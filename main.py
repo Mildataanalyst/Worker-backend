@@ -7324,7 +7324,15 @@ CONTACT_TRACKER_HEADERS = [
     "final_bucket", "website", "source_mix", "poc_name", "contact_number", "referred_by",
     "contact_status", "outreach_owner", "meeting_date", "meeting_time", "meeting_notes",
     "next_follow_up_date", "tracker_comment", "pm_reviewer", "pm_rating", "pm_comment",
-    "background", "one_line_understanding", "sent_from_final_at", "created_at", "updated_at",
+    "background", "one_line_understanding",
+    # Contact Supporter fields. Stored as pipe-separated values where there can be many.
+    "all_emails", "selected_to_emails", "selected_cc_emails", "all_phones", "selected_phone",
+    "linkedin_org_urls", "linkedin_people_urls", "contact_form_urls", "contact_source_urls",
+    "best_contact_route", "contact_confidence", "contact_confidence_reason",
+    "email_subject", "email_body", "linkedin_message", "website_detail", "reviewer_line",
+    "outreach_locked", "manual_review_needed", "query_mode", "queries_used", "contact_generated_at",
+    "outreach_template_name",
+    "sent_from_final_at", "created_at", "updated_at",
 ]
 
 CONTACT_STATUSES = {
@@ -7459,6 +7467,435 @@ def _contact_tracker_key(row: dict) -> str:
     return f"name:{_normalise_lead_name(row.get('ngo_name') or '')}|district:{str(row.get('district') or '').strip().lower()}"
 
 
+
+
+def _split_multi_value(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw_parts = [str(x or "") for x in value]
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return []
+        raw_parts = []
+        if text[:1] in "[{":
+            try:
+                data = json.loads(text)
+                if isinstance(data, list):
+                    raw_parts = [str(x or "") for x in data]
+                elif isinstance(data, dict):
+                    raw_parts = [str(x or "") for x in data.values()]
+            except Exception:
+                raw_parts = []
+        if not raw_parts:
+            raw_parts = re.split(r"[|;\n]+", text)
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in raw_parts:
+        item = re.sub(r"\s+", " ", str(part or "").strip().strip(","))
+        if not item:
+            continue
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def _join_multi_value(values) -> str:
+    return " | ".join(_split_multi_value(values))
+
+
+_EMAIL_RE = re.compile(r"(?<![\w.+-])([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})(?![\w.-])", re.I)
+_PHONE_RE = re.compile(r"(?:(?:\+91|0)?[\s\-.]?[6-9]\d{2}[\s\-.]?\d{3}[\s\-.]?\d{4}|0\d{2,4}[\s\-.]?\d{6,8})")
+
+
+def _extract_emails(text: str) -> list[str]:
+    bad_ext = {"png", "jpg", "jpeg", "gif", "webp", "svg", "pdf", "css", "js"}
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _EMAIL_RE.findall(str(text or "")):
+        email = m.strip().strip(".,;:()[]{}<>\"'").lower()
+        if not email or "example." in email or email.endswith("@domain.com"):
+            continue
+        tld = email.rsplit(".", 1)[-1].lower()
+        if tld in bad_ext:
+            continue
+        if any(x in email for x in ["sentry.", "wixpress", "wordpress", "schema.org"]):
+            continue
+        if email not in seen:
+            seen.add(email)
+            out.append(email)
+    return out
+
+
+def _clean_phone(value: str) -> str:
+    raw = str(value or "")
+    digits = re.sub(r"\D+", "", raw)
+    if digits.startswith("91") and len(digits) == 12:
+        return "+91 " + digits[2:7] + " " + digits[7:]
+    if len(digits) == 10 and digits[0] in "6789":
+        return "+91 " + digits[:5] + " " + digits[5:]
+    if len(digits) >= 8:
+        return raw.strip().strip(".,;:()[]{}")
+    return ""
+
+
+def _extract_phones(text: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _PHONE_RE.findall(str(text or "")):
+        phone = _clean_phone(m)
+        if not phone:
+            continue
+        key = re.sub(r"\D+", "", phone)
+        if len(key) < 8 or key in seen:
+            continue
+        seen.add(key)
+        out.append(phone)
+    return out
+
+
+def _contact_queries(ngo_name: str, region: str, mode: str) -> list[str]:
+    name = str(ngo_name or "").strip()
+    reg = str(region or "Karnataka").strip() or "Karnataka"
+    mode = str(mode or "balanced").lower()
+    cheap = [
+        f'"{name}" {reg} NGO official website contact email phone',
+        f'"{name}" founder director trustee LinkedIn {reg}',
+    ]
+    balanced = [
+        f'"{name}" {reg} NGO official website',
+        f'"{name}" contact email phone',
+        f'"{name}" founder director trustee secretary',
+        f'site:linkedin.com "{name}" {reg}',
+    ]
+    deep = [
+        f'"{name}" {reg} NGO official website',
+        f'"{name}" contact email phone',
+        f'"{name}" annual report email phone',
+        f'"{name}" founder director trustee secretary',
+        f'site:linkedin.com/company "{name}"',
+        f'site:linkedin.com/in "{name}" founder director trustee',
+    ]
+    if mode == "cheap":
+        return cheap
+    if mode == "deep":
+        return deep
+    return balanced
+
+
+def _is_low_value_contact_url(url: str) -> bool:
+    u = str(url or "").lower()
+    bad = [
+        "ngodarpan", "darpan", "csrbox", "justdial", "sulekha", "zaubacorp", "tofler",
+        "facebook.com", "instagram.com", "twitter.com", "x.com/", "youtube.com", "youtu.be",
+        "guidestar", "give.do", "giveindia", "impactguru", "wikipedia.org", "wikimedia.org",
+    ]
+    return any(x in u for x in bad)
+
+
+def _is_linkedin_org(url: str) -> bool:
+    u = str(url or "").lower()
+    return "linkedin.com/company" in u or "linkedin.com/school" in u
+
+
+def _is_linkedin_person(url: str) -> bool:
+    return "linkedin.com/in/" in str(url or "").lower()
+
+
+def _rank_emails(emails: list[str]) -> list[str]:
+    def score(email: str) -> tuple[int, str]:
+        e = email.lower()
+        local = e.split("@", 1)[0]
+        s = 50
+        if any(x in local for x in ["director", "founder", "trustee", "secretary", "ceo", "head", "program", "programme"]):
+            s -= 30
+        if any(x in local for x in ["info", "contact", "admin", "office", "hello"]):
+            s -= 18
+        if any(x in local for x in ["noreply", "no-reply", "support", "careers", "hr"]):
+            s += 50
+        if any(e.endswith("@" + d) for d in ["gmail.com", "yahoo.com", "rediffmail.com", "hotmail.com", "outlook.com"]):
+            s += 6
+        return (s, e)
+    return sorted(_split_multi_value(emails), key=score)
+
+
+def _fill_contact_template(template: str, variables: dict) -> str:
+    text = str(template or "")
+    for key, value in variables.items():
+        text = text.replace("[" + key + "]", str(value or ""))
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _default_contact_templates(settings: dict | None = None) -> dict:
+    settings = settings or {}
+    return {
+        "sender_name": settings.get("sender_name") or "Milan",
+        "email_subject_template": settings.get("email_subject_template") or "Quick Feeding India conversation",
+        "email_body_template": settings.get("email_body_template") or (
+            "Hi [contact_name_or_team],\n\n"
+            "I’m [sender_name] from Feeding India, by Eternal Foundation.\n\n"
+            "Your organization stood out in our Karnataka review. We went through your public work, especially [website_detail]. [reviewer_line]\n\n"
+            "Feeding India’s Daily Feeding Program supports child-focused institutions through daily nutritious meals or ration support.\n\n"
+            "Could we speak for 5 minutes to understand your work and see if there may be a fit? You can also reply here with your current food/ration support needs.\n\n"
+            "Regards,\n[sender_name]"
+        ),
+        "linkedin_template": settings.get("linkedin_template") or (
+            "Hi [contact_name_or_team], I’m [sender_name] from Feeding India, by Eternal Foundation. "
+            "We came across [ngo_name] during our Karnataka review and wanted to understand your work better. "
+            "Would you be open to a quick 5-minute conversation on possible food/ration support?"
+        ),
+        "feeding_india_website": settings.get("feeding_india_website") or "",
+        "annual_report_link": settings.get("annual_report_link") or "",
+        "social_links": settings.get("social_links") or "",
+        "max_first_wave_emails": int(settings.get("max_first_wave_emails") or 3),
+        "template_name": settings.get("template_name") or "default",
+    }
+
+
+def _fallback_contact_copy(row: dict, evidence: dict, settings: dict | None = None) -> dict:
+    cfg = _default_contact_templates(settings)
+    reviewer_raw = str(row.get("pm_comment") or row.get("tracker_comment") or row.get("one_line_understanding") or "").strip()
+    reviewer_line = ""
+    if reviewer_raw:
+        reviewer_line = _first_sentence(reviewer_raw, 140)
+        if reviewer_line and not reviewer_line.lower().startswith("our"):
+            reviewer_line = "Our reviewer noted: " + reviewer_line
+    detail = evidence.get("website_detail") or _first_sentence(row.get("one_line_understanding") or row.get("background") or "", 130) or "your work with children"
+    variables = {
+        "ngo_name": row.get("ngo_name") or "your organization",
+        "contact_name_or_team": row.get("poc_name") or "Team",
+        "sender_name": cfg["sender_name"],
+        "website_detail": detail,
+        "reviewer_line": reviewer_line,
+        "category": row.get("final_bucket") or "",
+        "rating": row.get("pm_rating") or "",
+        "program_name": "Daily Feeding Program",
+        "feeding_india_website": cfg["feeding_india_website"],
+        "annual_report_link": cfg["annual_report_link"],
+        "social_links": cfg["social_links"],
+    }
+    return {
+        "website_detail": detail,
+        "reviewer_line": reviewer_line,
+        "email_subject": _fill_contact_template(cfg["email_subject_template"], variables),
+        "email_body": _fill_contact_template(cfg["email_body_template"], variables),
+        "linkedin_message": _fill_contact_template(cfg["linkedin_template"], variables),
+        "outreach_template_name": cfg["template_name"],
+        "source": "fallback",
+    }
+
+
+def _call_contact_haiku(row: dict, evidence: dict, settings: dict | None = None) -> dict:
+    cfg = _default_contact_templates(settings)
+    fallback = _fallback_contact_copy(row, evidence, settings)
+    if _get_anthropic() is None or not os.environ.get("ANTHROPIC_API_KEY"):
+        return fallback
+    model = os.environ.get("CONTACT_AI_MODEL") or os.environ.get("HAIKU_MODEL") or os.environ.get("STORY_MODEL") or "claude-haiku-4-5-20251001"
+    prompt = f"""
+You generate extremely brief outreach copy for Feeding India's Daily Feeding Program.
+Use ONLY the provided reviewer note, website/search snippets, and template variables. Do not invent facts. No fluff. Avoid: amazing, incredible, synergy, best.
+Return ONLY JSON with: website_detail, reviewer_line, email_subject, email_body, linkedin_message.
+
+Rules:
+- website_detail: max 16 words, factual, lower-case phrase is okay.
+- reviewer_line: max 16 words. Use only if positive and useful; else empty.
+- email_body: fill the user's template exactly in structure. Keep it short.
+- linkedin_message: max 55 words.
+
+Template variables:
+{json.dumps({
+    "sender_name": cfg["sender_name"],
+    "ngo_name": row.get("ngo_name") or "",
+    "contact_name_or_team": row.get("poc_name") or "Team",
+    "email_subject_template": cfg["email_subject_template"],
+    "email_body_template": cfg["email_body_template"],
+    "linkedin_template": cfg["linkedin_template"],
+    "feeding_india_website": cfg["feeding_india_website"],
+    "annual_report_link": cfg["annual_report_link"],
+    "social_links": cfg["social_links"],
+}, ensure_ascii=False)}
+
+Reviewer/context:
+{json.dumps({
+    "pm_rating": row.get("pm_rating"),
+    "pm_comment": row.get("pm_comment"),
+    "background": row.get("background"),
+    "one_line_understanding": row.get("one_line_understanding"),
+    "tracker_comment": row.get("tracker_comment"),
+}, ensure_ascii=False)}
+
+Search evidence:
+{json.dumps(evidence, ensure_ascii=False)[:5000]}
+""".strip()
+    try:
+        client = _get_anthropic().Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        msg = client.messages.create(
+            model=model,
+            max_tokens=int(os.environ.get("CONTACT_AI_MAX_TOKENS", "700")),
+            temperature=0.05,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        content = _json_text_from_msg(msg)
+        try:
+            data = _clean_json_from_text(content)
+        except Exception:
+            data = json.loads(content)
+        if isinstance(data, dict):
+            out = dict(fallback)
+            for k in ["website_detail", "reviewer_line", "email_subject", "email_body", "linkedin_message"]:
+                if str(data.get(k) or "").strip():
+                    out[k] = str(data.get(k) or "").strip()
+            out["outreach_template_name"] = cfg["template_name"]
+            out["source"] = "haiku"
+            return out
+    except Exception as e:
+        fallback["ai_error"] = str(e)[:240]
+    return fallback
+
+
+def _discover_public_contacts(row: dict, region: str, query_mode: str) -> dict:
+    if not _has_serper_keys():
+        raise RuntimeError("SERPER_API_KEY or SERPER_API_KEYS must be set")
+    ngo_name = str(row.get("ngo_name") or "").strip()
+    if not ngo_name:
+        raise ValueError("NGO name is missing")
+    queries = _contact_queries(ngo_name, region, query_mode)
+    emails: list[str] = []
+    phones: list[str] = []
+    linkedin_org: list[str] = []
+    linkedin_people: list[str] = []
+    contact_forms: list[str] = []
+    source_urls: list[str] = []
+    snippets: list[dict] = []
+    fetch_candidates: list[str] = []
+    for q in queries:
+        data = _serper_post({"q": q, "num": 10, "gl": "in"}, timeout=25)
+        for item in (data.get("organic") or [])[:10]:
+            link = str(item.get("link") or "").strip()
+            title = str(item.get("title") or "")
+            snippet = str(item.get("snippet") or "")
+            hay = "\n".join([title, snippet, link])
+            emails.extend(_extract_emails(hay))
+            phones.extend(_extract_phones(hay))
+            if link:
+                if _is_linkedin_org(link):
+                    linkedin_org.append(link); source_urls.append(link)
+                elif _is_linkedin_person(link):
+                    linkedin_people.append(link); source_urls.append(link)
+                elif "contact" in link.lower() and not _is_low_value_contact_url(link):
+                    contact_forms.append(link); source_urls.append(link)
+                if not _is_low_value_contact_url(link) and link.startswith(("http://", "https://")):
+                    fetch_candidates.append(link)
+            if title or snippet:
+                snippets.append({"title": title[:180], "snippet": snippet[:320], "url": link[:240]})
+    # Fetch only a few likely official/contact pages; Serper is for discovery, fetch is for extracting public contacts.
+    fetched = 0
+    for url in _split_multi_value(fetch_candidates)[:6]:
+        if fetched >= 4:
+            break
+        try:
+            final_url, html = _safe_fetch_text(url, timeout=8, max_bytes=800_000)
+            fetched += 1
+            soup = _make_soup(html)
+            text = soup.get_text(" ", strip=True)
+            merged = "\n".join([final_url, text[:120000], " ".join(a.get("href") or "" for a in soup.find_all("a", href=True)[:300])])
+            found_e = _extract_emails(merged)
+            found_p = _extract_phones(merged)
+            if found_e or found_p or "contact" in final_url.lower():
+                source_urls.append(final_url)
+            emails.extend(found_e)
+            phones.extend(found_p)
+            for a in soup.find_all("a", href=True)[:300]:
+                href = urljoin(final_url, a.get("href") or "")
+                if _is_linkedin_org(href):
+                    linkedin_org.append(href); source_urls.append(href)
+                elif _is_linkedin_person(href):
+                    linkedin_people.append(href); source_urls.append(href)
+                elif "contact" in href.lower() and href.startswith(("http://", "https://")) and not _is_low_value_contact_url(href):
+                    contact_forms.append(href)
+            if not row.get("website") and final_url and not _is_low_value_contact_url(final_url):
+                row["website"] = final_url
+        except Exception:
+            continue
+    ranked_emails = _rank_emails(emails)
+    all_emails = _split_multi_value(ranked_emails)
+    all_phones = _split_multi_value(phones)
+    org_urls = _split_multi_value(linkedin_org)
+    people_urls = _split_multi_value(linkedin_people)
+    form_urls = _split_multi_value(contact_forms)
+    source_urls = _split_multi_value(source_urls)
+    if all_emails and (all_phones or org_urls or people_urls):
+        conf, reason = "High", "Email plus another public contact route found."
+    elif all_emails:
+        conf, reason = "High", "At least one public email found."
+    elif org_urls or people_urls or all_phones or form_urls:
+        conf, reason = "Medium", "No email, but another public contact route found."
+    else:
+        conf, reason = "Low", "No usable public contact route found."
+    route_parts = []
+    if all_emails: route_parts.append("email")
+    if all_phones: route_parts.append("phone")
+    if org_urls or people_urls: route_parts.append("LinkedIn")
+    if form_urls: route_parts.append("contact form")
+    return {
+        "queries": queries,
+        "queries_used": len(queries),
+        "all_emails": all_emails,
+        "all_phones": all_phones,
+        "linkedin_org_urls": org_urls,
+        "linkedin_people_urls": people_urls,
+        "contact_form_urls": form_urls,
+        "contact_source_urls": source_urls,
+        "best_contact_route": " + ".join(route_parts) if route_parts else "manual search needed",
+        "contact_confidence": conf,
+        "contact_confidence_reason": reason,
+        "website_detail": _first_sentence(" ".join([x.get("snippet") or x.get("title") or "" for x in snippets[:4]]), 130),
+        "search_snippets": snippets[:12],
+    }
+
+
+def _generate_contact_supporter_row(row: dict, region: str, query_mode: str, settings: dict | None = None) -> dict:
+    evidence = _discover_public_contacts(row, region, query_mode)
+    cfg = _default_contact_templates(settings)
+    max_first = max(1, min(int(cfg.get("max_first_wave_emails") or 3), 8))
+    all_emails = _split_multi_value(evidence.get("all_emails"))
+    selected_to = all_emails[:1]
+    selected_cc = all_emails[1:max_first]
+    copy = _call_contact_haiku(row, evidence, settings)
+    manual_review_needed = "yes" if evidence.get("contact_confidence") == "Low" else ""
+    if not all_emails and not (evidence.get("linkedin_org_urls") or evidence.get("linkedin_people_urls")):
+        manual_review_needed = "yes"
+    return {
+        "all_emails": _join_multi_value(all_emails),
+        "selected_to_emails": _join_multi_value(selected_to),
+        "selected_cc_emails": _join_multi_value(selected_cc),
+        "all_phones": _join_multi_value(evidence.get("all_phones") or []),
+        "selected_phone": _split_multi_value(evidence.get("all_phones") or [""])[0] if _split_multi_value(evidence.get("all_phones") or []) else "",
+        "linkedin_org_urls": _join_multi_value(evidence.get("linkedin_org_urls") or []),
+        "linkedin_people_urls": _join_multi_value(evidence.get("linkedin_people_urls") or []),
+        "contact_form_urls": _join_multi_value(evidence.get("contact_form_urls") or []),
+        "contact_source_urls": _join_multi_value(evidence.get("contact_source_urls") or []),
+        "best_contact_route": evidence.get("best_contact_route") or "manual search needed",
+        "contact_confidence": evidence.get("contact_confidence") or "Low",
+        "contact_confidence_reason": evidence.get("contact_confidence_reason") or "",
+        "email_subject": copy.get("email_subject") or "Quick Feeding India conversation",
+        "email_body": copy.get("email_body") or "",
+        "linkedin_message": copy.get("linkedin_message") or "",
+        "website_detail": copy.get("website_detail") or evidence.get("website_detail") or "",
+        "reviewer_line": copy.get("reviewer_line") or "",
+        "manual_review_needed": manual_review_needed,
+        "query_mode": query_mode,
+        "queries_used": str(evidence.get("queries_used") or 0),
+        "contact_generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "outreach_template_name": copy.get("outreach_template_name") or cfg.get("template_name") or "default",
+    }
+
+
 def _contact_summary(rows: list[dict]) -> dict:
     status_counts = {s: 0 for s in sorted(CONTACT_STATUSES)}
     by_bucket: dict[str, int] = {}
@@ -7479,8 +7916,18 @@ def _contact_summary(rows: list[dict]) -> dict:
         nf = str(row.get("next_follow_up_date") or "")[:10]
         if nf and nf < today and status not in {"meeting_done", "not_interested", "on_hold"}:
             overdue_followups += 1
+    emails_found = sum(1 for r in rows if _split_multi_value(r.get("all_emails") or r.get("selected_to_emails") or ""))
+    linkedin_found = sum(1 for r in rows if _split_multi_value(r.get("linkedin_org_urls") or "") or _split_multi_value(r.get("linkedin_people_urls") or ""))
+    ready_to_email = sum(1 for r in rows if _split_multi_value(r.get("selected_to_emails") or r.get("all_emails") or "") and str(r.get("manual_review_needed") or "").lower() not in {"1", "true", "yes"})
+    needs_review = sum(1 for r in rows if str(r.get("manual_review_needed") or "").lower() in {"1", "true", "yes"})
+    locked_rows = sum(1 for r in rows if str(r.get("outreach_locked") or "").lower() in {"1", "true", "yes"})
     return {
         "total_in_tracker": len(rows),
+        "emails_found_count": emails_found,
+        "linkedin_found_count": linkedin_found,
+        "ready_to_email_count": ready_to_email,
+        "needs_review_count": needs_review,
+        "locked_rows_count": locked_rows,
         "status_counts": status_counts,
         "not_started_count": status_counts.get("not_started", 0),
         "contacted_count": status_counts.get("contacted", 0),
@@ -7557,6 +8004,66 @@ def contact_tracker(region: str = "Karnataka"):
     return _json(True, region=region, count=len(rows), rows=rows, summary=_contact_summary(rows))
 
 
+
+
+@app.post("/contact-tracker/generate-outreach")
+def contact_tracker_generate_outreach(payload: dict | None = None):
+    payload = payload or {}
+    region = str(payload.get("region") or "Karnataka")
+    query_mode = str(payload.get("query_mode") or "balanced").lower()
+    if query_mode not in {"cheap", "balanced", "deep"}:
+        query_mode = "balanced"
+    settings = payload.get("settings") or {}
+    if not isinstance(settings, dict):
+        settings = {}
+    force = bool(payload.get("force"))
+    all_rows = bool(payload.get("all"))
+    tracker_ids = {str(x).strip() for x in (payload.get("tracker_ids") or []) if str(x).strip()}
+    one_id = str(payload.get("tracker_id") or "").strip()
+    if one_id:
+        tracker_ids.add(one_id)
+    if not all_rows and not tracker_ids:
+        return _json(False, status_code=400, error="tracker_id, tracker_ids, or all=true is required")
+    if not _has_serper_keys():
+        return _json(False, status_code=500, error="SERPER_API_KEY or SERPER_API_KEYS must be set before contact discovery can run")
+
+    max_rows = int(payload.get("limit") or os.environ.get("CONTACT_GENERATE_MAX_ROWS", "25") or 25)
+    max_rows = max(1, min(max_rows, 100))
+    paths = [_contact_tracker_path(region)]
+    undo_before = _undo_snapshot_before(paths)
+    rows = _read_contact_tracker(region)
+    generated = 0
+    skipped: list[dict] = []
+    errors: list[dict] = []
+    now_s = time.strftime("%Y-%m-%d %H:%M:%S")
+    for row in rows:
+        if not all_rows and str(row.get("tracker_id") or "") not in tracker_ids:
+            continue
+        if generated >= max_rows:
+            skipped.append({"ngo_name": row.get("ngo_name"), "reason": "limit_reached"})
+            continue
+        if str(row.get("outreach_locked") or "").lower() in {"1", "true", "yes"} and not force:
+            skipped.append({"ngo_name": row.get("ngo_name"), "reason": "locked"})
+            continue
+        try:
+            patch = _generate_contact_supporter_row(row, region, query_mode, settings)
+            for k, v in patch.items():
+                row[k] = v
+            row["updated_at"] = now_s
+            generated += 1
+        except Exception as e:
+            row["manual_review_needed"] = "yes"
+            row["contact_confidence"] = row.get("contact_confidence") or "Low"
+            row["contact_confidence_reason"] = f"Generation failed: {str(e)[:220]}"
+            row["updated_at"] = now_s
+            errors.append({"ngo_name": row.get("ngo_name"), "error": str(e)[:300]})
+    if generated or errors:
+        _write_contact_tracker(region, rows)
+        _workspace_log(region, "contact_supporter_generated", {"generated_count": generated, "errors": len(errors), "query_mode": query_mode})
+        _undo_snapshot_after("contact_tracker_generate_outreach", f"Contact Supporter generated: {generated} row(s)", region, paths, undo_before)
+    return _json(True, generated_count=generated, skipped=skipped[:100], errors=errors[:100], summary=_contact_summary(rows), rows=rows)
+
+
 @app.post("/contact-tracker/update")
 def contact_tracker_update(payload: dict | None = None):
     payload = payload or {}
@@ -7568,7 +8075,16 @@ def contact_tracker_update(payload: dict | None = None):
     if not tracker_id and not ngo_ref:
         return _json(False, status_code=400, error="tracker_id or ngo_ref is required")
     rows = _read_contact_tracker(region)
-    allowed = {"poc_name", "contact_number", "contact_status", "outreach_owner", "meeting_date", "meeting_time", "meeting_notes", "next_follow_up_date", "tracker_comment"}
+    allowed = {
+        "poc_name", "contact_number", "contact_status", "outreach_owner", "meeting_date",
+        "meeting_time", "meeting_notes", "next_follow_up_date", "tracker_comment",
+        "all_emails", "selected_to_emails", "selected_cc_emails", "all_phones", "selected_phone",
+        "linkedin_org_urls", "linkedin_people_urls", "contact_form_urls", "contact_source_urls",
+        "best_contact_route", "contact_confidence", "contact_confidence_reason",
+        "email_subject", "email_body", "linkedin_message", "website_detail", "reviewer_line",
+        "outreach_locked", "manual_review_needed", "query_mode", "queries_used", "contact_generated_at",
+        "outreach_template_name",
+    }
     updated = None
     for row in rows:
         if (tracker_id and row.get("tracker_id") == tracker_id) or (ngo_ref and row.get("ngo_ref") == ngo_ref):
@@ -7610,6 +8126,76 @@ def contact_tracker_remove(payload: dict | None = None):
     _workspace_log(region, "tracker_row_removed", {"removed_count": removed})
     _undo_snapshot_after("contact_tracker_remove", f"Contact Tracker remove: {removed} row(s)", region, paths, undo_before)
     return _json(True, removed_count=removed, count=len(kept), summary=_contact_summary(kept))
+
+
+
+
+@app.post("/contact-tracker/import-csv")
+async def contact_tracker_import_csv(region: str = "Karnataka", file: UploadFile = File(...)):
+    raw = await file.read()
+    if len(raw or b"") > int(os.environ.get("CONTACT_IMPORT_MAX_BYTES", "6000000")):
+        return _json(False, status_code=400, error="CSV is too large")
+    text = raw.decode("utf-8-sig", errors="replace")
+    incoming = list(csv.DictReader(text.splitlines()))
+    if not incoming:
+        return _json(False, status_code=400, error="No rows found in CSV")
+    paths = [_contact_tracker_path(region)]
+    undo_before = _undo_snapshot_before(paths)
+    rows = _read_contact_tracker(region)
+    by_id = {str(r.get("tracker_id") or "").strip(): r for r in rows if str(r.get("tracker_id") or "").strip()}
+    by_name = {_normalise_lead_name(r.get("ngo_name") or ""): r for r in rows if _normalise_lead_name(r.get("ngo_name") or "")}
+    aliases = {re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_"): h for h in CONTACT_TRACKER_HEADERS}
+    aliases.update({
+        "ngo": "ngo_name", "ngo_name": "ngo_name", "name": "ngo_name",
+        "best_email": "selected_to_emails", "primary_email": "selected_to_emails", "to_emails": "selected_to_emails",
+        "cc_emails": "selected_cc_emails", "backup_email": "selected_cc_emails",
+        "emails_found": "all_emails", "all_emails_found": "all_emails",
+        "phone": "selected_phone", "phones_found": "all_phones",
+        "linkedin": "linkedin_org_urls", "linkedin_org": "linkedin_org_urls", "linkedin_people": "linkedin_people_urls",
+        "subject": "email_subject", "body": "email_body", "email": "email_body",
+        "linkedin_text": "linkedin_message", "linkedin_message": "linkedin_message",
+        "confidence": "contact_confidence", "status": "contact_status",
+    })
+    updated = 0
+    appended = 0
+    now_s = time.strftime("%Y-%m-%d %H:%M:%S")
+    allowed = set(CONTACT_TRACKER_HEADERS) - {"created_at"}
+    for raw_row in incoming:
+        mapped = {}
+        for k, v in (raw_row or {}).items():
+            kk = re.sub(r"[^a-z0-9]+", "_", str(k or "").lower()).strip("_")
+            field = aliases.get(kk)
+            if field in allowed:
+                mapped[field] = str(v or "")
+        target = None
+        tid = str(mapped.get("tracker_id") or "").strip()
+        if tid and tid in by_id:
+            target = by_id[tid]
+        if target is None:
+            nm = _normalise_lead_name(mapped.get("ngo_name") or raw_row.get("NGO Name") or raw_row.get("NGO") or "")
+            if nm and nm in by_name:
+                target = by_name[nm]
+        if target is None:
+            target = {h: "" for h in CONTACT_TRACKER_HEADERS}
+            target.update(mapped)
+            target["tracker_id"] = target.get("tracker_id") or uuid.uuid4().hex[:12]
+            target["region"] = region
+            target["contact_status"] = target.get("contact_status") or "not_started"
+            target["created_at"] = now_s
+            rows.append(target)
+            by_id[target["tracker_id"]] = target
+            if _normalise_lead_name(target.get("ngo_name") or ""):
+                by_name[_normalise_lead_name(target.get("ngo_name") or "")] = target
+            appended += 1
+        for k, v in mapped.items():
+            if k in allowed:
+                target[k] = v
+        target["updated_at"] = now_s
+        updated += 1
+    _write_contact_tracker(region, rows)
+    _workspace_log(region, "contact_tracker_csv_imported", {"updated_count": updated, "appended_count": appended})
+    _undo_snapshot_after("contact_tracker_import_csv", f"Contact Tracker CSV import: {updated} row(s)", region, paths, undo_before)
+    return _json(True, updated_count=updated, appended_count=appended, count=len(rows), summary=_contact_summary(rows))
 
 
 @app.get("/contact-tracker/export.csv")
