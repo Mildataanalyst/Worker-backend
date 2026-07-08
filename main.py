@@ -8146,7 +8146,17 @@ async def contact_tracker_import_csv(region: str = "Karnataka", file: UploadFile
     by_name = {_normalise_lead_name(r.get("ngo_name") or ""): r for r in rows if _normalise_lead_name(r.get("ngo_name") or "")}
     aliases = {re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_"): h for h in CONTACT_TRACKER_HEADERS}
     aliases.update({
-        "ngo": "ngo_name", "ngo_name": "ngo_name", "name": "ngo_name",
+        # Minimum initial upload headers
+        "ngo": "ngo_name", "ngo_name": "ngo_name", "ngo_name_input": "ngo_name", "name": "ngo_name", "organization": "ngo_name", "organisation": "ngo_name",
+        "category": "final_bucket", "bucket": "final_bucket", "final_category": "final_bucket", "outreach_category": "final_bucket",
+        "rating": "pm_rating", "review_rating": "pm_rating", "pm_rating": "pm_rating",
+        "pm": "pm_reviewer", "reviewer": "pm_reviewer", "pm_reviewer": "pm_reviewer", "reviewed_by": "pm_reviewer",
+        "reviewer_note": "pm_comment", "review_note": "pm_comment", "pm_note": "pm_comment", "pm_comment": "pm_comment", "comments": "pm_comment",
+        "website_url": "website", "official_website": "website",
+        "poc": "poc_name", "poc_name": "poc_name", "contact_name": "poc_name",
+        "contact_number": "contact_number", "phone_number": "contact_number",
+        "owner": "outreach_owner", "outreach_owner": "outreach_owner",
+        # Edited/exported tracker headers
         "best_email": "selected_to_emails", "primary_email": "selected_to_emails", "to_emails": "selected_to_emails",
         "cc_emails": "selected_cc_emails", "backup_email": "selected_cc_emails",
         "emails_found": "all_emails", "all_emails_found": "all_emails",
@@ -8190,12 +8200,60 @@ async def contact_tracker_import_csv(region: str = "Karnataka", file: UploadFile
         for k, v in mapped.items():
             if k in allowed:
                 target[k] = v
+        # For initial uploads, keep input lightweight but still compatible with tracker/generation.
+        if not target.get("ngo_ref") and target.get("ngo_name"):
+            target["ngo_ref"] = _normalise_lead_name(target.get("ngo_name") or "") or target.get("ngo_name")
+        if not target.get("contact_status"):
+            target["contact_status"] = "not_started"
+        if target.get("contact_number") and not target.get("selected_phone"):
+            target["selected_phone"] = target.get("contact_number")
+        if target.get("contact_number") and not target.get("all_phones"):
+            target["all_phones"] = target.get("contact_number")
         target["updated_at"] = now_s
         updated += 1
     _write_contact_tracker(region, rows)
     _workspace_log(region, "contact_tracker_csv_imported", {"updated_count": updated, "appended_count": appended})
     _undo_snapshot_after("contact_tracker_import_csv", f"Contact Tracker CSV import: {updated} row(s)", region, paths, undo_before)
     return _json(True, updated_count=updated, appended_count=appended, count=len(rows), summary=_contact_summary(rows))
+
+
+@app.get("/contact-tracker/sample-input.csv")
+def contact_tracker_sample_input():
+    import io
+    headers = [
+        "NGO Name", "Category", "Rating", "PM Reviewer", "Reviewer Note",
+        "Website", "POC Name", "Contact Number", "Outreach Owner"
+    ]
+    sample_rows = [
+        {
+            "NGO Name": "Example Education Trust",
+            "Category": "Residential school / long-term education pathway",
+            "Rating": "4",
+            "PM Reviewer": "Avika",
+            "Reviewer Note": "Strong residential education model; food support likely relevant.",
+            "Website": "",
+            "POC Name": "",
+            "Contact Number": "",
+            "Outreach Owner": "",
+        },
+        {
+            "NGO Name": "Example Children Foundation",
+            "Category": "Full-day school / low-income education",
+            "Rating": "3",
+            "PM Reviewer": "Ipshita",
+            "Reviewer Note": "Clear child focus and education pathway; needs contact validation.",
+            "Website": "",
+            "POC Name": "",
+            "Contact Number": "",
+            "Outreach Owner": "",
+        },
+    ]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=headers)
+    writer.writeheader()
+    for row in sample_rows:
+        writer.writerow(row)
+    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=dfp2_contact_supporter_sample_input.csv"})
 
 
 @app.get("/contact-tracker/export.csv")
