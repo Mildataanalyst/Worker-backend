@@ -108,6 +108,7 @@ recheck_threads: dict[str, threading.Thread] = {}
 recheck_cancel_flags: dict[str, threading.Event] = {}
 presence_threads: dict[str, threading.Thread] = {}
 presence_cancel_flags: dict[str, threading.Event] = {}
+deep_enrichment_runtime = None
 
 app = FastAPI(title=APP_NAME)
 
@@ -273,7 +274,7 @@ def _role_allows_path(role: str, path: str) -> bool:
         blocked = ("/repository", "/story", "/discovery")
         return not path.startswith(blocked)
     if role == "search":
-        allowed = ("/repository", "/jobs")
+        allowed = ("/repository", "/enrichment", "/jobs")
         return path.startswith(allowed)
     if role in {"story", "ai", "story_ai"}:
         allowed = ("/story", "/discovery", "/jobs")
@@ -595,6 +596,14 @@ def _job_live_state(run_id: str) -> str:
     th = recheck_threads.get(run_id) or story_threads.get(run_id) or presence_threads.get(run_id)
     if th:
         return "running" if th.is_alive() else "not_running"
+    runtime = globals().get("deep_enrichment_runtime")
+    if runtime is not None:
+        try:
+            state = runtime.live_state(run_id)
+            if state != "not_running":
+                return state
+        except Exception:
+            pass
     return "not_running"
 
 
@@ -903,6 +912,10 @@ def jobs_cancel(run_id: str):
         return recheck_cancel(run_id)
     if job_type in {"story", "discovery"} or run_id.startswith(("story", "discovery")):
         return story_cancel(run_id)
+    if job_type == "deep_enrichment" or run_id.startswith("enrich_"):
+        runtime = globals().get("deep_enrichment_runtime")
+        if runtime is not None:
+            return runtime.cancel(run_id)
     return _json(True, run_id=run_id, stage="cancel_requested", cancel_requested=True, live_state=_job_live_state(run_id))
 
 
@@ -8522,7 +8535,7 @@ def admin_cleanup_old_runs(payload: dict):
     delete_undo = bool(payload.get("delete_undo"))
     protect_imported = str(payload.get("protect_imported", "true")).lower() not in {"0", "false", "no"}
     protected = _protected_lead_pool_run_ids() if protect_imported else set()
-    prefixes = ("run_", "recheck_", "presence_", "story", "discovery")
+    prefixes = ("run_", "recheck_", "presence_", "story", "discovery", "enrich_")
     candidates = [p for p in RUNS_DIR.iterdir() if p.is_dir() and p.name.startswith(prefixes)]
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     protected_candidates = [p for p in candidates if p.name in protected]
@@ -8566,3 +8579,33 @@ def admin_cleanup_old_runs(payload: dict):
         deleted_undo=bool(confirm and delete_undo),
         note="Lead-Pool-imported runs are protected and were not deleted." if protect_imported else "Imported-run protection disabled by payload.",
     )
+
+
+# -----------------------------------------------------------------------------
+# V59 Deep Enrichment — Firecrawl + Serper evidence collection
+# -----------------------------------------------------------------------------
+# Registered at the end so the module can reuse the hardened persistence, SSRF,
+# Serper failover, job registry, CORS, and mutation-auth helpers above.
+import importlib.util as _importlib_util
+
+_deep_spec = _importlib_util.spec_from_file_location("dfp2_deep_enrichment", Path(__file__).resolve().parent / "deep_enrichment.py")
+if _deep_spec is None or _deep_spec.loader is None:
+    raise RuntimeError("Could not load deep_enrichment.py")
+_deep_module = _importlib_util.module_from_spec(_deep_spec)
+_deep_spec.loader.exec_module(_deep_module)
+
+deep_enrichment_runtime = _deep_module.register_deep_enrichment(
+    app,
+    runs_dir=RUNS_DIR,
+    serper_post=_serper_post,
+    has_serper_keys=_has_serper_keys,
+    safe_fetch_text=_safe_fetch_text,
+    validate_public_url=_validate_public_http_url,
+    make_soup=_make_soup,
+    get_anthropic=_get_anthropic,
+    job_create=_job_create,
+    job_update=_job_update,
+    job_request_cancel=_job_request_cancel,
+    job_cancel_requested=_job_cancel_requested,
+    utc_now_iso=_utc_now_iso,
+)
