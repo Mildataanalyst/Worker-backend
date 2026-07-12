@@ -8582,7 +8582,7 @@ def admin_cleanup_old_runs(payload: dict):
 
 
 # -----------------------------------------------------------------------------
-# V59 Deep Enrichment — Firecrawl + Serper evidence collection
+# V60 Deep Enrichment — Firecrawl multi-key failover + Serper evidence collection
 # -----------------------------------------------------------------------------
 # Registered at the end so the module can reuse the hardened persistence, SSRF,
 # Serper failover, job registry, CORS, and mutation-auth helpers above.

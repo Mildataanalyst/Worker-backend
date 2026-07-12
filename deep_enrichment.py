@@ -280,7 +280,13 @@ class DeepEnrichmentRuntime:
         self.router = APIRouter()
         self.threads: dict[str, threading.Thread] = {}
         self.cancel_flags: dict[str, threading.Event] = {}
-        self.firecrawl_jobs: dict[str, str] = {}
+        # Active Firecrawl crawl IDs keep the API key that created them. Firecrawl
+        # crawl jobs are account-scoped, so polling/cancelling/pagination must keep
+        # using the same key for the full lifecycle of that crawl.
+        self.firecrawl_jobs: dict[str, dict[str, str]] = {}
+        self._firecrawl_lock = threading.RLock()
+        self._firecrawl_cursor = 0
+        self._firecrawl_disabled: dict[str, str] = {}
         self._status_lock = threading.RLock()
         self._register_routes()
 
@@ -303,7 +309,10 @@ class DeepEnrichmentRuntime:
     def config(self) -> JSONResponse:
         return self._json(
             True,
-            firecrawl_configured=bool(self._firecrawl_key()),
+            firecrawl_configured=bool(self._firecrawl_keys()),
+            firecrawl_key_count=len(self._firecrawl_keys()),
+            firecrawl_enabled_key_count=len(self._enabled_firecrawl_keys()),
+            firecrawl_disabled_keys=self._disabled_firecrawl_key_labels(),
             serper_configured=bool(self.has_serper_keys()),
             haiku_configured=bool(os.environ.get("ANTHROPIC_API_KEY")),
             categories=[{"key": key, "label": label} for key, label in CATEGORY_LABELS.items()],
@@ -320,8 +329,13 @@ class DeepEnrichmentRuntime:
             return self._json(False, status_code=400, stage="invalid_input", error="Select at least one NGO")
         if len(ngos) > int(os.environ.get("ENRICHMENT_MAX_NGOS_PER_RUN", "100")):
             return self._json(False, status_code=400, stage="too_many_ngos", error="A Deep Enrichment run supports at most 100 NGOs")
-        if not self._firecrawl_key():
-            return self._json(False, status_code=503, stage="missing_firecrawl_key", error="FIRECRAWL_API_KEY is not configured on the Railway worker")
+        if not self._firecrawl_keys():
+            return self._json(
+                False,
+                status_code=503,
+                stage="missing_firecrawl_key",
+                error="FIRECRAWL_API_KEYS or FIRECRAWL_API_KEY is not configured on the Railway worker",
+            )
         if not self.has_serper_keys():
             return self._json(False, status_code=503, stage="missing_serper_key", error="SERPER_API_KEY or SERPER_API_KEYS is not configured on the Railway worker")
 
@@ -404,10 +418,18 @@ class DeepEnrichmentRuntime:
         event = self.cancel_flags.setdefault(run_id, threading.Event())
         event.set()
         self.job_request_cancel(run_id)
-        firecrawl_id = self.firecrawl_jobs.get(run_id)
+        firecrawl_job = self.firecrawl_jobs.get(run_id) or {}
+        firecrawl_id = str(firecrawl_job.get("crawl_id") or "") if isinstance(firecrawl_job, dict) else str(firecrawl_job or "")
+        firecrawl_key = str(firecrawl_job.get("api_key") or "") if isinstance(firecrawl_job, dict) else ""
         if firecrawl_id:
             try:
-                self._firecrawl_request("DELETE", f"/crawl/{firecrawl_id}", timeout=30)
+                self._firecrawl_request(
+                    "DELETE",
+                    f"/crawl/{firecrawl_id}",
+                    timeout=30,
+                    api_key=firecrawl_key or None,
+                    allow_key_failover=False,
+                )
             except Exception:
                 pass
         self._patch_status(rd, stage="cancel_requested", run_status="cancelling", message="Cancellation requested")
@@ -707,15 +729,83 @@ class DeepEnrichmentRuntime:
     # ------------------------------------------------------------------
     # Firecrawl
     # ------------------------------------------------------------------
-    def _firecrawl_key(self) -> str:
-        return str(os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+    def _firecrawl_keys(self) -> list[str]:
+        """Return de-duplicated Firecrawl keys in configured order.
 
-    def _firecrawl_request(self, method: str, path_or_url: str, payload: dict | None = None, timeout: int = 90) -> dict:
-        key = self._firecrawl_key()
+        FIRECRAWL_API_KEYS is the preferred multi-key variable. The legacy
+        FIRECRAWL_API_KEY remains supported. Values may be comma or newline
+        separated; whitespace around each key is ignored.
+        """
+        raw_multi = str(os.environ.get("FIRECRAWL_API_KEYS") or "").strip()
+        raw_single = str(os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+        raw = raw_multi or raw_single
+        keys: list[str] = []
+        seen: set[str] = set()
+        for value in re.split(r"[,\n\r]+", raw):
+            key = value.strip()
+            if key and key not in seen:
+                seen.add(key)
+                keys.append(key)
+        return keys
+
+    def _firecrawl_key_label(self, key: str) -> str:
         if not key:
-            raise RuntimeError("FIRECRAWL_API_KEY is not configured")
+            return "unconfigured"
+        digest = hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()[:8]
+        tail = key[-4:] if len(key) >= 4 else key
+        return f"key-{digest}-…{tail}"
+
+    def _enabled_firecrawl_keys(self) -> list[str]:
+        configured = self._firecrawl_keys()
+        with self._firecrawl_lock:
+            return [key for key in configured if key not in self._firecrawl_disabled]
+
+    def _disabled_firecrawl_key_labels(self) -> list[dict]:
+        configured = set(self._firecrawl_keys())
+        with self._firecrawl_lock:
+            return [
+                {"key": self._firecrawl_key_label(key), "reason": reason}
+                for key, reason in self._firecrawl_disabled.items()
+                if key in configured
+            ]
+
+    def _disable_firecrawl_key(self, key: str, reason: str) -> None:
+        if not key:
+            return
+        with self._firecrawl_lock:
+            self._firecrawl_disabled[key] = str(reason or "unavailable")[:200]
+
+    def _next_firecrawl_key(self, excluded: set[str] | None = None) -> str:
+        excluded = excluded or set()
+        with self._firecrawl_lock:
+            keys = [
+                key for key in self._firecrawl_keys()
+                if key not in self._firecrawl_disabled and key not in excluded
+            ]
+            if not keys:
+                configured = self._firecrawl_keys()
+                if not configured:
+                    raise RuntimeError("FIRECRAWL_API_KEYS or FIRECRAWL_API_KEY is not configured")
+                disabled = ", ".join(item["key"] for item in self._disabled_firecrawl_key_labels())
+                detail = f" Disabled keys: {disabled}." if disabled else ""
+                raise RuntimeError(f"No usable Firecrawl API keys remain.{detail}")
+            key = keys[self._firecrawl_cursor % len(keys)]
+            self._firecrawl_cursor = (self._firecrawl_cursor + 1) % max(1, len(keys))
+            return key
+
+    def _firecrawl_request_on_key(
+        self,
+        method: str,
+        path_or_url: str,
+        *,
+        api_key: str,
+        payload: dict | None = None,
+        timeout: int = 90,
+    ) -> dict:
+        if not api_key:
+            raise RuntimeError("A Firecrawl API key is required")
         url = path_or_url if str(path_or_url).startswith("http") else f"https://api.firecrawl.dev/v2{path_or_url}"
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         last_error = ""
         for attempt in range(5):
             try:
@@ -741,10 +831,82 @@ class DeepEnrichmentRuntime:
                 time.sleep(min(2 ** attempt, 15))
                 last_error = body
                 continue
-            if response.status_code == 402:
-                raise RuntimeError("Firecrawl credits are exhausted or payment is required")
+            if response.status_code in {401, 402, 403}:
+                reason = {
+                    401: "authentication rejected",
+                    402: "credits exhausted or payment required",
+                    403: "key forbidden",
+                }[response.status_code]
+                self._disable_firecrawl_key(api_key, reason)
+                raise FirecrawlKeyUnavailable(response.status_code, reason, body)
             raise RuntimeError(f"Firecrawl failed {response.status_code}: {body}")
         raise RuntimeError(f"Firecrawl request failed: {last_error}")
+
+    def _firecrawl_request_with_key(
+        self,
+        method: str,
+        path_or_url: str,
+        payload: dict | None = None,
+        timeout: int = 90,
+        *,
+        api_key: str | None = None,
+        allow_key_failover: bool = True,
+    ) -> tuple[dict, str]:
+        """Execute a Firecrawl request and return both response and key used.
+
+        New independent requests may fail over across configured keys. Requests
+        tied to an existing crawl must pass api_key and disable failover so the
+        crawl remains attached to the account that created it.
+        """
+        if api_key:
+            try:
+                return self._firecrawl_request_on_key(
+                    method, path_or_url, api_key=api_key, payload=payload, timeout=timeout
+                ), api_key
+            except FirecrawlKeyUnavailable:
+                if not allow_key_failover:
+                    raise
+
+        attempted: set[str] = set()
+        last_error: Exception | None = None
+        while True:
+            try:
+                key = self._next_firecrawl_key(attempted)
+            except Exception:
+                if last_error is not None:
+                    raise RuntimeError(str(last_error)) from last_error
+                raise
+            attempted.add(key)
+            try:
+                data = self._firecrawl_request_on_key(
+                    method, path_or_url, api_key=key, payload=payload, timeout=timeout
+                )
+                return data, key
+            except FirecrawlKeyUnavailable as exc:
+                last_error = exc
+                if not allow_key_failover:
+                    raise
+                continue
+
+    def _firecrawl_request(
+        self,
+        method: str,
+        path_or_url: str,
+        payload: dict | None = None,
+        timeout: int = 90,
+        *,
+        api_key: str | None = None,
+        allow_key_failover: bool = True,
+    ) -> dict:
+        data, _ = self._firecrawl_request_with_key(
+            method,
+            path_or_url,
+            payload,
+            timeout,
+            api_key=api_key,
+            allow_key_failover=allow_key_failover,
+        )
+        return data
 
     def _crawl_official_site(self, run_id: str, rd: Path, website: str, limit: int, cancel_event: threading.Event) -> tuple[list[dict], int, list[str]]:
         exclude_paths = [
@@ -771,26 +933,43 @@ class DeepEnrichmentRuntime:
                 "timeout": int(os.environ.get("FIRECRAWL_PAGE_TIMEOUT_MS", "60000")),
             },
         }
-        started = self._firecrawl_request("POST", "/crawl", payload, timeout=120)
+        # Starting a crawl may fail over to another configured key. Once the
+        # crawl is created, every poll, pagination request and cancellation uses
+        # the same key because Firecrawl crawl IDs are account-scoped.
+        started, crawl_key = self._firecrawl_request_with_key("POST", "/crawl", payload, timeout=120)
         crawl_id = str(started.get("id") or "")
         if not crawl_id:
             raise RuntimeError(f"Firecrawl did not return a crawl ID: {str(started)[:300]}")
-        self.firecrawl_jobs[run_id] = crawl_id
-        self._patch_status(rd, firecrawl_job_id=crawl_id)
+        key_label = self._firecrawl_key_label(crawl_key)
+        self.firecrawl_jobs[run_id] = {"crawl_id": crawl_id, "api_key": crawl_key, "key_label": key_label}
+        self._patch_status(rd, firecrawl_job_id=crawl_id, firecrawl_key=key_label)
         deadline = time.time() + int(os.environ.get("FIRECRAWL_CRAWL_TIMEOUT_SECONDS", "1800"))
         result = {}
         while time.time() < deadline:
             if self._cancelled(run_id, cancel_event):
                 try:
-                    self._firecrawl_request("DELETE", f"/crawl/{crawl_id}", timeout=30)
+                    self._firecrawl_request(
+                        "DELETE",
+                        f"/crawl/{crawl_id}",
+                        timeout=30,
+                        api_key=crawl_key,
+                        allow_key_failover=False,
+                    )
                 except Exception:
                     pass
                 raise CancelledError()
-            result = self._firecrawl_request("GET", f"/crawl/{crawl_id}", timeout=120)
+            result = self._firecrawl_request(
+                "GET",
+                f"/crawl/{crawl_id}",
+                timeout=120,
+                api_key=crawl_key,
+                allow_key_failover=False,
+            )
             crawl_status = str(result.get("status") or "").lower()
             self._patch_status(
                 rd,
                 firecrawl_job_id=crawl_id,
+                firecrawl_key=key_label,
                 current_step=f"Firecrawl: {result.get('completed', 0)}/{result.get('total', '?')} pages",
             )
             if crawl_status in {"completed", "failed", "cancelled", "canceled"}:
@@ -798,7 +977,13 @@ class DeepEnrichmentRuntime:
             time.sleep(float(os.environ.get("FIRECRAWL_POLL_SECONDS", "4")))
         else:
             try:
-                self._firecrawl_request("DELETE", f"/crawl/{crawl_id}", timeout=30)
+                self._firecrawl_request(
+                    "DELETE",
+                    f"/crawl/{crawl_id}",
+                    timeout=30,
+                    api_key=crawl_key,
+                    allow_key_failover=False,
+                )
             except Exception:
                 pass
             raise RuntimeError("Firecrawl site crawl exceeded the configured timeout")
@@ -811,7 +996,13 @@ class DeepEnrichmentRuntime:
         seen_next = set()
         while next_url and next_url not in seen_next:
             seen_next.add(next_url)
-            page = self._firecrawl_request("GET", str(next_url), timeout=120)
+            page = self._firecrawl_request(
+                "GET",
+                str(next_url),
+                timeout=120,
+                api_key=crawl_key,
+                allow_key_failover=False,
+            )
             documents.extend(page.get("data") or [])
             next_url = page.get("next")
 
@@ -857,7 +1048,7 @@ class DeepEnrichmentRuntime:
 
     def _firecrawl_scrape(self, url: str) -> dict:
         url = self.validate_public_url(url)
-        response = self._firecrawl_request("POST", "/scrape", {
+        response, scrape_key = self._firecrawl_request_with_key("POST", "/scrape", {
             "url": url,
             "formats": ["markdown"],
             "onlyMainContent": True,
@@ -874,6 +1065,7 @@ class DeepEnrichmentRuntime:
             "metadata": metadata,
             "url": metadata.get("sourceURL") or metadata.get("url") or url,
             "credits_used": int(response.get("creditsUsed") or data.get("creditsUsed") or 1),
+            "firecrawl_key": self._firecrawl_key_label(scrape_key),
         }
 
     # ------------------------------------------------------------------
@@ -1645,6 +1837,14 @@ Evidence dossier:\n{compact}
                 value = json.loads(match.group(0))
                 return value if isinstance(value, dict) else {}
         return {}
+
+
+class FirecrawlKeyUnavailable(RuntimeError):
+    def __init__(self, status_code: int, reason: str, body: str = "") -> None:
+        self.status_code = int(status_code)
+        self.reason = str(reason or "Firecrawl key unavailable")
+        self.body = str(body or "")[:500]
+        super().__init__(f"Firecrawl key unavailable ({self.status_code}): {self.reason}")
 
 
 class CancelledError(Exception):

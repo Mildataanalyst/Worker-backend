@@ -89,3 +89,111 @@ def test_aggregate_exports_markdown_jsonl_and_csv(tmp_path):
     assert (rd / "gpt_fable_packet.md").exists()
     assert (rd / "deep_enrichment_export.zip").exists()
     assert "Example Foundation" in (rd / "gpt_fable_packet.md").read_text()
+
+
+class _FakeFirecrawlResponse:
+    def __init__(self, status_code, payload=None, text="", headers=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.text = text or json.dumps(self._payload)
+        self.headers = headers or {}
+
+    def json(self):
+        return self._payload
+
+
+def test_firecrawl_keys_support_multi_and_dedupe(tmp_path, monkeypatch):
+    monkeypatch.setenv("FIRECRAWL_API_KEYS", " fc-one,fc-two, fc-one\nfc-three ")
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "legacy-ignored")
+    rt = runtime(tmp_path)
+    assert rt._firecrawl_keys() == ["fc-one", "fc-two", "fc-three"]
+    assert rt._enabled_firecrawl_keys() == ["fc-one", "fc-two", "fc-three"]
+
+
+def test_firecrawl_independent_request_fails_over_on_exhausted_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("FIRECRAWL_API_KEYS", "fc-one,fc-two")
+    rt = runtime(tmp_path)
+    calls = []
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        auth = (headers or {}).get("Authorization")
+        calls.append(auth)
+        if auth == "Bearer fc-one":
+            return _FakeFirecrawlResponse(402, {"error": "credits exhausted"})
+        return _FakeFirecrawlResponse(200, {"success": True, "data": {"markdown": "ok"}})
+
+    monkeypatch.setattr("deep_enrichment.requests.request", fake_request)
+    data, used_key = rt._firecrawl_request_with_key("POST", "/scrape", {"url": "https://example.org"})
+    assert data["success"] is True
+    assert used_key == "fc-two"
+    assert calls == ["Bearer fc-one", "Bearer fc-two"]
+    disabled = rt._disabled_firecrawl_key_labels()
+    assert len(disabled) == 1
+    assert disabled[0]["reason"] == "credits exhausted or payment required"
+    assert "fc-one" not in json.dumps(disabled)
+
+
+def test_firecrawl_crawl_keeps_key_affinity_for_polling(tmp_path, monkeypatch):
+    monkeypatch.setenv("FIRECRAWL_API_KEYS", "fc-one,fc-two")
+    rt = runtime(tmp_path)
+    calls = []
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        auth = (headers or {}).get("Authorization")
+        calls.append((method, url, auth))
+        if method == "POST" and url.endswith("/crawl"):
+            return _FakeFirecrawlResponse(200, {"id": "crawl-123"})
+        if method == "GET" and url.endswith("/crawl/crawl-123"):
+            return _FakeFirecrawlResponse(200, {
+                "status": "completed",
+                "completed": 1,
+                "total": 1,
+                "creditsUsed": 1,
+                "data": [{
+                    "markdown": "Example Foundation won a national award.",
+                    "metadata": {"sourceURL": "https://example.org/about", "title": "About"},
+                    "links": [],
+                }],
+            })
+        raise AssertionError(f"Unexpected Firecrawl request: {method} {url}")
+
+    monkeypatch.setattr("deep_enrichment.requests.request", fake_request)
+    rd = tmp_path / "enrich_affinity"
+    rd.mkdir(parents=True, exist_ok=True)
+    pages, credits, notes = rt._crawl_official_site(
+        "enrich_affinity", rd, "https://example.org", 10, __import__("threading").Event()
+    )
+    assert credits == 1
+    assert len(pages) == 1
+    assert notes == []
+    assert [call[2] for call in calls] == ["Bearer fc-one", "Bearer fc-one"]
+    assert "enrich_affinity" not in rt.firecrawl_jobs
+    status = json.loads((rd / "status.json").read_text())
+    assert status["firecrawl_key"].startswith("key-")
+    assert "fc-one" not in json.dumps(status)
+
+
+def test_firecrawl_crawl_start_fails_over_then_keeps_second_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("FIRECRAWL_API_KEYS", "fc-one,fc-two")
+    rt = runtime(tmp_path)
+    calls = []
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        auth = (headers or {}).get("Authorization")
+        calls.append((method, url, auth))
+        if method == "POST" and url.endswith("/crawl") and auth == "Bearer fc-one":
+            return _FakeFirecrawlResponse(402, {"error": "credits exhausted"})
+        if method == "POST" and url.endswith("/crawl") and auth == "Bearer fc-two":
+            return _FakeFirecrawlResponse(200, {"id": "crawl-456"})
+        if method == "GET" and url.endswith("/crawl/crawl-456"):
+            return _FakeFirecrawlResponse(200, {"status": "completed", "completed": 0, "total": 0, "data": []})
+        raise AssertionError(f"Unexpected Firecrawl request: {method} {url} {auth}")
+
+    monkeypatch.setattr("deep_enrichment.requests.request", fake_request)
+    rd = tmp_path / "enrich_failover"
+    rd.mkdir(parents=True, exist_ok=True)
+    pages, _, _ = rt._crawl_official_site(
+        "enrich_failover", rd, "https://example.org", 10, __import__("threading").Event()
+    )
+    assert pages == []
+    assert [call[2] for call in calls] == ["Bearer fc-one", "Bearer fc-two", "Bearer fc-two"]
