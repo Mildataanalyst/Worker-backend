@@ -300,6 +300,8 @@ class DeepEnrichmentRuntime:
         self.router.add_api_route("/enrichment/export/{run_id}/{kind}", self.export, methods=["GET"])
         self.router.add_api_route("/enrichment/cancel/{run_id}", self.cancel, methods=["POST"])
         self.router.add_api_route("/enrichment/resume/{run_id}", self.resume, methods=["POST"])
+        self.router.add_api_route("/enrichment/repair-preview/{run_id}", self.repair_preview, methods=["GET"])
+        self.router.add_api_route("/enrichment/repair/{run_id}", self.start_repair, methods=["POST"])
         self.router.add_api_route("/enrichment/archive", self.archive, methods=["GET"])
         self.router.add_api_route("/enrichment/config", self.config, methods=["GET"])
 
@@ -444,32 +446,483 @@ class DeepEnrichmentRuntime:
             return self._json(False, status_code=409, error="Run is already active")
         event = threading.Event()
         self.cancel_flags[run_id] = event
-        self._patch_status(rd, stage="resuming", run_status="resuming", message="Resuming incomplete NGOs")
+        payload = self._read_json(rd / "input.json", {})
+        is_repair = str(payload.get("mode") or "").lower() == "repair"
+        self._patch_status(
+            rd,
+            stage="resuming",
+            run_status="resuming",
+            message="Resuming evidence repair" if is_repair else "Resuming incomplete NGOs",
+            error="",
+        )
         self.job_update(run_id, status="resuming", stage="resuming", cancel_requested=False)
-        thread = threading.Thread(target=self._run, args=(run_id, event), daemon=True)
+        target = self._run_repair if is_repair else self._run
+        thread = threading.Thread(target=target, args=(run_id, event), daemon=True)
         self.threads[run_id] = thread
         thread.start()
-        return self._json(True, run_id=run_id, stage="resuming")
+        return self._json(True, run_id=run_id, stage="resuming", mode="repair" if is_repair else "enrichment")
+
+    def repair_preview(self, run_id: str) -> JSONResponse:
+        rd = self._run_dir(run_id)
+        if not (rd / "input.json").exists():
+            return self._json(False, status_code=404, error="Deep Enrichment run not found")
+        preview = self._repair_preview_data(rd)
+        return self._json(True, **preview)
+
+    def start_repair(self, run_id: str, payload: dict | None = None) -> JSONResponse:
+        payload = payload or {}
+        source_rd = self._run_dir(run_id)
+        if not (source_rd / "input.json").exists():
+            return self._json(False, status_code=404, error="Deep Enrichment run not found")
+        source_thread = self.threads.get(run_id)
+        if source_thread and source_thread.is_alive():
+            return self._json(False, status_code=409, error="The source run is still active. Repair is available after it finishes.")
+        preview = self._repair_preview_data(source_rd)
+        if not preview.get("repair_required"):
+            return self._json(False, status_code=409, error="This run has no missing official-site evidence to repair")
+        if not self._firecrawl_keys():
+            return self._json(
+                False,
+                status_code=503,
+                stage="missing_firecrawl_key",
+                error="FIRECRAWL_API_KEYS or FIRECRAWL_API_KEY is not configured on the Railway worker",
+            )
+
+        options = self._repair_options(payload.get("options") or {})
+        source_payload = self._read_json(source_rd / "input.json", {})
+        all_ngos = source_payload.get("ngos") or []
+        repair_ids = list(preview.get("repair_ngo_ids") or [])
+        repair_run_id = f"repair_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        rd = self._run_dir(repair_run_id)
+        rd.mkdir(parents=True, exist_ok=True)
+        source_packs = source_rd / "ngo_research_packs"
+        if source_packs.exists():
+            shutil.copytree(source_packs, rd / "ngo_research_packs", dirs_exist_ok=True)
+
+        input_payload = {
+            "run_id": repair_run_id,
+            "mode": "repair",
+            "source_run_id": run_id,
+            "region": str(source_payload.get("region") or "").strip(),
+            "ngos": all_ngos,
+            "repair_ngo_ids": repair_ids,
+            "options": options,
+            "created_at": self.utc_now_iso(),
+        }
+        self._write_json(rd / "input.json", input_payload)
+        status = self._initial_repair_status(repair_run_id, run_id, preview, options)
+        self._write_status(rd, status)
+        self._initialise_repair_outputs(rd, input_payload)
+        self.job_create(
+            repair_run_id,
+            "deep_enrichment_repair",
+            rd,
+            status="queued",
+            stage="queued",
+            total=len(repair_ids),
+            processed=0,
+        )
+
+        event = threading.Event()
+        self.cancel_flags[repair_run_id] = event
+        thread = threading.Thread(target=self._run_repair, args=(repair_run_id, event), daemon=True)
+        self.threads[repair_run_id] = thread
+        thread.start()
+        return self._json(
+            True,
+            run_id=repair_run_id,
+            source_run_id=run_id,
+            stage="queued",
+            mode="repair",
+            source_total=preview.get("source_total", 0),
+            repair_required=preview.get("repair_required", 0),
+            already_complete=preview.get("already_complete", 0),
+            serper_queries_reused=preview.get("serper_queries_reused", 0),
+            new_serper_queries=0,
+            estimated_max_firecrawl_credits=int(preview.get("repair_required") or 0) * int(options["max_pages_per_site"]),
+            status_url=f"/enrichment/status/{repair_run_id}",
+        )
 
     def archive(self, limit: int = 100) -> JSONResponse:
         rows = []
-        for rd in self.runs_dir.glob("enrich_*"):
+        for rd in list(self.runs_dir.glob("enrich_*")) + list(self.runs_dir.glob("repair_*")):
             if not rd.is_dir():
                 continue
             status = self._read_json(rd / "status.json", {})
+            preview = self._repair_preview_data(rd)
             rows.append({
                 "run_id": rd.name,
                 "created_at": status.get("created_at") or "",
                 "updated_at": status.get("updated_at") or "",
                 "run_status": status.get("run_status") or "",
                 "stage": status.get("stage") or "",
+                "mode": status.get("mode") or ("repair" if rd.name.startswith("repair_") else "enrichment"),
+                "source_run_id": status.get("source_run_id") or "",
                 "processed": status.get("processed") or 0,
                 "total": status.get("total") or 0,
+                "source_total": preview.get("source_total") or status.get("source_total") or 0,
+                "already_complete": preview.get("already_complete") or 0,
+                "repair_required": preview.get("repair_required") or 0,
+                "repair_eligible": bool(preview.get("repair_required")) and not rd.name.startswith("repair_"),
                 "firecrawl_credits_used": status.get("firecrawl_credits_used") or 0,
                 "serper_queries_used": status.get("serper_queries_used") or 0,
+                "serper_queries_reused": status.get("serper_queries_reused") or preview.get("serper_queries_reused") or 0,
+                "external_sources_reused": status.get("external_sources_reused") or preview.get("external_sources_reused") or 0,
             })
         rows.sort(key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
         return self._json(True, count=len(rows), rows=rows[: max(1, min(limit, 500))])
+
+    def _repair_preview_data(self, rd: Path) -> dict:
+        payload = self._read_json(rd / "input.json", {})
+        ngos = payload.get("ngos") or []
+        summary_rows = self._read_json(rd / "master_summary.json", [])
+        summary_by_id = {str(row.get("ngo_id") or ""): row for row in summary_rows if isinstance(row, dict)}
+        dossiers: dict[str, dict] = {}
+        repair_ids: list[str] = []
+        already_complete = 0
+        no_website = 0
+        serper_reused = 0
+        external_reused = 0
+        official_pages = 0
+        for ngo in ngos:
+            ngo_id = str(ngo.get("ngo_id") or "")
+            summary = summary_by_id.get(ngo_id) or {}
+            if summary:
+                pages = int(summary.get("pages_collected") or 0)
+                crawl_status = str(summary.get("crawl_status") or ("complete" if pages > 0 else "limited")).lower()
+                website = str(summary.get("website") or ngo.get("website") or "").strip()
+                serper_reused += int(summary.get("serper_queries_used") or 0)
+                external_reused += int(summary.get("external_sources") or 0)
+            else:
+                if not dossiers:
+                    dossiers = self._dossiers_by_id(rd)
+                dossier = dossiers.get(ngo_id) or {}
+                crawl = dossier.get("crawl") or {}
+                pages = int(crawl.get("pages_collected") or len(dossier.get("website_pages") or []) or 0)
+                crawl_status = str(crawl.get("status") or ("complete" if pages > 0 else "limited")).lower()
+                website = str(dossier.get("website") or ngo.get("website") or "").strip()
+                external = dossier.get("external_research") or {}
+                serper_reused += int(external.get("queries_used") or 0)
+                external_reused += int(external.get("source_count") or len(external.get("sources") or []) or 0)
+            if not website:
+                no_website += 1
+            official_pages += pages
+            if pages > 0 and crawl_status == "complete":
+                already_complete += 1
+            else:
+                repair_ids.append(ngo_id)
+        status = self._read_json(rd / "status.json", {})
+        return {
+            "source_run_id": rd.name,
+            "source_total": len(ngos),
+            "already_complete": already_complete,
+            "repair_required": len(repair_ids),
+            "repair_ngo_ids": repair_ids,
+            "without_website": no_website,
+            "serper_queries_reused": serper_reused,
+            "external_sources_reused": external_reused,
+            "official_pages_reused": official_pages,
+            "new_serper_queries": 0,
+            "source_run_status": status.get("run_status") or "",
+            "source_stage": status.get("stage") or "",
+            "eligible": bool(repair_ids),
+        }
+
+    def _dossiers_by_id(self, rd: Path) -> dict[str, dict]:
+        output: dict[str, dict] = {}
+        jsonl_path = rd / "all_dossiers.jsonl"
+        if jsonl_path.exists():
+            try:
+                with jsonl_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        row = json.loads(line)
+                        ngo_id = str(row.get("ngo_id") or "")
+                        if ngo_id:
+                            output[ngo_id] = row
+            except Exception:
+                pass
+        if output:
+            return output
+        for evidence_path in (rd / "ngo_research_packs").glob("*/evidence.json"):
+            row = self._read_json(evidence_path, {})
+            ngo_id = str(row.get("ngo_id") or "")
+            if ngo_id:
+                output[ngo_id] = row
+        return output
+
+    def _initialise_repair_outputs(self, rd: Path, input_payload: dict) -> None:
+        dossiers = self._dossiers_by_id(rd)
+        summaries = [self._summary_from_dossier(dossier) for dossier in dossiers.values() if dossier]
+        summaries.sort(key=lambda row: str(row.get("ngo_name") or "").lower())
+        self._write_json(rd / "master_summary.json", summaries)
+        self._rebuild_aggregate_outputs(rd, input_payload)
+
+    def _initial_repair_status(self, run_id: str, source_run_id: str, preview: dict, options: dict) -> dict:
+        return {
+            "run_id": run_id,
+            "module": "deep_enrichment_repair",
+            "mode": "repair",
+            "source_run_id": source_run_id,
+            "run_status": "queued",
+            "stage": "queued",
+            "processed": 0,
+            "completed": 0,
+            "failed": 0,
+            "total": int(preview.get("repair_required") or 0),
+            "source_total": int(preview.get("source_total") or 0),
+            "already_complete": int(preview.get("already_complete") or 0),
+            "repair_required": int(preview.get("repair_required") or 0),
+            "repaired_count": 0,
+            "still_partial_count": 0,
+            "current_ngo": "",
+            "current_index": 0,
+            "current_step": "Waiting for worker",
+            "current_url": "",
+            "firecrawl_credits_used": 0,
+            "serper_queries_used": 0,
+            "serper_queries_reused": int(preview.get("serper_queries_reused") or 0),
+            "official_pages_collected": 0,
+            "official_pages_reused": int(preview.get("official_pages_reused") or 0),
+            "external_sources_collected": 0,
+            "external_sources_reused": int(preview.get("external_sources_reused") or 0),
+            "options": options,
+            "message": "Evidence repair queued. Existing Serper research will be reused.",
+            "error": "",
+            "created_at": self.utc_now_iso(),
+            "updated_at": self.utc_now_iso(),
+        }
+
+    def _repair_options(self, value: dict) -> dict:
+        value = value or {}
+        return {
+            "max_pages_per_site": self._clamp(value.get("max_pages_per_site"), 10, 100, int(os.environ.get("ENRICHMENT_MAX_PAGES_PER_SITE", "50"))),
+            "use_haiku": bool(value.get("use_haiku", True)),
+            "blind_haiku": bool(value.get("blind_haiku", True)),
+            "clean_existing_sources": bool(value.get("clean_existing_sources", True)),
+        }
+
+    def _run_repair(self, run_id: str, cancel_event: threading.Event) -> None:
+        rd = self._run_dir(run_id)
+        payload = self._read_json(rd / "input.json", {})
+        all_ngos = payload.get("ngos") or []
+        by_id = {str(ngo.get("ngo_id") or ""): ngo for ngo in all_ngos}
+        repair_ids = [str(value) for value in (payload.get("repair_ngo_ids") or []) if str(value)]
+        options = self._repair_options(payload.get("options") or {})
+        dossiers = self._dossiers_by_id(rd)
+        attempted = {
+            ngo_id for ngo_id, dossier in dossiers.items()
+            if str((dossier.get("repair_metadata") or {}).get("repair_run_id") or "") == run_id
+            and str((dossier.get("repair_metadata") or {}).get("attempt_status") or "") in {"complete", "still_limited"}
+        }
+        self._patch_status(
+            rd,
+            run_status="running",
+            stage="repairing_official_websites",
+            processed=len(attempted),
+            message="Repairing missing official-site evidence. No new Serper searches will run.",
+        )
+        self.job_update(run_id, status="running", stage="repairing_official_websites", total=len(repair_ids), processed=len(attempted), cancel_requested=False)
+        try:
+            for index, ngo_id in enumerate(repair_ids):
+                if ngo_id in attempted:
+                    continue
+                ngo = by_id.get(ngo_id)
+                if not ngo:
+                    continue
+                if self._cancelled(run_id, cancel_event):
+                    self._patch_status(rd, run_status="cancelled", stage="cancelled", message="Repair cancelled; completed repairs were preserved.")
+                    self.job_update(run_id, status="cancelled", stage="cancelled")
+                    self._rebuild_aggregate_outputs(rd, payload)
+                    return
+                if not self._enabled_firecrawl_keys():
+                    raise FirecrawlCapacityExhausted("No usable Firecrawl API keys remain")
+                self._patch_status(
+                    rd,
+                    stage="repairing_official_websites",
+                    current_ngo=ngo.get("ngo_name"),
+                    current_index=index + 1,
+                    current_step="Crawling missing official website",
+                    message=f"Repairing {ngo.get('ngo_name')}",
+                )
+                dossier = dossiers.get(ngo_id) or self._read_json(self._ngo_dir(rd, ngo) / "evidence.json", {})
+                try:
+                    repaired = self._repair_dossier(run_id, rd, ngo, dossier, options, cancel_event)
+                except FirecrawlCapacityExhausted:
+                    raise
+                except CancelledError:
+                    self._patch_status(rd, run_status="cancelled", stage="cancelled", message="Repair cancelled; completed repairs were preserved.")
+                    self.job_update(run_id, status="cancelled", stage="cancelled")
+                    self._rebuild_aggregate_outputs(rd, payload)
+                    return
+                except Exception as exc:
+                    repaired = dict(dossier or {})
+                    repaired.setdefault("crawl", {}).setdefault("notes", []).append(f"Repair failed: {str(exc)[:400]}")
+                    repaired["repair_metadata"] = {
+                        "repair_run_id": run_id,
+                        "source_run_id": payload.get("source_run_id") or "",
+                        "attempt_status": "still_limited",
+                        "error": str(exc)[:500],
+                        "new_pages_added": 0,
+                        "new_firecrawl_credits_used": 0,
+                        "serper_queries_rerun": 0,
+                        "completed_at": self.utc_now_iso(),
+                    }
+                    self._save_repaired_dossier(rd, ngo, repaired)
+                dossiers[ngo_id] = repaired
+                attempted.add(ngo_id)
+                summaries = [self._summary_from_dossier(item) for item in dossiers.values() if item]
+                summaries.sort(key=lambda row: str(row.get("ngo_name") or "").lower())
+                self._write_json(rd / "master_summary.json", summaries)
+                repaired_count = sum(1 for item in dossiers.values() if str((item.get("repair_metadata") or {}).get("repair_run_id") or "") == run_id and str((item.get("repair_metadata") or {}).get("attempt_status") or "") == "complete")
+                still_partial = sum(1 for item in dossiers.values() if str((item.get("repair_metadata") or {}).get("repair_run_id") or "") == run_id and str((item.get("repair_metadata") or {}).get("attempt_status") or "") == "still_limited")
+                self._patch_status(
+                    rd,
+                    processed=len(attempted),
+                    completed=repaired_count,
+                    repaired_count=repaired_count,
+                    still_partial_count=still_partial,
+                    current_step="Repaired dossier saved",
+                )
+                self.job_update(run_id, status="running", stage="repairing_official_websites", processed=len(attempted), total=len(repair_ids))
+                if len(attempted) % 5 == 0:
+                    self._rebuild_aggregate_outputs(rd, payload)
+
+            self._rebuild_aggregate_outputs(rd, payload)
+            preview = self._repair_preview_data(rd)
+            remaining = int(preview.get("repair_required") or 0)
+            final_status = "complete" if remaining == 0 else "partial"
+            final_stage = "results_ready" if remaining == 0 else "partial_results_ready"
+            self._patch_status(
+                rd,
+                run_status=final_status,
+                stage=final_stage,
+                processed=len(repair_ids),
+                completed=int(self._read_json(rd / "status.json", {}).get("repaired_count") or 0),
+                current_ngo="",
+                current_step="Repaired export bundle ready",
+                remaining_repair_required=remaining,
+                message="Evidence repair completed" if remaining == 0 else f"Evidence repair completed; {remaining} NGO(s) still have limited official-site evidence.",
+            )
+            self.job_update(run_id, status=final_status, stage=final_stage, processed=len(repair_ids), total=len(repair_ids), error="" if remaining == 0 else f"{remaining} NGO(s) remain partial")
+        except FirecrawlCapacityExhausted as exc:
+            self._rebuild_aggregate_outputs(rd, payload)
+            self._patch_status(
+                rd,
+                run_status="waiting_for_firecrawl_credits",
+                stage="waiting_for_firecrawl_credits",
+                current_step="Repair paused before Serper or any later work",
+                message="Repair paused because no usable Firecrawl credits remain. Add credits or a usable key, redeploy if needed, then Resume.",
+                error=str(exc)[:500],
+            )
+            self.job_update(run_id, status="paused", stage="waiting_for_firecrawl_credits", error=str(exc)[:500])
+        except Exception as exc:
+            self._patch_status(rd, run_status="error", stage="error", error=str(exc)[:1000], message="Evidence repair stopped unexpectedly")
+            self.job_update(run_id, status="error", stage="error", error=str(exc)[:1000])
+        finally:
+            self.firecrawl_jobs.pop(run_id, None)
+
+    def _repair_dossier(self, run_id: str, rd: Path, ngo: dict, dossier: dict, options: dict, cancel_event: threading.Event) -> dict:
+        dossier = dict(dossier or {})
+        website = str(dossier.get("website") or ngo.get("website") or "").strip()
+        source_run_id = str(self._read_json(rd / "input.json", {}).get("source_run_id") or "")
+        if not website:
+            dossier.setdefault("crawl", {})["status"] = "limited"
+            dossier.setdefault("crawl", {}).setdefault("notes", []).append("Repair could not run because no official website is stored. No new Serper search was used.")
+            dossier["repair_metadata"] = {
+                "repair_run_id": run_id,
+                "source_run_id": source_run_id,
+                "attempt_status": "still_limited",
+                "error": "No official website stored",
+                "new_pages_added": 0,
+                "new_firecrawl_credits_used": 0,
+                "serper_queries_rerun": 0,
+                "completed_at": self.utc_now_iso(),
+            }
+            self._save_repaired_dossier(rd, ngo, dossier)
+            return dossier
+
+        website = self.validate_public_url(website)
+        self._patch_status(rd, stage="repairing_official_websites", current_step="Crawling official website", current_url=website)
+        pages, credits, notes = self._crawl_official_site(run_id, rd, website, options["max_pages_per_site"], cancel_event)
+        if self._cancelled(run_id, cancel_event):
+            raise CancelledError()
+        previous_pages = int((dossier.get("crawl") or {}).get("pages_collected") or len(dossier.get("website_pages") or []) or 0)
+        dossier["website"] = website
+        dossier["website_pages"] = pages
+        dossier["website_candidate_highlights"] = self._extract_highlights(pages, "ngo_website")
+        prior_credits = int((dossier.get("crawl") or {}).get("firecrawl_credits_used") or 0)
+        dossier["crawl"] = {
+            "status": "complete" if pages else "limited",
+            "pages_collected": len(pages),
+            "page_types": dict(Counter(page.get("page_type") or "other" for page in pages)),
+            "firecrawl_credits_used": prior_credits + int(credits or 0),
+            "notes": list(dict.fromkeys(list((dossier.get("crawl") or {}).get("notes") or []) + list(notes or []) + ["Official-site evidence repaired without rerunning Serper."])),
+        }
+        if options.get("clean_existing_sources"):
+            sources = list((dossier.get("external_research") or {}).get("sources") or [])
+            for source in sources:
+                source["repair_identity_status"] = self._strict_identity_status(dossier.get("ngo_name") or ngo.get("ngo_name") or "", source)
+            dossier.setdefault("external_research", {})["sources"] = sources
+            model_sources = [source for source in sources if source.get("repair_identity_status") in {"confirmed", "probable"}]
+            dossier["external_candidate_highlights"] = self._extract_highlights(model_sources, "external")
+            dossier["external_research"]["model_source_count"] = len(model_sources)
+            dossier["external_research"]["rejected_identity_count"] = sum(1 for source in sources if source.get("repair_identity_status") == "rejected")
+        if options.get("use_haiku"):
+            dossier["preliminary_ai_before_repair"] = dossier.get("preliminary_ai") or {}
+            dossier["preliminary_ai"] = self._run_haiku(dossier, blind=bool(options.get("blind_haiku", True)))
+        dossier["generated_at"] = self.utc_now_iso()
+        dossier["repair_metadata"] = {
+            "repair_run_id": run_id,
+            "source_run_id": source_run_id,
+            "attempt_status": "complete" if pages else "still_limited",
+            "new_pages_added": max(0, len(pages) - previous_pages),
+            "new_firecrawl_credits_used": int(credits or 0),
+            "serper_queries_rerun": 0,
+            "existing_serper_queries_reused": int((dossier.get("external_research") or {}).get("queries_used") or 0),
+            "blind_haiku": bool(options.get("blind_haiku", True)),
+            "completed_at": self.utc_now_iso(),
+        }
+        dossier["model_ready_summary"] = self._model_ready_summary(dossier)
+        self._save_repaired_dossier(rd, ngo, dossier)
+        self._increment_usage(rd, firecrawl_credits=int(credits or 0), serper_queries=0, external_sources=0, pages=max(0, len(pages) - previous_pages))
+        return dossier
+
+    def _save_repaired_dossier(self, rd: Path, ngo: dict, dossier: dict) -> None:
+        ngo_dir = self._ngo_dir(rd, ngo)
+        ngo_dir.mkdir(parents=True, exist_ok=True)
+        self._write_jsonl(ngo_dir / "official_pages.jsonl", dossier.get("website_pages") or [])
+        self._write_json(ngo_dir / "official_highlights.json", dossier.get("website_candidate_highlights") or [])
+        self._write_json(ngo_dir / "external_highlights.json", dossier.get("external_candidate_highlights") or [])
+        self._write_json(ngo_dir / "evidence.json", dossier)
+        self._write_text(ngo_dir / "dossier.md", self._dossier_markdown(dossier))
+        self._write_sources_csv(ngo_dir / "sources.csv", dossier)
+
+    def _strict_identity_status(self, ngo_name: str, source: dict) -> str:
+        title_snippet = " ".join([str(source.get("title") or ""), str(source.get("snippet") or "")])
+        full_text = " ".join([title_snippet, str(source.get("full_text") or "")[:7000]])
+        norm_name = self._norm(ngo_name)
+        norm_title = self._norm(title_snippet)
+        norm_text = self._norm(full_text)
+        generic = {"foundation", "trust", "society", "organisation", "organization", "ngo", "india", "charitable", "education", "educational", "social", "welfare", "centre", "center", "association"}
+        tokens = [token for token in self._meaningful_name_tokens(ngo_name) if token not in generic]
+        if len(tokens) >= 2:
+            title_hits = sum(1 for token in tokens if token in norm_title)
+            text_hits = sum(1 for token in tokens if token in norm_text)
+            if norm_name and norm_name in norm_title:
+                return "confirmed"
+            if title_hits >= max(2, len(tokens) - 1):
+                return "confirmed"
+            if text_hits / max(1, len(tokens)) >= 0.75:
+                return "probable"
+            return "rejected"
+        if norm_name and norm_name in norm_title:
+            context = " " + norm_text + " "
+            if any(term in context for term in [" ngo ", " nonprofit ", " non profit ", " children ", " students ", " education ", " karnataka ", " bengaluru ", " bangalore ", " india "]):
+                return "probable"
+        return "rejected"
 
     # ------------------------------------------------------------------
     # Job lifecycle
@@ -518,6 +971,18 @@ class DeepEnrichmentRuntime:
                 try:
                     dossier = self._process_ngo(run_id, rd, ngo, options, cancel_event)
                     summary = self._summary_from_dossier(dossier)
+                except FirecrawlCapacityExhausted as exc:
+                    self._rebuild_aggregate_outputs(rd, payload)
+                    self._patch_status(
+                        rd,
+                        run_status="waiting_for_firecrawl_credits",
+                        stage="waiting_for_firecrawl_credits",
+                        current_step="Run paused before external research",
+                        message="Deep Enrichment paused because no usable Firecrawl credits remain. Add credits or a usable key, redeploy if needed, then Resume.",
+                        error=str(exc)[:500],
+                    )
+                    self.job_update(run_id, status="paused", stage="waiting_for_firecrawl_credits", error=str(exc)[:500])
+                    return
                 except CancelledError:
                     self._patch_status(rd, run_status="cancelled", stage="cancelled", message="Run cancelled; completed dossiers were preserved")
                     self.job_update(run_id, status="cancelled", stage="cancelled")
@@ -551,18 +1016,30 @@ class DeepEnrichmentRuntime:
                 self._rebuild_aggregate_outputs(rd, payload)
 
             self._rebuild_aggregate_outputs(rd, payload)
-            final_status = "partial" if errors else "complete"
-            final_stage = "partial_results_ready" if errors else "results_ready"
+            limited_count = sum(1 for row in summaries if row.get("crawl_status") != "complete" and row.get("status") != "failed")
+            if errors:
+                final_status = "partial"
+                final_stage = "partial_results_ready"
+                final_message = "Deep Enrichment completed with some failed NGOs"
+            elif limited_count:
+                final_status = "completed_with_missing_evidence"
+                final_stage = "results_ready"
+                final_message = f"Deep Enrichment completed; {limited_count} NGO(s) require official-site repair"
+            else:
+                final_status = "complete"
+                final_stage = "results_ready"
+                final_message = "Deep Enrichment completed"
             self._patch_status(
                 rd,
                 run_status=final_status,
                 stage=final_stage,
                 processed=len(ngos),
-                completed=sum(1 for row in summaries if row.get("status") == "complete"),
+                completed=sum(1 for row in summaries if row.get("status") != "failed"),
                 failed=sum(1 for row in summaries if row.get("status") == "failed"),
+                repair_required=limited_count,
                 current_ngo="",
                 current_step="Export bundle ready",
-                message="Deep Enrichment completed" if not errors else "Deep Enrichment completed with some failed NGOs",
+                message=final_message,
             )
             self.job_update(run_id, status="complete" if not errors else "partial", stage=final_stage, processed=len(ngos), total=len(ngos), error="" if not errors else f"{len(errors)} NGO(s) failed")
         except Exception as exc:
@@ -598,6 +1075,8 @@ class DeepEnrichmentRuntime:
                 official_pages, firecrawl_credits, crawl_notes = self._crawl_official_site(
                     run_id, rd, website, options["max_pages_per_site"], cancel_event
                 )
+            except FirecrawlCapacityExhausted:
+                raise
             except Exception as exc:
                 crawl_notes.append(f"Official-site crawl failed: {exc}")
         else:
@@ -788,7 +1267,7 @@ class DeepEnrichmentRuntime:
                     raise RuntimeError("FIRECRAWL_API_KEYS or FIRECRAWL_API_KEY is not configured")
                 disabled = ", ".join(item["key"] for item in self._disabled_firecrawl_key_labels())
                 detail = f" Disabled keys: {disabled}." if disabled else ""
-                raise RuntimeError(f"No usable Firecrawl API keys remain.{detail}")
+                raise FirecrawlCapacityExhausted(f"No usable Firecrawl API keys remain.{detail}")
             key = keys[self._firecrawl_cursor % len(keys)]
             self._firecrawl_cursor = (self._firecrawl_cursor + 1) % max(1, len(keys))
             return key
@@ -872,9 +1351,9 @@ class DeepEnrichmentRuntime:
         while True:
             try:
                 key = self._next_firecrawl_key(attempted)
-            except Exception:
+            except FirecrawlCapacityExhausted as exc:
                 if last_error is not None:
-                    raise RuntimeError(str(last_error)) from last_error
+                    raise FirecrawlCapacityExhausted(f"{exc}. Last key error: {last_error}") from last_error
                 raise
             attempted.add(key)
             try:
@@ -909,6 +1388,23 @@ class DeepEnrichmentRuntime:
         return data
 
     def _crawl_official_site(self, run_id: str, rd: Path, website: str, limit: int, cancel_event: threading.Event) -> tuple[list[dict], int, list[str]]:
+        failover_notes: list[str] = []
+        attempted_keys = max(1, len(self._firecrawl_keys()))
+        for attempt in range(attempted_keys):
+            try:
+                pages, credits, notes = self._crawl_official_site_once(run_id, rd, website, limit, cancel_event)
+                return pages, credits, failover_notes + notes
+            except FirecrawlKeyUnavailable as exc:
+                self.firecrawl_jobs.pop(run_id, None)
+                failover_notes.append(f"Firecrawl crawl key failed during polling ({exc.reason}); restarted on another configured key.")
+                if not self._enabled_firecrawl_keys():
+                    raise FirecrawlCapacityExhausted("No usable Firecrawl API keys remain after crawl-key failover") from exc
+                if attempt + 1 >= attempted_keys:
+                    raise FirecrawlCapacityExhausted("All configured Firecrawl keys failed during official-site crawl") from exc
+                continue
+        raise FirecrawlCapacityExhausted("No usable Firecrawl API keys remain")
+
+    def _crawl_official_site_once(self, run_id: str, rd: Path, website: str, limit: int, cancel_event: threading.Event) -> tuple[list[dict], int, list[str]]:
         exclude_paths = [
             ".*(?:/|^)(?:privacy|terms|cookie|donate|donation|checkout|login|signin|wp-admin|cart|account)(?:/|$).*",
             ".*(?:/|^)(?:tag|author|search|feed)(?:/|$).*",
@@ -1212,13 +1708,13 @@ class DeepEnrichmentRuntime:
         findings.sort(key=lambda row: (-int(row.get("weight") or 0), str(row.get("source_title") or "")))
         return findings[:150]
 
-    def _run_haiku(self, dossier: dict) -> dict:
+    def _run_haiku(self, dossier: dict, blind: bool = False) -> dict:
         if not os.environ.get("ANTHROPIC_API_KEY"):
             return {"enabled": False, "status": "skipped", "reason": "ANTHROPIC_API_KEY is not configured"}
         anthropic_mod = self.get_anthropic()
         if anthropic_mod is None:
             return {"enabled": False, "status": "skipped", "reason": "Anthropic SDK is unavailable"}
-        compact = self._haiku_input(dossier)
+        compact = self._haiku_input(dossier, blind=blind)
         schema = {
             "primary_category": "one CATEGORY key",
             "secondary_categories": ["up to two CATEGORY keys"],
@@ -1258,16 +1754,19 @@ Evidence dossier:\n{compact}
                 "input_tokens": getattr(getattr(response, "usage", None), "input_tokens", None),
                 "output_tokens": getattr(getattr(response, "usage", None), "output_tokens", None),
                 "non_final": True,
+                "blind_to_pm_context": bool(blind),
             })
             return parsed
         except Exception as exc:
             return {"enabled": True, "status": "failed", "error": str(exc)[:500], "non_final": True}
 
-    def _haiku_input(self, dossier: dict) -> str:
+    def _haiku_input(self, dossier: dict, blind: bool = False) -> str:
         official = dossier.get("website_candidate_highlights") or []
         external = dossier.get("external_candidate_highlights") or []
         pages = dossier.get("website_pages") or []
         sources = dossier.get("external_research", {}).get("sources") or []
+        if any(source.get("repair_identity_status") for source in sources):
+            sources = [source for source in sources if source.get("repair_identity_status") in {"confirmed", "probable"}]
         page_summaries = []
         for page in pages[:20]:
             page_summaries.append({
@@ -1283,13 +1782,14 @@ Evidence dossier:\n{compact}
             })
         compact = {
             "ngo_name": dossier.get("ngo_name"),
-            "pm_context": dossier.get("pm_context"),
             "input_category": dossier.get("category_input"),
             "official_highlights": official[:40],
             "external_highlights": external[:40],
             "key_pages": page_summaries,
             "external_sources": source_summaries,
         }
+        if not blind:
+            compact["pm_context"] = dossier.get("pm_context")
         return json.dumps(compact, ensure_ascii=False)[:110_000]
 
     # ------------------------------------------------------------------
@@ -1315,6 +1815,9 @@ Evidence dossier:\n{compact}
         prelim = dossier.get("preliminary_ai") or {}
         summary = dossier.get("model_ready_summary") or {}
         top = summary.get("top_candidate_findings") or []
+        crawl = dossier.get("crawl") or {}
+        repair = dossier.get("repair_metadata") or {}
+        crawl_status = str(crawl.get("status") or ("complete" if int(crawl.get("pages_collected") or 0) > 0 else "limited")).lower()
         return {
             "ngo_id": dossier.get("ngo_id"),
             "ngo_name": dossier.get("ngo_name"),
@@ -1329,13 +1832,20 @@ Evidence dossier:\n{compact}
             "evidence_strength": self._signal_value(prelim, "evidence_strength"),
             "dfp_fit_signal": self._signal_value(prelim, "dfp_fit_signal"),
             "top_finding": top[0].get("exact_excerpt") if top else "",
-            "pages_collected": dossier.get("crawl", {}).get("pages_collected", 0),
+            "pages_collected": crawl.get("pages_collected", 0),
+            "crawl_status": crawl_status,
+            "model_readiness": "MODEL_READY" if crawl_status == "complete" else "PARTIAL_WEBSITE_MISSING",
             "external_sources": dossier.get("external_research", {}).get("source_count", 0),
+            "model_external_sources": dossier.get("external_research", {}).get("model_source_count", dossier.get("external_research", {}).get("source_count", 0)),
+            "rejected_identity_sources": dossier.get("external_research", {}).get("rejected_identity_count", 0),
             "serper_queries_used": dossier.get("external_research", {}).get("queries_used", 0),
-            "firecrawl_credits_used": dossier.get("crawl", {}).get("firecrawl_credits_used", 0),
+            "firecrawl_credits_used": crawl.get("firecrawl_credits_used", 0),
             "haiku_status": prelim.get("status") or "not_run",
-            "status": "complete",
-            "error": "",
+            "repair_status": repair.get("attempt_status") or "",
+            "repair_run_id": repair.get("repair_run_id") or "",
+            "new_pages_added": repair.get("new_pages_added") or 0,
+            "status": "complete" if crawl_status == "complete" else "limited",
+            "error": repair.get("error") or "",
         }
 
     def _signal_value(self, prelim: dict, key: str) -> Any:
@@ -1398,7 +1908,10 @@ Evidence dossier:\n{compact}
 
         lines.extend(["## External media and evidence", ""])
         source_limit = 30 if not compact else 15
-        for source in (external.get("sources") or [])[:source_limit]:
+        model_sources = list(external.get("sources") or [])
+        if any(source.get("repair_identity_status") for source in model_sources):
+            model_sources = [source for source in model_sources if source.get("repair_identity_status") in {"confirmed", "probable"}]
+        for source in model_sources[:source_limit]:
             excerpt = re.sub(r"\s+", " ", str(source.get("full_text") or source.get("snippet") or "")).strip()[:1500 if not compact else 700]
             lines.extend([
                 f"### {source.get('title') or 'Untitled source'}",
@@ -1519,11 +2032,16 @@ Evidence dossier:\n{compact}
             "run_id": rd.name,
             "created_at": status.get("created_at"),
             "updated_at": status.get("updated_at"),
+            "mode": input_payload.get("mode") or "enrichment",
+            "source_run_id": input_payload.get("source_run_id") or "",
             "selected_count": len(input_payload.get("ngos") or []),
-            "completed_count": sum(1 for row in summaries if row.get("status") == "complete"),
+            "completed_count": sum(1 for row in summaries if row.get("status") in {"complete", "limited"}),
+            "model_ready_count": sum(1 for row in summaries if row.get("crawl_status") == "complete"),
+            "limited_count": sum(1 for row in summaries if row.get("crawl_status") != "complete" and row.get("status") != "failed"),
             "failed_count": sum(1 for row in summaries if row.get("status") == "failed"),
             "firecrawl_credits_used": status.get("firecrawl_credits_used", 0),
             "serper_queries_used": status.get("serper_queries_used", 0),
+            "serper_queries_reused": status.get("serper_queries_reused", 0),
             "official_pages_collected": status.get("official_pages_collected", 0),
             "external_sources_collected": status.get("external_sources_collected", 0),
             "options": input_payload.get("options") or {},
@@ -1536,8 +2054,9 @@ Evidence dossier:\n{compact}
         fields = [
             "ngo_id", "ngo_name", "website", "pm_reviewer", "pm_rating", "primary_category", "primary_category_label",
             "standout_value", "transformation_potential_signal", "demonstrated_transformation_signal", "evidence_strength",
-            "dfp_fit_signal", "top_finding", "pages_collected", "external_sources", "serper_queries_used",
-            "firecrawl_credits_used", "haiku_status", "status", "error",
+            "dfp_fit_signal", "top_finding", "pages_collected", "crawl_status", "model_readiness",
+            "external_sources", "model_external_sources", "rejected_identity_sources", "serper_queries_used",
+            "firecrawl_credits_used", "haiku_status", "repair_status", "repair_run_id", "new_pages_added", "status", "error",
         ]
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
@@ -1629,6 +2148,10 @@ Evidence dossier:\n{compact}
         raw = str(status.get("run_status") or "").lower()
         if raw in {"complete", "partial", "cancelled", "error"}:
             return raw
+        if raw == "completed_with_missing_evidence":
+            return "complete"
+        if raw == "waiting_for_firecrawl_credits":
+            return "paused"
         if raw in {"queued", "resuming"}:
             return raw
         return "running"
@@ -1837,6 +2360,10 @@ Evidence dossier:\n{compact}
                 value = json.loads(match.group(0))
                 return value if isinstance(value, dict) else {}
         return {}
+
+
+class FirecrawlCapacityExhausted(RuntimeError):
+    pass
 
 
 class FirecrawlKeyUnavailable(RuntimeError):

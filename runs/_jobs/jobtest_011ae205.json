@@ -1,0 +1,16 @@
+{
+  "run_id": "jobtest_011ae205",
+  "job_type": "unit_test",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "run_dir": "/mnt/data/v61code/runs/jobtest_011ae205",
+  "owner_pid": 12507,
+  "cancel_requested": true,
+  "created_at": "2026-07-12T16:14:53Z",
+  "total": 10,
+  "processed": 4,
+  "updated_at": "2026-07-12T16:14:53Z",
+  "cancel_requested_at": "2026-07-12T16:14:53Z",
+  "interrupted_at": "2026-07-12T16:14:53Z",
+  "live_state": "not_running"
+}

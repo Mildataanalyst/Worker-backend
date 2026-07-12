@@ -1,29 +1,169 @@
 [
   {
-    "id": "4b1bdb796507",
+    "id": "83ca8629af90",
     "action": "final_send_to_contact_tracker",
     "label": "Final Ranking sent to tracker: 1 row(s)",
     "region": "Karnataka",
-    "created_at": "2026-07-08 09:20:11",
+    "created_at": "2026-07-12 16:09:08",
     "files": [
       {
-        "path": "/tmp/pytest-of-root/pytest-1/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
+        "path": "/tmp/pytest-of-root/pytest-0/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
         "before": null,
-        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n4650114fae3e,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-08 09:20:11,2026-07-08 09:20:11,2026-07-08 09:20:11\n"
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\nd32f0fa997c1,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:09:08,2026-07-12 16:09:08,2026-07-12 16:09:08\n"
       }
     ]
   },
   {
-    "id": "e3d36d0c03e8",
+    "id": "f5d9bbf8bc30",
     "action": "contact_tracker_update",
     "label": "Contact Tracker row updated",
     "region": "Karnataka",
-    "created_at": "2026-07-08 09:20:11",
+    "created_at": "2026-07-12 16:09:08",
+    "files": [
+      {
+        "path": "/tmp/pytest-of-root/pytest-0/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
+        "before": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\nd32f0fa997c1,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:09:08,2026-07-12 16:09:08,2026-07-12 16:09:08\n",
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\nd32f0fa997c1,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,connected,,,,Call done.,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:09:08,2026-07-12 16:09:08,2026-07-12 16:09:08\n"
+      }
+    ]
+  },
+  {
+    "id": "3760d0361c42",
+    "action": "final_send_to_contact_tracker",
+    "label": "Final Ranking sent to tracker: 1 row(s)",
+    "region": "Karnataka",
+    "created_at": "2026-07-12 16:09:57",
     "files": [
       {
         "path": "/tmp/pytest-of-root/pytest-1/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
-        "before": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n4650114fae3e,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-08 09:20:11,2026-07-08 09:20:11,2026-07-08 09:20:11\n",
-        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n4650114fae3e,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,connected,,,,Call done.,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-08 09:20:11,2026-07-08 09:20:11,2026-07-08 09:20:11\n"
+        "before": null,
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n9a984fa18edd,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:09:57,2026-07-12 16:09:57,2026-07-12 16:09:57\n"
+      }
+    ]
+  },
+  {
+    "id": "4b60418dc5a0",
+    "action": "contact_tracker_update",
+    "label": "Contact Tracker row updated",
+    "region": "Karnataka",
+    "created_at": "2026-07-12 16:09:57",
+    "files": [
+      {
+        "path": "/tmp/pytest-of-root/pytest-1/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
+        "before": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n9a984fa18edd,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:09:57,2026-07-12 16:09:57,2026-07-12 16:09:57\n",
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n9a984fa18edd,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,connected,,,,Call done.,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:09:57,2026-07-12 16:09:57,2026-07-12 16:09:57\n"
+      }
+    ]
+  },
+  {
+    "id": "d529c0e40320",
+    "action": "final_send_to_contact_tracker",
+    "label": "Final Ranking sent to tracker: 1 row(s)",
+    "region": "Karnataka",
+    "created_at": "2026-07-12 16:12:20",
+    "files": [
+      {
+        "path": "/tmp/pytest-of-root/pytest-2/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
+        "before": null,
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n58cd6a0f1c0a,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:12:20,2026-07-12 16:12:20,2026-07-12 16:12:20\n"
+      }
+    ]
+  },
+  {
+    "id": "fd673474e75c",
+    "action": "contact_tracker_update",
+    "label": "Contact Tracker row updated",
+    "region": "Karnataka",
+    "created_at": "2026-07-12 16:12:20",
+    "files": [
+      {
+        "path": "/tmp/pytest-of-root/pytest-2/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
+        "before": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n58cd6a0f1c0a,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:12:20,2026-07-12 16:12:20,2026-07-12 16:12:20\n",
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n58cd6a0f1c0a,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,connected,,,,Call done.,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:12:20,2026-07-12 16:12:20,2026-07-12 16:12:20\n"
+      }
+    ]
+  },
+  {
+    "id": "a0c163f3676e",
+    "action": "final_send_to_contact_tracker",
+    "label": "Final Ranking sent to tracker: 1 row(s)",
+    "region": "Karnataka",
+    "created_at": "2026-07-12 16:14:16",
+    "files": [
+      {
+        "path": "/tmp/pytest-of-root/pytest-3/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
+        "before": null,
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n2058ca34cc07,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:14:16,2026-07-12 16:14:16,2026-07-12 16:14:16\n"
+      }
+    ]
+  },
+  {
+    "id": "7224c3be5ec2",
+    "action": "contact_tracker_update",
+    "label": "Contact Tracker row updated",
+    "region": "Karnataka",
+    "created_at": "2026-07-12 16:14:16",
+    "files": [
+      {
+        "path": "/tmp/pytest-of-root/pytest-3/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
+        "before": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n2058ca34cc07,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:14:16,2026-07-12 16:14:16,2026-07-12 16:14:16\n",
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n2058ca34cc07,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,connected,,,,Call done.,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:14:16,2026-07-12 16:14:16,2026-07-12 16:14:16\n"
+      }
+    ]
+  },
+  {
+    "id": "fa99e0f04966",
+    "action": "final_send_to_contact_tracker",
+    "label": "Final Ranking sent to tracker: 1 row(s)",
+    "region": "Karnataka",
+    "created_at": "2026-07-12 16:14:35",
+    "files": [
+      {
+        "path": "/tmp/pytest-of-root/pytest-4/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
+        "before": null,
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n1fa99e4baa6e,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:14:35,2026-07-12 16:14:35,2026-07-12 16:14:35\n"
+      }
+    ]
+  },
+  {
+    "id": "a7007a8354f4",
+    "action": "contact_tracker_update",
+    "label": "Contact Tracker row updated",
+    "region": "Karnataka",
+    "created_at": "2026-07-12 16:14:35",
+    "files": [
+      {
+        "path": "/tmp/pytest-of-root/pytest-4/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
+        "before": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n1fa99e4baa6e,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:14:35,2026-07-12 16:14:35,2026-07-12 16:14:35\n",
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n1fa99e4baa6e,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,connected,,,,Call done.,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:14:35,2026-07-12 16:14:35,2026-07-12 16:14:35\n"
+      }
+    ]
+  },
+  {
+    "id": "861efdad193a",
+    "action": "final_send_to_contact_tracker",
+    "label": "Final Ranking sent to tracker: 1 row(s)",
+    "region": "Karnataka",
+    "created_at": "2026-07-12 16:14:53",
+    "files": [
+      {
+        "path": "/tmp/pytest-of-root/pytest-5/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
+        "before": null,
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n711cdb356f05,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:14:53,2026-07-12 16:14:53,2026-07-12 16:14:53\n"
+      }
+    ]
+  },
+  {
+    "id": "92c770cf0087",
+    "action": "contact_tracker_update",
+    "label": "Contact Tracker row updated",
+    "region": "Karnataka",
+    "created_at": "2026-07-12 16:14:53",
+    "files": [
+      {
+        "path": "/tmp/pytest-of-root/pytest-5/test_final_output_can_send_to_0/workspaces/karnataka/contact_tracker.csv",
+        "before": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n711cdb356f05,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,not_started,,,,,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:14:53,2026-07-12 16:14:53,2026-07-12 16:14:53\n",
+        "after": "tracker_id,region,ngo_ref,lead_id,ngo_name,district,final_rank,final_bucket,website,source_mix,poc_name,contact_number,referred_by,contact_status,outreach_owner,meeting_date,meeting_time,meeting_notes,next_follow_up_date,tracker_comment,pm_reviewer,pm_rating,pm_comment,background,one_line_understanding,all_emails,selected_to_emails,selected_cc_emails,all_phones,selected_phone,linkedin_org_urls,linkedin_people_urls,contact_form_urls,contact_source_urls,best_contact_route,contact_confidence,contact_confidence_reason,email_subject,email_body,linkedin_message,website_detail,reviewer_line,outreach_locked,manual_review_needed,query_mode,queries_used,contact_generated_at,outreach_template_name,sent_from_final_at,created_at,updated_at\n711cdb356f05,Karnataka,lead_tracker_test,lead_tracker_test,Tracker Test NGO,,1,Final Shortlist,https://example.org,Human Referral,,9999999999,Milan,connected,,,,Call done.,,,Milan,5,Strong fit.,Runs a residential hostel for children.,Runs a residential hostel for children.,,,,,,,,,,,,,,,,,,,,,,,,2026-07-12 16:14:53,2026-07-12 16:14:53,2026-07-12 16:14:53\n"
       }
     ]
   }

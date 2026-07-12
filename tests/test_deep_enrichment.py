@@ -197,3 +197,147 @@ def test_firecrawl_crawl_start_fails_over_then_keeps_second_key(tmp_path, monkey
     )
     assert pages == []
     assert [call[2] for call in calls] == ["Bearer fc-one", "Bearer fc-two", "Bearer fc-two"]
+
+
+def _sample_dossier(ngo, pages=0):
+    return {
+        "schema_version": "1.0",
+        "ngo_id": ngo["ngo_id"],
+        "ngo_name": ngo["ngo_name"],
+        "website": ngo["website"],
+        "pm_context": {"reviewer": "", "rating": 4, "comment": "", "one_line_understanding": ""},
+        "category_input": {"primary": "uncategorised", "secondary": []},
+        "crawl": {"status": "complete" if pages else "limited", "pages_collected": pages, "firecrawl_credits_used": pages, "notes": []},
+        "website_pages": ([{"title": "About", "url": ngo["website"], "page_type": "about", "markdown": "About"}] if pages else []),
+        "website_candidate_highlights": [],
+        "external_research": {"queries": [{"query": "stored"}], "queries_used": 45, "sources": [], "source_count": 8},
+        "external_candidate_highlights": [],
+        "preliminary_ai": {"enabled": False, "status": "not_run"},
+        "model_ready_summary": {"top_candidate_findings": []},
+    }
+
+
+def test_repair_preview_counts_only_missing_official_sites(tmp_path):
+    rt = runtime(tmp_path)
+    rd = tmp_path / "enrich_source"
+    complete, limited = rt._normalise_ngos([
+        {"ngo_name": "Complete Foundation", "website": "https://complete.example"},
+        {"ngo_name": "Limited Foundation", "website": "https://limited.example"},
+    ])
+    rt._write_json(rd / "input.json", {"ngos": [complete, limited], "options": {}})
+    rt._write_json(rt._ngo_dir(rd, complete) / "evidence.json", _sample_dossier(complete, pages=2))
+    rt._write_json(rt._ngo_dir(rd, limited) / "evidence.json", _sample_dossier(limited, pages=0))
+    rt._rebuild_aggregate_outputs(rd, {"ngos": [complete, limited], "options": {}})
+    preview = rt._repair_preview_data(rd)
+    assert preview["source_total"] == 2
+    assert preview["already_complete"] == 1
+    assert preview["repair_required"] == 1
+    assert preview["serper_queries_reused"] == 90
+    assert preview["new_serper_queries"] == 0
+
+
+def test_repair_dossier_reuses_serper_and_adds_official_pages(tmp_path, monkeypatch):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+    rt = runtime(tmp_path)
+    ngo = rt._normalise_ngos([{"ngo_name": "Repair Foundation", "website": "https://repair.example"}])[0]
+    rd = tmp_path / "repair_test"
+    rt._write_json(rd / "input.json", {"source_run_id": "enrich_source", "ngos": [ngo]})
+    rt._write_json(rd / "status.json", rt._initial_repair_status("repair_test", "enrich_source", {
+        "repair_required": 1, "source_total": 1, "already_complete": 0,
+        "serper_queries_reused": 45, "external_sources_reused": 8, "official_pages_reused": 0,
+    }, rt._repair_options({"use_haiku": False})))
+    dossier = _sample_dossier(ngo, pages=0)
+    monkeypatch.setattr(rt, "_crawl_official_site", lambda *args, **kwargs: ([{
+        "title": "About", "url": "https://repair.example/about", "page_type": "about",
+        "markdown": "Repair Foundation supports children in Karnataka.", "metadata": {}, "links": [],
+    }], 1, []))
+    repaired = rt._repair_dossier("repair_test", rd, ngo, dossier, rt._repair_options({"use_haiku": False}), __import__("threading").Event())
+    assert repaired["crawl"]["status"] == "complete"
+    assert repaired["repair_metadata"]["serper_queries_rerun"] == 0
+    assert repaired["external_research"]["queries_used"] == 45
+    status = json.loads((rd / "status.json").read_text())
+    assert status["serper_queries_used"] == 0
+    assert status["official_pages_collected"] == 1
+
+
+def test_strict_identity_filter_rejects_unrelated_generic_name(tmp_path):
+    rt = runtime(tmp_path)
+    unrelated = {
+        "title": "Relative humidity and solar radiation exacerbate snow drought risk",
+        "snippet": "Headstreams of the Tarim River Basin",
+        "full_text": "A hydrology study about river headstreams in China.",
+    }
+    relevant = {
+        "title": "Headstreams nonprofit expands play-based education in Karnataka",
+        "snippet": "The NGO works with children and youth in Bengaluru.",
+        "full_text": "Headstreams is an Indian nonprofit supporting education.",
+    }
+    assert rt._strict_identity_status("Headstreams", unrelated) == "rejected"
+    assert rt._strict_identity_status("Headstreams", relevant) == "probable"
+
+
+def test_firecrawl_polling_key_failure_restarts_crawl_on_next_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("FIRECRAWL_API_KEYS", "fc-one,fc-two")
+    rt = runtime(tmp_path)
+    calls = []
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        auth = (headers or {}).get("Authorization")
+        calls.append((method, url, auth))
+        if method == "POST" and url.endswith("/crawl") and auth == "Bearer fc-one":
+            return _FakeFirecrawlResponse(200, {"id": "crawl-one"})
+        if method == "GET" and url.endswith("/crawl/crawl-one"):
+            return _FakeFirecrawlResponse(402, {"error": "credits exhausted"})
+        if method == "POST" and url.endswith("/crawl") and auth == "Bearer fc-two":
+            return _FakeFirecrawlResponse(200, {"id": "crawl-two"})
+        if method == "GET" and url.endswith("/crawl/crawl-two"):
+            return _FakeFirecrawlResponse(200, {"status": "completed", "completed": 1, "total": 1, "creditsUsed": 1, "data": [{
+                "markdown": "Example Foundation supports children.",
+                "metadata": {"sourceURL": "https://example.org/about", "title": "About"},
+                "links": [],
+            }]})
+        raise AssertionError(f"Unexpected Firecrawl request: {method} {url} {auth}")
+
+    monkeypatch.setattr("deep_enrichment.requests.request", fake_request)
+    rd = tmp_path / "enrich_poll_failover"
+    rd.mkdir(parents=True, exist_ok=True)
+    pages, credits, notes = rt._crawl_official_site("enrich_poll_failover", rd, "https://example.org", 10, __import__("threading").Event())
+    assert len(pages) == 1
+    assert credits == 1
+    assert any("restarted" in note for note in notes)
+    assert [call[2] for call in calls] == ["Bearer fc-one", "Bearer fc-one", "Bearer fc-two", "Bearer fc-two"]
+
+
+def test_start_repair_runs_end_to_end_without_serper(tmp_path, monkeypatch):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test")
+    rt = runtime(tmp_path)
+    source_rd = tmp_path / "enrich_source_run"
+    complete, limited = rt._normalise_ngos([
+        {"ngo_name": "Complete Foundation", "website": "https://complete.example"},
+        {"ngo_name": "Limited Foundation", "website": "https://limited.example"},
+    ])
+    payload = {"run_id": source_rd.name, "region": "Karnataka", "ngos": [complete, limited], "options": {}}
+    rt._write_json(source_rd / "input.json", payload)
+    rt._write_json(source_rd / "status.json", {"run_status": "complete", "stage": "results_ready", "created_at": "x", "updated_at": "x"})
+    for ngo, pages in [(complete, 1), (limited, 0)]:
+        dossier = _sample_dossier(ngo, pages=pages)
+        rt._write_json(rt._ngo_dir(source_rd, ngo) / "evidence.json", dossier)
+    rt._write_json(source_rd / "master_summary.json", [rt._summary_from_dossier(_sample_dossier(complete, 1)), rt._summary_from_dossier(_sample_dossier(limited, 0))])
+    rt._rebuild_aggregate_outputs(source_rd, payload)
+
+    monkeypatch.setattr(rt, "_crawl_official_site", lambda *args, **kwargs: ([{
+        "title": "About", "url": "https://limited.example/about", "page_type": "about",
+        "markdown": "Limited Foundation supports children.", "metadata": {}, "links": [],
+    }], 1, []))
+    response = rt.start_repair(source_rd.name, {"options": {"use_haiku": False}})
+    body = json.loads(response.body)
+    assert body["ok"] is True
+    repair_id = body["run_id"]
+    rt.threads[repair_id].join(timeout=10)
+    status = json.loads((tmp_path / repair_id / "status.json").read_text())
+    assert status["stage"] == "results_ready"
+    assert status["serper_queries_used"] == 0
+    assert status["serper_queries_reused"] == 90
+    repaired = rt._dossiers_by_id(tmp_path / repair_id)[limited["ngo_id"]]
+    assert repaired["crawl"]["status"] == "complete"
+    assert repaired["repair_metadata"]["serper_queries_rerun"] == 0

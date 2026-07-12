@@ -1,0 +1,13 @@
+{
+  "run_id": "jobtest_78d9c7e9",
+  "job_type": "unit_test",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "run_dir": "/mnt/data/v61code/runs/jobtest_78d9c7e9",
+  "owner_pid": 12507,
+  "cancel_requested": false,
+  "created_at": "2026-07-12T16:14:53Z",
+  "updated_at": "2026-07-12T16:14:53Z",
+  "interrupted_at": "2026-07-12T16:14:53Z",
+  "live_state": "not_running"
+}
