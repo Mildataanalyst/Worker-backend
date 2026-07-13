@@ -11,6 +11,8 @@ This module deliberately keeps enrichment and judgement separate:
 from __future__ import annotations
 
 import csv
+import copy
+import io
 import hashlib
 import json
 import os
@@ -18,6 +20,7 @@ import re
 import shutil
 import threading
 import time
+import tempfile
 import uuid
 import zipfile
 from collections import Counter, defaultdict
@@ -28,6 +31,7 @@ from urllib.parse import urlparse
 import requests
 from fastapi import APIRouter
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 
 
 CATEGORY_LABELS = {
@@ -289,6 +293,13 @@ class DeepEnrichmentRuntime:
         self._firecrawl_disabled: dict[str, str] = {}
         self._status_lock = threading.RLock()
         self._register_routes()
+        # Repair runs are compacted on startup so a full free-tier volume can
+        # recover before any status or checkpoint write is attempted.
+        try:
+            self._startup_storage_recovery()
+        except Exception:
+            # Storage recovery must never prevent the worker from booting.
+            pass
 
     # ------------------------------------------------------------------
     # Routes
@@ -395,6 +406,12 @@ class DeepEnrichmentRuntime:
         if not rd.exists():
             return self._json(False, status_code=404, error="Deep Enrichment run not found")
         key = str(kind or "").strip().lower().replace("-", "_")
+        if key not in {"zip", "full", "csv", "master_csv", "jsonl", "packet", "markdown", "report"}:
+            return self._json(False, status_code=400, error="Unknown export kind. Use zip, csv, jsonl, packet, or report")
+        if self._is_repair_run(rd):
+            # Repair exports are generated on ephemeral container storage only
+            # when downloaded. They never consume the persistent run volume.
+            return self._ephemeral_repair_export(rd, key)
         mapping = {
             "zip": (rd / "deep_enrichment_export.zip", "application/zip"),
             "full": (rd / "deep_enrichment_export.zip", "application/zip"),
@@ -405,10 +422,7 @@ class DeepEnrichmentRuntime:
             "markdown": (rd / "gpt_fable_packet.md", "text/markdown"),
             "report": (rd / "run_report.json", "application/json"),
         }
-        target = mapping.get(key)
-        if not target:
-            return self._json(False, status_code=400, error="Unknown export kind. Use zip, csv, jsonl, packet, or report")
-        path, media_type = target
+        path, media_type = mapping[key]
         if not path.exists():
             return self._json(False, status_code=409, error="That export is not ready yet. Partial results remain available through the results endpoint")
         return FileResponse(path, media_type=media_type, filename=path.name)
@@ -495,10 +509,6 @@ class DeepEnrichmentRuntime:
         repair_run_id = f"repair_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         rd = self._run_dir(repair_run_id)
         rd.mkdir(parents=True, exist_ok=True)
-        source_packs = source_rd / "ngo_research_packs"
-        if source_packs.exists():
-            shutil.copytree(source_packs, rd / "ngo_research_packs", dirs_exist_ok=True)
-
         input_payload = {
             "run_id": repair_run_id,
             "mode": "repair",
@@ -575,7 +585,9 @@ class DeepEnrichmentRuntime:
     def _repair_preview_data(self, rd: Path) -> dict:
         payload = self._read_json(rd / "input.json", {})
         ngos = payload.get("ngos") or []
-        summary_rows = self._read_json(rd / "master_summary.json", [])
+        # Repair runs are source + delta overlays; derive preview from merged
+        # dossiers so stale V61 aggregate files cannot hide repaired records.
+        summary_rows = [] if self._is_repair_run(rd) else self._read_json(rd / "master_summary.json", [])
         summary_by_id = {str(row.get("ngo_id") or ""): row for row in summary_rows if isinstance(row, dict)}
         dossiers: dict[str, dict] = {}
         repair_ids: list[str] = []
@@ -628,7 +640,11 @@ class DeepEnrichmentRuntime:
             "eligible": bool(repair_ids),
         }
 
-    def _dossiers_by_id(self, rd: Path) -> dict[str, dict]:
+    def _is_repair_run(self, rd: Path) -> bool:
+        payload = self._read_json(rd / "input.json", {})
+        return str(payload.get("mode") or "").lower() == "repair" or rd.name.startswith("repair_")
+
+    def _local_dossiers_by_id(self, rd: Path) -> dict[str, dict]:
         output: dict[str, dict] = {}
         jsonl_path = rd / "all_dossiers.jsonl"
         if jsonl_path.exists():
@@ -644,8 +660,6 @@ class DeepEnrichmentRuntime:
                             output[ngo_id] = row
             except Exception:
                 pass
-        if output:
-            return output
         for evidence_path in (rd / "ngo_research_packs").glob("*/evidence.json"):
             row = self._read_json(evidence_path, {})
             ngo_id = str(row.get("ngo_id") or "")
@@ -653,12 +667,172 @@ class DeepEnrichmentRuntime:
                 output[ngo_id] = row
         return output
 
+    def _repair_deltas_by_id(self, rd: Path) -> dict[str, dict]:
+        output: dict[str, dict] = {}
+        for delta_path in (rd / "ngo_research_packs").glob("*/repair_delta.json"):
+            row = self._read_json(delta_path, {})
+            ngo_id = str(row.get("ngo_id") or "")
+            if ngo_id:
+                output[ngo_id] = row
+        return output
+
+    def _apply_repair_delta(self, base: dict, delta: dict) -> dict:
+        result = copy.deepcopy(base or {})
+        for key in [
+            "ngo_id", "ngo_name", "website", "website_pages", "website_candidate_highlights",
+            "external_candidate_highlights", "crawl", "preliminary_ai_before_repair", "preliminary_ai",
+            "generated_at", "repair_metadata", "model_ready_summary",
+        ]:
+            if key in delta:
+                result[key] = copy.deepcopy(delta.get(key))
+        patch = delta.get("external_research_patch") or {}
+        if patch:
+            external = copy.deepcopy(result.get("external_research") or {})
+            updates = {str(item.get("url") or ""): str(item.get("repair_identity_status") or "") for item in (patch.get("identity_updates") or []) if str(item.get("url") or "")}
+            sources = []
+            for source in external.get("sources") or []:
+                updated = dict(source)
+                status = updates.get(str(source.get("url") or ""))
+                if status:
+                    updated["repair_identity_status"] = status
+                sources.append(updated)
+            external["sources"] = sources
+            for key in ["model_source_count", "rejected_identity_count"]:
+                if key in patch:
+                    external[key] = patch.get(key)
+            result["external_research"] = external
+        return result
+
+    def _dossiers_by_id(self, rd: Path, _seen: set[str] | None = None) -> dict[str, dict]:
+        rd = Path(rd)
+        seen = set(_seen or set())
+        if rd.name in seen:
+            return {}
+        seen.add(rd.name)
+        if not self._is_repair_run(rd):
+            return self._local_dossiers_by_id(rd)
+        payload = self._read_json(rd / "input.json", {})
+        source_run_id = str(payload.get("source_run_id") or "")
+        output: dict[str, dict] = {}
+        if source_run_id:
+            source_rd = self._run_dir(source_run_id)
+            if source_rd.exists():
+                output.update(self._dossiers_by_id(source_rd, seen))
+        # V61 repair runs may contain full copied dossiers. Preserve only those
+        # actually changed by this repair run as overlays.
+        for ngo_id, row in self._local_dossiers_by_id(rd).items():
+            metadata = row.get("repair_metadata") or {}
+            if str(metadata.get("repair_run_id") or "") == rd.name:
+                output[ngo_id] = row
+        for ngo_id, delta in self._repair_deltas_by_id(rd).items():
+            output[ngo_id] = self._apply_repair_delta(output.get(ngo_id) or {}, delta)
+        return output
+
+    def _make_repair_delta(self, dossier: dict) -> dict:
+        external = dossier.get("external_research") or {}
+        identity_updates = []
+        for source in external.get("sources") or []:
+            status = str(source.get("repair_identity_status") or "")
+            url = str(source.get("url") or "")
+            if status and url:
+                identity_updates.append({"url": url, "repair_identity_status": status})
+        delta = {
+            "schema_version": "repair-delta-1.0",
+            "ngo_id": dossier.get("ngo_id"),
+            "ngo_name": dossier.get("ngo_name"),
+            "website": dossier.get("website"),
+            "website_pages": dossier.get("website_pages") or [],
+            "website_candidate_highlights": dossier.get("website_candidate_highlights") or [],
+            "external_candidate_highlights": dossier.get("external_candidate_highlights") or [],
+            "crawl": dossier.get("crawl") or {},
+            "external_research_patch": {
+                "identity_updates": identity_updates,
+                "model_source_count": external.get("model_source_count"),
+                "rejected_identity_count": external.get("rejected_identity_count"),
+            },
+            "preliminary_ai_before_repair": dossier.get("preliminary_ai_before_repair") or {},
+            "preliminary_ai": dossier.get("preliminary_ai") or {},
+            "generated_at": dossier.get("generated_at"),
+            "repair_metadata": dossier.get("repair_metadata") or {},
+            "model_ready_summary": dossier.get("model_ready_summary") or {},
+        }
+        return delta
+
+    def _startup_storage_recovery(self) -> None:
+        for rd in self.runs_dir.glob("repair_*"):
+            if rd.is_dir():
+                self._compact_repair_run(rd)
+
+    def _compact_repair_run(self, rd: Path) -> None:
+        # These files are fully reproducible and were the main source of disk
+        # amplification in V61. Remove them before writing anything else.
+        for name in [
+            "deep_enrichment_export.zip", ".deep_enrichment_export.zip.tmp",
+            "all_dossiers.jsonl", "gpt_fable_packet.md", "master_summary.csv", "run_report.json",
+        ]:
+            path = rd / name
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+        try:
+            shutil.rmtree(rd / "gpt_fable_packets", ignore_errors=True)
+        except Exception:
+            pass
+        packs = rd / "ngo_research_packs"
+        if not packs.exists():
+            return
+        for ngo_dir in list(packs.iterdir()):
+            if not ngo_dir.is_dir():
+                continue
+            evidence_path = ngo_dir / "evidence.json"
+            delta_path = ngo_dir / "repair_delta.json"
+            dossier = self._read_json(evidence_path, {}) if evidence_path.exists() else {}
+            metadata = dossier.get("repair_metadata") or {}
+            if dossier and str(metadata.get("repair_run_id") or "") == rd.name:
+                try:
+                    self._write_json(delta_path, self._make_repair_delta(dossier))
+                except Exception:
+                    # If writing the compact delta fails, retain evidence.json.
+                    continue
+                for child in list(ngo_dir.iterdir()):
+                    if child == delta_path:
+                        continue
+                    try:
+                        if child.is_dir():
+                            shutil.rmtree(child, ignore_errors=True)
+                        else:
+                            child.unlink()
+                    except Exception:
+                        pass
+            elif delta_path.exists():
+                for child in list(ngo_dir.iterdir()):
+                    if child == delta_path:
+                        continue
+                    try:
+                        if child.is_dir():
+                            shutil.rmtree(child, ignore_errors=True)
+                        else:
+                            child.unlink()
+                    except Exception:
+                        pass
+            else:
+                # Unchanged V61 copies are recoverable from the source run.
+                shutil.rmtree(ngo_dir, ignore_errors=True)
+        for tmp in rd.rglob("*.tmp"):
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+
     def _initialise_repair_outputs(self, rd: Path, input_payload: dict) -> None:
         dossiers = self._dossiers_by_id(rd)
         summaries = [self._summary_from_dossier(dossier) for dossier in dossiers.values() if dossier]
         summaries.sort(key=lambda row: str(row.get("ngo_name") or "").lower())
         self._write_json(rd / "master_summary.json", summaries)
-        self._rebuild_aggregate_outputs(rd, input_payload)
+        # Do not pre-build JSONL, Markdown packets, category packets or ZIPs.
+        # Repair exports are generated only when downloaded on ephemeral disk.
 
     def _initial_repair_status(self, run_id: str, source_run_id: str, preview: dict, options: dict) -> dict:
         return {
@@ -735,7 +909,7 @@ class DeepEnrichmentRuntime:
                 if self._cancelled(run_id, cancel_event):
                     self._patch_status(rd, run_status="cancelled", stage="cancelled", message="Repair cancelled; completed repairs were preserved.")
                     self.job_update(run_id, status="cancelled", stage="cancelled")
-                    self._rebuild_aggregate_outputs(rd, payload)
+                    self._write_repair_light_outputs(rd, payload)
                     return
                 if not self._enabled_firecrawl_keys():
                     raise FirecrawlCapacityExhausted("No usable Firecrawl API keys remain")
@@ -755,7 +929,7 @@ class DeepEnrichmentRuntime:
                 except CancelledError:
                     self._patch_status(rd, run_status="cancelled", stage="cancelled", message="Repair cancelled; completed repairs were preserved.")
                     self.job_update(run_id, status="cancelled", stage="cancelled")
-                    self._rebuild_aggregate_outputs(rd, payload)
+                    self._write_repair_light_outputs(rd, payload)
                     return
                 except Exception as exc:
                     repaired = dict(dossier or {})
@@ -787,10 +961,7 @@ class DeepEnrichmentRuntime:
                     current_step="Repaired dossier saved",
                 )
                 self.job_update(run_id, status="running", stage="repairing_official_websites", processed=len(attempted), total=len(repair_ids))
-                if len(attempted) % 5 == 0:
-                    self._rebuild_aggregate_outputs(rd, payload)
-
-            self._rebuild_aggregate_outputs(rd, payload)
+            self._write_repair_light_outputs(rd, payload)
             preview = self._repair_preview_data(rd)
             remaining = int(preview.get("repair_required") or 0)
             final_status = "complete" if remaining == 0 else "partial"
@@ -802,13 +973,13 @@ class DeepEnrichmentRuntime:
                 processed=len(repair_ids),
                 completed=int(self._read_json(rd / "status.json", {}).get("repaired_count") or 0),
                 current_ngo="",
-                current_step="Repaired export bundle ready",
+                current_step="Repair complete; exports are generated when downloaded",
                 remaining_repair_required=remaining,
                 message="Evidence repair completed" if remaining == 0 else f"Evidence repair completed; {remaining} NGO(s) still have limited official-site evidence.",
             )
             self.job_update(run_id, status=final_status, stage=final_stage, processed=len(repair_ids), total=len(repair_ids), error="" if remaining == 0 else f"{remaining} NGO(s) remain partial")
         except FirecrawlCapacityExhausted as exc:
-            self._rebuild_aggregate_outputs(rd, payload)
+            self._write_repair_light_outputs(rd, payload)
             self._patch_status(
                 rd,
                 run_status="waiting_for_firecrawl_credits",
@@ -893,12 +1064,20 @@ class DeepEnrichmentRuntime:
     def _save_repaired_dossier(self, rd: Path, ngo: dict, dossier: dict) -> None:
         ngo_dir = self._ngo_dir(rd, ngo)
         ngo_dir.mkdir(parents=True, exist_ok=True)
-        self._write_jsonl(ngo_dir / "official_pages.jsonl", dossier.get("website_pages") or [])
-        self._write_json(ngo_dir / "official_highlights.json", dossier.get("website_candidate_highlights") or [])
-        self._write_json(ngo_dir / "external_highlights.json", dossier.get("external_candidate_highlights") or [])
-        self._write_json(ngo_dir / "evidence.json", dossier)
-        self._write_text(ngo_dir / "dossier.md", self._dossier_markdown(dossier))
-        self._write_sources_csv(ngo_dir / "sources.csv", dossier)
+        # Store only the changed overlay. The large original dossier and Serper
+        # corpus stay in the source run and are merged at read/export time.
+        delta_path = ngo_dir / "repair_delta.json"
+        self._write_json(delta_path, self._make_repair_delta(dossier))
+        for child in list(ngo_dir.iterdir()):
+            if child == delta_path:
+                continue
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink()
+            except Exception:
+                pass
 
     def _strict_identity_status(self, ngo_name: str, source: dict) -> str:
         title_snippet = " ".join([str(source.get("title") or ""), str(source.get("snippet") or "")])
@@ -1979,6 +2158,158 @@ Evidence dossier:\n{compact}
             writer.writeheader()
             for row in rows:
                 writer.writerow({key: self._safe_csv(value) for key, value in row.items()})
+
+    def _ordered_dossiers(self, rd: Path) -> list[dict]:
+        payload = self._read_json(rd / "input.json", {})
+        by_id = self._dossiers_by_id(rd)
+        ordered = []
+        seen: set[str] = set()
+        for ngo in payload.get("ngos") or []:
+            ngo_id = str(ngo.get("ngo_id") or "")
+            dossier = by_id.get(ngo_id)
+            if dossier:
+                ordered.append(dossier)
+                seen.add(ngo_id)
+        for ngo_id, dossier in by_id.items():
+            if ngo_id not in seen and dossier:
+                ordered.append(dossier)
+        return ordered
+
+    def _run_report_data(self, rd: Path, input_payload: dict, summaries: list[dict] | None = None) -> dict:
+        summaries = summaries if summaries is not None else self._read_json(rd / "master_summary.json", [])
+        status = self._read_json(rd / "status.json", {})
+        return {
+            "run_id": rd.name,
+            "created_at": status.get("created_at"),
+            "updated_at": status.get("updated_at"),
+            "mode": input_payload.get("mode") or "enrichment",
+            "source_run_id": input_payload.get("source_run_id") or "",
+            "selected_count": len(input_payload.get("ngos") or []),
+            "completed_count": sum(1 for row in summaries if row.get("status") in {"complete", "limited"}),
+            "model_ready_count": sum(1 for row in summaries if row.get("crawl_status") == "complete"),
+            "limited_count": sum(1 for row in summaries if row.get("crawl_status") != "complete" and row.get("status") != "failed"),
+            "failed_count": sum(1 for row in summaries if row.get("status") == "failed"),
+            "firecrawl_credits_used": status.get("firecrawl_credits_used", 0),
+            "serper_queries_used": status.get("serper_queries_used", 0),
+            "serper_queries_reused": status.get("serper_queries_reused", 0),
+            "official_pages_collected": status.get("official_pages_collected", 0),
+            "external_sources_collected": status.get("external_sources_collected", 0),
+            "options": input_payload.get("options") or {},
+            "categories": dict(Counter(row.get("primary_category_label") or "Uncategorised" for row in summaries if row.get("status") == "complete")),
+            "storage_mode": "source_plus_repair_deltas" if self._is_repair_run(rd) else "full_run",
+            "exports": "generated_on_download" if self._is_repair_run(rd) else "stored_on_volume",
+        }
+
+    def _write_repair_light_outputs(self, rd: Path, input_payload: dict) -> None:
+        dossiers = self._ordered_dossiers(rd)
+        summaries = [self._summary_from_dossier(dossier) for dossier in dossiers if dossier]
+        summaries.sort(key=lambda row: str(row.get("ngo_name") or "").lower())
+        self._write_json(rd / "master_summary.json", summaries)
+        # CSV and report are small enough to persist; large packets and ZIPs are
+        # intentionally generated only on download in /tmp.
+        self._write_master_csv(rd / "master_summary.csv", summaries)
+        self._write_json(rd / "run_report.json", self._run_report_data(rd, input_payload, summaries))
+
+    def _master_csv_text(self, summaries: list[dict]) -> str:
+        fields = [
+            "ngo_id", "ngo_name", "website", "pm_reviewer", "pm_rating", "primary_category", "primary_category_label",
+            "standout_value", "transformation_potential_signal", "demonstrated_transformation_signal", "evidence_strength",
+            "dfp_fit_signal", "top_finding", "pages_collected", "crawl_status", "model_readiness",
+            "external_sources", "model_external_sources", "rejected_identity_sources", "serper_queries_used",
+            "firecrawl_credits_used", "haiku_status", "repair_status", "repair_run_id", "new_pages_added", "status", "error",
+        ]
+        handle = io.StringIO()
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in summaries:
+            writer.writerow({field: self._safe_csv(row.get(field, "")) for field in fields})
+        return handle.getvalue()
+
+    def _packet_text(self, dossiers: list[dict]) -> str:
+        parts = [
+            "# DFP 2.0 — Deep Enrichment Research Packet",
+            "",
+            "Use this evidence to categorise and compare NGOs. Preserve the distinction between demonstrated transformation, transformation potential, evidence strength, and DFP operational fit. Do not treat weak online documentation as weak work.",
+            "",
+        ]
+        for dossier in dossiers:
+            parts.append(self._dossier_markdown(dossier, compact=True))
+            parts.extend(["", "---", ""])
+        return "\n".join(parts)
+
+    def _temporary_export_path(self, suffix: str) -> Path:
+        handle = tempfile.NamedTemporaryFile(prefix="dfp2-repair-", suffix=suffix, delete=False)
+        path = Path(handle.name)
+        handle.close()
+        return path
+
+    def _cleanup_temp_export(self, path: Path) -> None:
+        try:
+            path.unlink()
+        except Exception:
+            pass
+
+    def _ephemeral_repair_export(self, rd: Path, key: str) -> Any:
+        payload = self._read_json(rd / "input.json", {})
+        dossiers = self._ordered_dossiers(rd)
+        summaries = [self._summary_from_dossier(dossier) for dossier in dossiers if dossier]
+        summaries.sort(key=lambda row: str(row.get("ngo_name") or "").lower())
+        report = self._run_report_data(rd, payload, summaries)
+        if key in {"csv", "master_csv"}:
+            path = self._temporary_export_path(".csv")
+            path.write_text(self._master_csv_text(summaries), encoding="utf-8-sig")
+            return FileResponse(path, media_type="text/csv", filename="master_summary.csv", background=BackgroundTask(self._cleanup_temp_export, path))
+        if key == "jsonl":
+            path = self._temporary_export_path(".jsonl")
+            with path.open("w", encoding="utf-8") as handle:
+                for dossier in dossiers:
+                    handle.write(json.dumps(dossier, ensure_ascii=False) + "\n")
+            return FileResponse(path, media_type="application/x-ndjson", filename="all_dossiers.jsonl", background=BackgroundTask(self._cleanup_temp_export, path))
+        if key in {"packet", "markdown"}:
+            path = self._temporary_export_path(".md")
+            path.write_text(self._packet_text(dossiers), encoding="utf-8")
+            return FileResponse(path, media_type="text/markdown", filename="gpt_fable_packet.md", background=BackgroundTask(self._cleanup_temp_export, path))
+        if key == "report":
+            path = self._temporary_export_path(".json")
+            path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            return FileResponse(path, media_type="application/json", filename="run_report.json", background=BackgroundTask(self._cleanup_temp_export, path))
+
+        path = self._temporary_export_path(".zip")
+        packet_text = self._packet_text(dossiers)
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+            archive.writestr("input.json", json.dumps(payload, ensure_ascii=False, indent=2))
+            archive.writestr("status.json", json.dumps(self._read_json(rd / "status.json", {}), ensure_ascii=False, indent=2))
+            archive.writestr("master_summary.csv", self._master_csv_text(summaries).encode("utf-8-sig"))
+            archive.writestr("all_dossiers.jsonl", "".join(json.dumps(dossier, ensure_ascii=False) + "\n" for dossier in dossiers))
+            archive.writestr("gpt_fable_packet.md", packet_text)
+            archive.writestr("run_report.json", json.dumps(report, ensure_ascii=False, indent=2))
+            grouped: dict[str, list[dict]] = defaultdict(list)
+            for dossier in dossiers:
+                prelim = dossier.get("preliminary_ai") or {}
+                category = prelim.get("primary_category") or dossier.get("category_input", {}).get("primary") or "uncategorised"
+                grouped[str(category)].append(dossier)
+            for category, category_dossiers in grouped.items():
+                for batch_index in range(0, len(category_dossiers), 10):
+                    batch = category_dossiers[batch_index:batch_index + 10]
+                    parts = [
+                        f"# {CATEGORY_LABELS.get(category, category)} — Deep Enrichment Packet",
+                        "",
+                        "Assess these NGOs first within their model. Separate demonstrated transformation, transformation potential, and evidence strength.",
+                        "",
+                    ]
+                    for dossier in batch:
+                        parts.append(self._dossier_markdown(dossier, compact=True))
+                        parts.extend(["", "---", ""])
+                    filename = f"gpt_fable_packets/{self._slug(category)}-batch-{batch_index // 10 + 1:02d}.md"
+                    archive.writestr(filename, "\n".join(parts))
+            for dossier in dossiers:
+                ngo_name = str(dossier.get("ngo_name") or "ngo")
+                ngo_id = str(dossier.get("ngo_id") or "")
+                folder = f"ngo_research_packs/{self._slug(ngo_name)}-{ngo_id[-6:]}"
+                archive.writestr(f"{folder}/evidence.json", json.dumps(dossier, ensure_ascii=False, indent=2))
+                archive.writestr(f"{folder}/dossier.md", self._dossier_markdown(dossier))
+                archive.writestr(f"{folder}/official_pages.jsonl", "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in (dossier.get("website_pages") or [])))
+        return FileResponse(path, media_type="application/zip", filename="deep_enrichment_export.zip", background=BackgroundTask(self._cleanup_temp_export, path))
 
     def _rebuild_aggregate_outputs(self, rd: Path, input_payload: dict) -> None:
         summaries = self._read_json(rd / "master_summary.json", [])

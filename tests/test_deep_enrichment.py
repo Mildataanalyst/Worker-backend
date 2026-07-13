@@ -341,3 +341,73 @@ def test_start_repair_runs_end_to_end_without_serper(tmp_path, monkeypatch):
     repaired = rt._dossiers_by_id(tmp_path / repair_id)[limited["ngo_id"]]
     assert repaired["crawl"]["status"] == "complete"
     assert repaired["repair_metadata"]["serper_queries_rerun"] == 0
+
+
+def test_repair_compaction_converts_v61_full_copies_to_deltas(tmp_path):
+    rt = runtime(tmp_path)
+    source_rd = tmp_path / "enrich_source_compact"
+    repair_rd = tmp_path / "repair_compact"
+    complete, repaired_ngo = rt._normalise_ngos([
+        {"ngo_name": "Complete Foundation", "website": "https://complete.example"},
+        {"ngo_name": "Repaired Foundation", "website": "https://repaired.example"},
+    ])
+    source_payload = {"run_id": source_rd.name, "ngos": [complete, repaired_ngo], "options": {}}
+    rt._write_json(source_rd / "input.json", source_payload)
+    source_complete = _sample_dossier(complete, pages=1)
+    source_limited = _sample_dossier(repaired_ngo, pages=0)
+    rt._write_json(rt._ngo_dir(source_rd, complete) / "evidence.json", source_complete)
+    rt._write_json(rt._ngo_dir(source_rd, repaired_ngo) / "evidence.json", source_limited)
+
+    repair_payload = {
+        "run_id": repair_rd.name, "mode": "repair", "source_run_id": source_rd.name,
+        "ngos": [complete, repaired_ngo], "repair_ngo_ids": [repaired_ngo["ngo_id"]], "options": {},
+    }
+    rt._write_json(repair_rd / "input.json", repair_payload)
+    # Simulate V61's full copy of every dossier.
+    rt._write_json(rt._ngo_dir(repair_rd, complete) / "evidence.json", source_complete)
+    repaired = _sample_dossier(repaired_ngo, pages=2)
+    repaired["repair_metadata"] = {"repair_run_id": repair_rd.name, "attempt_status": "complete"}
+    rt._write_json(rt._ngo_dir(repair_rd, repaired_ngo) / "evidence.json", repaired)
+    (repair_rd / "deep_enrichment_export.zip").write_bytes(b"large-regenerable-export")
+    (repair_rd / "gpt_fable_packet.md").write_text("regenerable")
+    (repair_rd / "gpt_fable_packets").mkdir(parents=True)
+    (repair_rd / "gpt_fable_packets" / "x.md").write_text("regenerable")
+
+    rt._compact_repair_run(repair_rd)
+    assert not (repair_rd / "deep_enrichment_export.zip").exists()
+    assert not (repair_rd / "gpt_fable_packet.md").exists()
+    assert not rt._ngo_dir(repair_rd, complete).exists()
+    repaired_dir = rt._ngo_dir(repair_rd, repaired_ngo)
+    assert (repaired_dir / "repair_delta.json").exists()
+    assert not (repaired_dir / "evidence.json").exists()
+
+    merged = rt._dossiers_by_id(repair_rd)
+    assert set(merged) == {complete["ngo_id"], repaired_ngo["ngo_id"]}
+    assert merged[complete["ngo_id"]]["crawl"]["pages_collected"] == 1
+    assert merged[repaired_ngo["ngo_id"]]["crawl"]["pages_collected"] == 2
+    assert merged[repaired_ngo["ngo_id"]]["repair_metadata"]["attempt_status"] == "complete"
+
+
+def test_repair_export_is_generated_off_persistent_volume(tmp_path):
+    rt = runtime(tmp_path)
+    source_rd = tmp_path / "enrich_source_export"
+    repair_rd = tmp_path / "repair_export"
+    ngo = rt._normalise_ngos([{"ngo_name": "Export Foundation", "website": "https://export.example"}])[0]
+    rt._write_json(source_rd / "input.json", {"run_id": source_rd.name, "ngos": [ngo], "options": {}})
+    rt._write_json(rt._ngo_dir(source_rd, ngo) / "evidence.json", _sample_dossier(ngo, pages=1))
+    rt._write_json(repair_rd / "input.json", {
+        "run_id": repair_rd.name, "mode": "repair", "source_run_id": source_rd.name,
+        "ngos": [ngo], "repair_ngo_ids": [], "options": {},
+    })
+    rt._write_json(repair_rd / "status.json", {"run_status": "complete"})
+    response = rt.export(repair_rd.name, "zip")
+    export_path = Path(response.path)
+    assert export_path.exists()
+    assert tmp_path not in export_path.parents
+    import zipfile
+    with zipfile.ZipFile(export_path) as archive:
+        names = set(archive.namelist())
+        assert "all_dossiers.jsonl" in names
+        assert "gpt_fable_packet.md" in names
+        assert any(name.endswith("/evidence.json") for name in names)
+    export_path.unlink()
