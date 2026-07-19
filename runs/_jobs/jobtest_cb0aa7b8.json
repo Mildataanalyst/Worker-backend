@@ -1,0 +1,13 @@
+{
+  "run_id": "jobtest_cb0aa7b8",
+  "job_type": "unit_test",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "run_dir": "/mnt/data/work_worker_v69/runs/jobtest_cb0aa7b8",
+  "owner_pid": 22797,
+  "cancel_requested": false,
+  "created_at": "2026-07-19T11:18:15Z",
+  "updated_at": "2026-07-19T11:18:15Z",
+  "interrupted_at": "2026-07-19T11:18:15Z",
+  "live_state": "not_running"
+}

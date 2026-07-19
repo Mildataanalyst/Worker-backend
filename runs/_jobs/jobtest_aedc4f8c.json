@@ -1,0 +1,16 @@
+{
+  "run_id": "jobtest_aedc4f8c",
+  "job_type": "unit_test",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "run_dir": "/mnt/data/work_worker_v70/runs/jobtest_aedc4f8c",
+  "owner_pid": 38864,
+  "cancel_requested": true,
+  "created_at": "2026-07-19T11:49:34Z",
+  "total": 10,
+  "processed": 4,
+  "updated_at": "2026-07-19T11:49:34Z",
+  "cancel_requested_at": "2026-07-19T11:49:34Z",
+  "interrupted_at": "2026-07-19T11:49:34Z",
+  "live_state": "not_running"
+}
