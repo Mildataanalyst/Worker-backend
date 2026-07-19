@@ -82,3 +82,72 @@ def test_pause_then_resume_skips_completed_rows(monkeypatch, tmp_path):
     with (rd / main.RECHECK_OUTPUTS["results"]).open("r", encoding="utf-8-sig", newline="") as f:
         results = list(csv.DictReader(f))
     assert len(results) == 3
+
+
+def test_stream_fetch_has_total_wall_clock_deadline(monkeypatch):
+    class SlowResponse:
+        status_code = 200
+        headers = {"content-type": "text/html"}
+        encoding = "utf-8"
+        closed = False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size=65536):
+            yield b"first"
+            time.sleep(0.03)
+            yield b"second"
+
+        def close(self):
+            self.closed = True
+
+    response = SlowResponse()
+    monkeypatch.setattr(main, "_validate_public_http_url", lambda url: url)
+    monkeypatch.setattr(main.requests, "get", lambda *args, **kwargs: response)
+
+    try:
+        main._safe_fetch_text("https://example.org", timeout=1, hard_deadline_sec=0.01)
+        assert False, "expected a total fetch deadline"
+    except main.FetchDeadlineExceeded:
+        pass
+    assert response.closed is True
+
+
+def test_row_watchdog_checkpoints_timeout_and_continues(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "RUNS_DIR", tmp_path)
+    monkeypatch.setattr(main, "RECHECK_PACE_SEC", 0)
+    monkeypatch.setattr(main, "SMART_RECHECK_MAX_ROW_SECONDS", 0.01)
+    monkeypatch.setattr(main, "_smart_load_entity_register", lambda rd=None: ({}, ""))
+    run_id = "recheck_row_watchdog_test"
+    rd = tmp_path / run_id
+    rd.mkdir(parents=True)
+    (rd / "uploaded_input.csv").write_text(
+        "name,district,state,darpan_id\nSlow NGO,Mysuru,Karnataka,KA/1\nNext NGO,Mysuru,Karnataka,KA/2\n",
+        encoding="utf-8",
+    )
+    main._recheck_initialize_outputs(rd)
+    main._write_recheck_status(
+        rd, run_id=run_id, strategy="smart", run_status="starting", stage="queued",
+        total=2, processed=0, started_at_epoch=time.time(), active_elapsed_sec=0,
+    )
+
+    def fake_process(row, rd_arg, audit_rows, counter):
+        if row["name"] == "Slow NGO":
+            while True:
+                main._check_recheck_deadline("synthetic slow NGO")
+        return main._smart_result(
+            row, "", "no_candidate_after_completed_search", "low", "serper", "query", "none", "direct",
+            searched="yes", queries_used=0,
+        )
+
+    monkeypatch.setattr(main, "_smart_process_row", fake_process)
+    main._run_smart_recheck_job(run_id, threading.Event(), strategy_name="smart")
+
+    status = json.loads(main._recheck_status_path(rd).read_text(encoding="utf-8"))
+    assert status["run_status"] == "complete"
+    assert status["processed"] == 2
+    assert status["row_timeouts"] == 1
+    with (rd / main.RECHECK_OUTPUTS["results"]).open("r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert [row["Website Status"] for row in rows] == ["row_timeout", "no_candidate_after_completed_search"]

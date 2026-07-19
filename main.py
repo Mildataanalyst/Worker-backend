@@ -21,6 +21,99 @@ from urllib.parse import urlparse, urljoin
 
 import requests
 
+
+class RecheckRowDeadlineExceeded(TimeoutError):
+    """Raised when one Smart Recovery NGO exceeds its total processing budget."""
+
+
+class FetchDeadlineExceeded(requests.exceptions.Timeout):
+    """Raised when a streamed response exceeds its wall-clock download budget."""
+
+
+_RECHECK_DEADLINE_STATE = threading.local()
+
+
+def _current_recheck_deadline() -> float | None:
+    value = getattr(_RECHECK_DEADLINE_STATE, "deadline", None)
+    return float(value) if value is not None else None
+
+
+@contextmanager
+def _smart_recheck_row_deadline(seconds: float):
+    """Apply a cooperative wall-clock deadline to the current recovery row.
+
+    Smart Recovery runs inside a background thread, so Unix signals cannot safely
+    interrupt it. Network reads below enforce this deadline directly, while the
+    surrounding row loop converts an overrun into a checkpointed ``row_timeout``
+    result and continues with the next NGO.
+    """
+    previous = _current_recheck_deadline()
+    seconds = float(seconds or 0)
+    deadline = time.monotonic() + seconds if seconds > 0 else previous
+    if previous is not None and deadline is not None:
+        deadline = min(previous, deadline)
+    _RECHECK_DEADLINE_STATE.deadline = deadline
+    try:
+        yield deadline
+    finally:
+        _RECHECK_DEADLINE_STATE.deadline = previous
+
+
+def _check_recheck_deadline(operation: str = "Smart Recovery row") -> None:
+    deadline = _current_recheck_deadline()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RecheckRowDeadlineExceeded(f"{operation} exceeded the per-NGO deadline")
+
+
+def _effective_deadline(fetch_deadline: float | None = None) -> float | None:
+    row_deadline = _current_recheck_deadline()
+    if row_deadline is None:
+        return fetch_deadline
+    if fetch_deadline is None:
+        return row_deadline
+    return min(row_deadline, fetch_deadline)
+
+
+def _bounded_request_timeout(timeout, fetch_deadline: float | None = None):
+    """Limit connect/read inactivity time to the remaining wall-clock budget."""
+    _check_recheck_deadline("network request")
+    deadline = _effective_deadline(fetch_deadline)
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        if _current_recheck_deadline() is not None and time.monotonic() >= _current_recheck_deadline():
+            raise RecheckRowDeadlineExceeded("network request exceeded the per-NGO deadline")
+        raise FetchDeadlineExceeded("total fetch deadline exceeded")
+    remaining = max(0.25, remaining)
+    if isinstance(timeout, tuple):
+        return tuple(max(0.25, min(float(part), remaining)) for part in timeout)
+    return max(0.25, min(float(timeout), remaining))
+
+
+def _check_fetch_deadline(fetch_deadline: float | None, operation: str = "response download") -> None:
+    _check_recheck_deadline(operation)
+    if fetch_deadline is not None and time.monotonic() >= fetch_deadline:
+        raise FetchDeadlineExceeded(f"{operation}: total fetch deadline exceeded")
+
+
+def _read_stream_with_deadline(resp, *, max_bytes: int, fetch_deadline: float | None, label: str) -> bytes:
+    """Read a streamed response with both a byte cap and a total wall-clock cap."""
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=65536):
+        _check_fetch_deadline(fetch_deadline, label)
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"{label} exceeded safe size limit")
+        chunks.append(chunk)
+        _check_fetch_deadline(fetch_deadline, label)
+    _check_fetch_deadline(fetch_deadline, label)
+    return b"".join(chunks)
+
+
 def _make_soup(html: str):
     # Lazy import: BeautifulSoup is only needed when fetching/scoring pages.
     from bs4 import BeautifulSoup
@@ -423,29 +516,51 @@ def _validate_public_http_url(url: str) -> str:
     return parsed.geturl()
 
 
-def _safe_fetch_text(url: str, *, headers: dict | None = None, timeout: int = 10, max_bytes: int = 1_500_000, max_redirects: int = 4) -> tuple[str, str]:
+def _safe_fetch_text(
+    url: str,
+    *,
+    headers: dict | None = None,
+    timeout: int = 10,
+    max_bytes: int = 1_500_000,
+    max_redirects: int = 4,
+    hard_deadline_sec: float | None = None,
+) -> tuple[str, str]:
     current = _validate_public_http_url(url)
     headers = headers or {"User-Agent": "Mozilla/5.0 DFP2/1.0"}
+    fetch_deadline = time.monotonic() + float(hard_deadline_sec) if hard_deadline_sec and float(hard_deadline_sec) > 0 else None
     for _ in range(max_redirects + 1):
-        resp = requests.get(current, headers=headers, timeout=timeout, allow_redirects=False, stream=True)
-        if 300 <= resp.status_code < 400 and resp.headers.get("Location"):
-            current = _validate_public_http_url(urljoin(current, resp.headers["Location"]))
-            continue
-        resp.raise_for_status()
-        ctype = (resp.headers.get("content-type") or "").lower()
-        if ctype and not any(x in ctype for x in ["text/html", "text/plain", "application/xhtml+xml"]):
-            raise ValueError(f"Unsupported content type: {ctype[:80]}")
-        chunks: list[bytes] = []
-        total = 0
-        for chunk in resp.iter_content(chunk_size=65536):
-            if not chunk:
+        _check_fetch_deadline(fetch_deadline, "HTML fetch")
+        resp = None
+        try:
+            resp = requests.get(
+                current,
+                headers=headers,
+                timeout=_bounded_request_timeout(timeout, fetch_deadline),
+                allow_redirects=False,
+                stream=True,
+            )
+            _check_fetch_deadline(fetch_deadline, "HTML fetch")
+            if 300 <= resp.status_code < 400 and resp.headers.get("Location"):
+                current = _validate_public_http_url(urljoin(current, resp.headers["Location"]))
                 continue
-            total += len(chunk)
-            if total > max_bytes:
-                raise ValueError("Response exceeded safe fetch size limit")
-            chunks.append(chunk)
-        enc = resp.encoding or "utf-8"
-        return current, b"".join(chunks).decode(enc, errors="replace")
+            resp.raise_for_status()
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if ctype and not any(x in ctype for x in ["text/html", "text/plain", "application/xhtml+xml"]):
+                raise ValueError(f"Unsupported content type: {ctype[:80]}")
+            raw = _read_stream_with_deadline(
+                resp,
+                max_bytes=max_bytes,
+                fetch_deadline=fetch_deadline,
+                label="HTML response",
+            )
+            enc = resp.encoding or "utf-8"
+            return current, raw.decode(enc, errors="replace")
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
     raise ValueError("Too many redirects")
 
 
@@ -1514,6 +1629,8 @@ SMART_RECHECK_FUZZY_THRESHOLD = float(os.environ.get("SMART_RECHECK_FUZZY_THRESH
 SMART_RECHECK_NOMINATION_SCORE = int(os.environ.get("SMART_RECHECK_NOMINATION_SCORE", "8"))
 SMART_RECHECK_MAX_VERIFY_PER_ROW = int(os.environ.get("SMART_RECHECK_MAX_VERIFY_PER_ROW", "3"))
 SMART_RECHECK_FETCH_TIMEOUT = int(os.environ.get("SMART_RECHECK_FETCH_TIMEOUT", "12"))
+SMART_RECHECK_HARD_FETCH_DEADLINE_SEC = max(0.0, float(os.environ.get("SMART_RECHECK_HARD_FETCH_DEADLINE_SEC", "20")))
+SMART_RECHECK_MAX_ROW_SECONDS = max(0.0, float(os.environ.get("SMART_RECHECK_MAX_ROW_SECONDS", "120")))
 SMART_RECHECK_FETCH_RETRY_ATTEMPTS = max(1, int(os.environ.get("SMART_RECHECK_FETCH_RETRY_ATTEMPTS", "2")))
 SMART_RECHECK_FETCH_RETRY_BACKOFF_SEC = max(0.0, float(os.environ.get("SMART_RECHECK_FETCH_RETRY_BACKOFF_SEC", "0.75")))
 SMART_RECHECK_VERIFY_MAX_PAGES = int(os.environ.get("SMART_RECHECK_VERIFY_MAX_PAGES", "7"))
@@ -1742,7 +1859,7 @@ def _recheck_append_checkpoint(rd: Path, result: dict, audit_rows: list[dict]) -
 
     firecrawl_fields = ["name", "district", "state", "darpan_id", "email", "phone", "registered_address", "website", "previous_website_status"]
     firecrawl_statuses = {
-        "candidate_site_unreachable", "possible_site_manual_review", "needs_manual_verification",
+        "candidate_site_unreachable", "possible_site_manual_review", "needs_manual_verification", "row_timeout",
         "no_candidate_after_completed_search", "search_incomplete", "provider_failure",
     }
     if result.get("Website Status") in firecrawl_statuses:
@@ -2668,24 +2785,38 @@ def _smart_fetch_pdf_text(url: str) -> tuple[str, str, str]:
     """Download and parse a PDF locally, consuming no Firecrawl credits."""
     current = _validate_public_http_url(url)
     headers = {"User-Agent": "Mozilla/5.0 DFP2SmartRecovery/4.0"}
+    fetch_deadline = time.monotonic() + SMART_RECHECK_HARD_FETCH_DEADLINE_SEC if SMART_RECHECK_HARD_FETCH_DEADLINE_SEC > 0 else None
     for _ in range(5):
-        resp = requests.get(current, headers=headers, timeout=SMART_RECHECK_FETCH_TIMEOUT, allow_redirects=False, stream=True)
-        if 300 <= resp.status_code < 400 and resp.headers.get("Location"):
-            current = _validate_public_http_url(urljoin(current, resp.headers["Location"]))
-            continue
-        resp.raise_for_status()
-        chunks = []
-        total = 0
-        for chunk in resp.iter_content(chunk_size=65536):
-            if not chunk:
+        _check_fetch_deadline(fetch_deadline, "PDF fetch")
+        resp = None
+        try:
+            resp = requests.get(
+                current,
+                headers=headers,
+                timeout=_bounded_request_timeout(SMART_RECHECK_FETCH_TIMEOUT, fetch_deadline),
+                allow_redirects=False,
+                stream=True,
+            )
+            _check_fetch_deadline(fetch_deadline, "PDF fetch")
+            if 300 <= resp.status_code < 400 and resp.headers.get("Location"):
+                current = _validate_public_http_url(urljoin(current, resp.headers["Location"]))
                 continue
-            total += len(chunk)
-            if total > SMART_RECHECK_LOCAL_PDF_MAX_BYTES:
-                raise ValueError("PDF exceeded local size limit")
-            chunks.append(chunk)
-        raw = b"".join(chunks)
-        if not raw.startswith(b"%PDF") and "pdf" not in (resp.headers.get("content-type") or "").lower():
-            raise ValueError("Response was not a PDF")
+            resp.raise_for_status()
+            raw = _read_stream_with_deadline(
+                resp,
+                max_bytes=SMART_RECHECK_LOCAL_PDF_MAX_BYTES,
+                fetch_deadline=fetch_deadline,
+                label="PDF response",
+            )
+            if not raw.startswith(b"%PDF") and "pdf" not in (resp.headers.get("content-type") or "").lower():
+                raise ValueError("Response was not a PDF")
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+        _check_fetch_deadline(fetch_deadline, "PDF parsing")
         try:
             from pypdf import PdfReader
         except Exception as exc:
@@ -2693,8 +2824,13 @@ def _smart_fetch_pdf_text(url: str) -> tuple[str, str, str]:
         reader = PdfReader(io.BytesIO(raw))
         texts = []
         for page in list(reader.pages)[:SMART_RECHECK_LOCAL_PDF_MAX_PAGES]:
+            _check_fetch_deadline(fetch_deadline, "PDF parsing")
             try:
                 texts.append(page.extract_text() or "")
+            except RecheckRowDeadlineExceeded:
+                raise
+            except FetchDeadlineExceeded:
+                raise
             except Exception:
                 continue
         text = re.sub(r"\s+", " ", " ".join(texts)).strip()
@@ -2752,17 +2888,22 @@ def _smart_fetch_page(url: str, allow_firecrawl: bool = True, counter: dict | No
                     headers={"User-Agent": "Mozilla/5.0 DFP2SmartRecovery/4.0"},
                     timeout=SMART_RECHECK_FETCH_TIMEOUT,
                     max_bytes=2_500_000,
+                    hard_deadline_sec=SMART_RECHECK_HARD_FETCH_DEADLINE_SEC,
                 )
                 visible = _smart_html_to_text(raw)
                 if visible and not _smart_is_challenge_text(visible):
                     return final_url, visible, raw, ""
                 errors.append(f"{candidate} attempt {attempt + 1}: empty/challenge response")
+            except RecheckRowDeadlineExceeded:
+                raise
             except Exception as direct_error:
                 # Some PDF endpoints lack a .pdf suffix but advertise PDF content.
                 if "unsupported content type" in str(direct_error).lower() and "pdf" in str(direct_error).lower():
                     try:
                         final_url, visible, _ = _smart_fetch_pdf_text(candidate)
                         return final_url, visible, "", ""
+                    except RecheckRowDeadlineExceeded:
+                        raise
                     except Exception as pdf_error:
                         errors.append(f"{candidate} PDF parse: {pdf_error}")
                 else:
@@ -3072,6 +3213,8 @@ def _smart_write_summary(rd: Path, result_rows: list[dict], audit_rows: list[dic
             "SMART_RECHECK_MAX_TOTAL_QUERIES": SMART_RECHECK_MAX_TOTAL_QUERIES,
             "SMART_RECHECK_BRAVE_MAX_QUERIES_PER_ROW": SMART_RECHECK_BRAVE_MAX_QUERIES_PER_ROW,
             "SMART_RECHECK_FETCH_RETRY_ATTEMPTS": SMART_RECHECK_FETCH_RETRY_ATTEMPTS,
+            "SMART_RECHECK_HARD_FETCH_DEADLINE_SEC": SMART_RECHECK_HARD_FETCH_DEADLINE_SEC,
+            "SMART_RECHECK_MAX_ROW_SECONDS": SMART_RECHECK_MAX_ROW_SECONDS,
             "SMART_RECHECK_FUZZY_THRESHOLD": SMART_RECHECK_FUZZY_THRESHOLD,
             "use_brave": SMART_RECHECK_USE_BRAVE, "use_firecrawl": SMART_RECHECK_USE_FIRECRAWL,
             "rename_recovery_enabled": SMART_RECHECK_ENABLE_RENAME_RECOVERY,
@@ -3591,6 +3734,8 @@ def _run_smart_recheck_job(run_id: str, cancel_event: threading.Event, strategy_
     audit_count = _count_export_records(rd / RECHECK_OUTPUTS["audit"])
     skipped_rows: list[dict] = _recheck_read_all_csv(rd / RECHECK_OUTPUTS["skipped"])
     cap_hit = bool(previous_status.get("cap_hit")); errors = int(previous_status.get("errors") or 0)
+    row_timeouts = int(previous_status.get("row_timeouts") or 0)
+    last_progress_epoch = float(previous_status.get("last_progress_at_epoch") or session_start)
     counter = _recheck_load_counter(rd, strategy_name)
 
     try:
@@ -3646,14 +3791,18 @@ def _run_smart_recheck_job(run_id: str, cancel_event: threading.Event, strategy_
                     _write_recheck_status(
                         rd, ok=True, run_status="paused", stage="paused", current_item="Paused safely after the last completed NGO.",
                         strategy=strategy_name, summary=summary, queries_used=counter["queries"], firecrawl_credits_used=counter.get("firecrawl_credits", 0),
-                        downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()}, **progress,
+                        downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()},
+                        row_timeouts=row_timeouts, current_item_started_at_epoch=None,
+                        last_progress_at_epoch=last_progress_epoch, **progress,
                     )
                     _job_update(run_id, status="paused", stage="paused")
                 else:
                     _write_recheck_status(
                         rd, ok=True, run_status="stopped", stage="stopped_partial", current_item="Search ended safely. Partial outputs are ready and the run can be resumed.",
                         strategy=strategy_name, summary=summary, queries_used=counter["queries"], firecrawl_credits_used=counter.get("firecrawl_credits", 0),
-                        downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()}, **progress,
+                        downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()},
+                        row_timeouts=row_timeouts, current_item_started_at_epoch=None,
+                        last_progress_at_epoch=last_progress_epoch, **progress,
                     )
                     _job_update(run_id, status="stopped", stage="stopped_partial")
                 return
@@ -3673,18 +3822,36 @@ def _run_smart_recheck_job(run_id: str, cancel_event: threading.Event, strategy_
 
             active_elapsed = active_elapsed_before + (time.time() - session_start)
             progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+            row_started_epoch = time.time()
             _write_recheck_status(
                 rd, stage="firecrawl_recovery" if strategy_name == "firecrawl" else "smart_recovery",
                 current_item=row.get("name", ""), current_search="", queries_used=counter["queries"],
+                current_item_started_at_epoch=row_started_epoch,
+                row_deadline_seconds=SMART_RECHECK_MAX_ROW_SECONDS,
+                last_progress_at_epoch=last_progress_epoch,
+                row_timeouts=row_timeouts,
                 firecrawl_credits_used=counter.get("firecrawl_credits", 0), strategy=strategy_name, **progress,
             )
             row_audit: list[dict] = []
+            row_queries_before = int(counter.get("queries", 0))
             try:
-                result = _smart_process_firecrawl_row(row, rd, row_audit, counter) if strategy_name == "firecrawl" else _smart_process_row(row, rd, row_audit, counter)
+                with _smart_recheck_row_deadline(SMART_RECHECK_MAX_ROW_SECONDS):
+                    result = _smart_process_firecrawl_row(row, rd, row_audit, counter) if strategy_name == "firecrawl" else _smart_process_row(row, rd, row_audit, counter)
+            except RecheckRowDeadlineExceeded as e:
+                errors += 1
+                row_timeouts += 1
+                used = max(0, int(counter.get("queries", 0)) - row_queries_before)
+                _append_recheck_error(rd, f"{row.get('name','')} row timeout: {e}")
+                row_audit.append(_smart_audit(row, {"provider": strategy_name, "pass": "row_watchdog", "query": ""}, decision="row_timeout", note=str(e)[:250]))
+                result = _smart_result(
+                    row, "", "row_timeout", "low", strategy_name, "",
+                    f"NGO exceeded the {SMART_RECHECK_MAX_ROW_SECONDS:g}s processing deadline; saved as retryable and continued.",
+                    "row_watchdog", searched="yes" if used else "no", queries_used=used,
+                )
             except Exception as e:
                 errors += 1
                 _append_recheck_error(rd, f"{row.get('name','')} smart error: {e}")
-                result = _smart_result(row, "", "firecrawl_provider_failure" if strategy_name == "firecrawl" else "search_failed", "low", strategy_name, "", str(e)[:250], "", searched="yes", queries_used=0)
+                result = _smart_result(row, "", "firecrawl_provider_failure" if strategy_name == "firecrawl" else "search_failed", "low", strategy_name, "", str(e)[:250], "", searched="yes", queries_used=max(0, int(counter.get("queries", 0)) - row_queries_before))
             if result.get("Website Status") == "skipped_query_cap":
                 cap_hit = True
                 skipped_rows.append(row)
@@ -3696,9 +3863,13 @@ def _run_smart_recheck_job(run_id: str, cancel_event: threading.Event, strategy_
             active_elapsed = active_elapsed_before + (time.time() - session_start)
             progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
             summary = _smart_write_summary(rd, result_rows, audit_count, counter["queries"], first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
+            last_progress_epoch = time.time()
             _write_recheck_status(
                 rd, run_status="running", queries_used=counter["queries"], cap_hit=cap_hit,
-                summary=summary, errors=errors, firecrawl_credits_used=counter.get("firecrawl_credits", 0), strategy=strategy_name, **progress,
+                summary=summary, errors=errors, row_timeouts=row_timeouts,
+                current_item="", current_item_started_at_epoch=None,
+                last_completed_item=row.get("name", ""), last_progress_at_epoch=last_progress_epoch,
+                firecrawl_credits_used=counter.get("firecrawl_credits", 0), strategy=strategy_name, **progress,
             )
             time.sleep(RECHECK_PACE_SEC)
 
@@ -3710,7 +3881,9 @@ def _run_smart_recheck_job(run_id: str, cancel_event: threading.Event, strategy_
             message="Firecrawl recovery complete" if strategy_name == "firecrawl" else "Smart website recovery complete",
             queries_used=counter["queries"], cap_hit=cap_hit, summary=summary, errors=errors,
             firecrawl_credits_used=counter.get("firecrawl_credits", 0), strategy=strategy_name,
-            downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()}, **progress,
+            downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()},
+            row_timeouts=row_timeouts, current_item="", current_item_started_at_epoch=None,
+            last_progress_at_epoch=time.time(), **progress,
         )
         _recheck_pause_path(rd).unlink(missing_ok=True)
         _recheck_stop_path(rd).unlink(missing_ok=True)
@@ -3807,6 +3980,16 @@ def recheck_status(run_id: str):
     data["can_stop"] = process_state == "running" and run_status != "stop_requested"
     data["can_resume"] = process_state != "running" and (run_status in {"paused", "stopped", "interrupted", "error", "cancelled", "canceled"} or str(data.get("stage") or "").lower() in {"stopped_partial", "interrupted_restart"})
     data["partial_outputs_available"] = bool(data["downloads"].get("results") or data["downloads"].get("audit"))
+    row_started = data.get("current_item_started_at_epoch")
+    if process_state == "running" and row_started not in {None, ""}:
+        try:
+            row_elapsed = max(0.0, time.time() - float(row_started))
+            data["current_item_elapsed_sec"] = round(row_elapsed, 1)
+            row_limit = float(data.get("row_deadline_seconds") or SMART_RECHECK_MAX_ROW_SECONDS or 0)
+            data["row_deadline_remaining_sec"] = round(max(0.0, row_limit - row_elapsed), 1) if row_limit > 0 else None
+            data["row_near_deadline"] = bool(row_limit > 0 and row_elapsed >= row_limit * 0.75)
+        except Exception:
+            pass
     _job_sync_from_status(run_id, "no_website_recheck", rd, data)
     data["job"] = _read_job(run_id)
     return JSONResponse(content=data)

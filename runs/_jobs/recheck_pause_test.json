@@ -1,0 +1,21 @@
+{
+  "run_id": "recheck_pause_test",
+  "job_type": "no_website_recheck",
+  "created_at": "2026-07-19T08:57:26Z",
+  "run_dir": "/tmp/pytest-of-root/pytest-2/test_pause_then_resume_skips_c0/recheck_pause_test",
+  "status": "complete",
+  "stage": "results_ready",
+  "updated_at": "2026-07-19T08:59:03Z",
+  "run_status": "complete",
+  "processed": 3,
+  "total": 3,
+  "error": "",
+  "current_item": "",
+  "current_search": "",
+  "queries_used": 3,
+  "cap_hit": false,
+  "strategy": "smart",
+  "module": "no_website_recheck",
+  "remaining": 0,
+  "progress_pct": 100.0
+}
