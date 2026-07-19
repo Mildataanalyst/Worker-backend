@@ -479,11 +479,15 @@ def clean_and_load():
                     "Reason": "Exact duplicate of NGO name + district + state. Same NGO names in different districts/states are preserved.",
                 })
                 continue
+            supplied_website = (r.get("website") or r.get("Website") or r.get("url") or r.get("URL") or "").strip()
+            darpan_id = (r.get("darpan_id") or r.get("Darpan ID") or r.get("NGO Darpan ID") or "").strip()
             row = {
                 "id": ngo_id_for(name, district, state),
                 "name": name,   # display name (suffix preserved)
                 "district": district,
                 "state": state,
+                "website": supplied_website,
+                "darpan_id": darpan_id,
             }
             seen[key] = row
             rows.append(row)
@@ -700,19 +704,44 @@ def _looks_like_html_response(r):
     ct = (r.headers.get("content-type") or "").lower()
     return ("text/html" in ct) or ("application/xhtml" in ct) or ct == ""
 
+def _fetch_site_variants(url):
+    raw = str(url or "").strip()
+    if not raw:
+        return []
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw.lstrip("/")
+    p = urlparse(raw)
+    host = (p.hostname or "").lower()
+    path = p.path or "/"
+    variants = [raw]
+    if host:
+        alt = host[4:] if host.startswith("www.") else "www." + host
+        variants.append(f"https://{alt}{path}")
+        if p.scheme == "https":
+            variants.append(f"http://{host}{path}")
+    return list(dict.fromkeys(variants))
+
+
 def fetch_site_text(url):
     pages_text, socials = [], set()
-    r = http_get(url, FETCH_TIMEOUT)
-    if r is None or r.status_code != 200:
-        return "", [], f"could not fetch {url}"
-    if not _looks_like_html_response(r):
-        return "", [], f"not an HTML page: {url}"
-    base = re.match(r"^(https?://[^/]+)", url)
-    base = base.group(1) if base else url
+    r = None
+    fetched_url = url
+    errors = []
+    for candidate in _fetch_site_variants(url):
+        rr = http_get(candidate, FETCH_TIMEOUT)
+        if rr is not None and rr.status_code == 200 and _looks_like_html_response(rr):
+            r = rr
+            fetched_url = getattr(rr, "url", candidate) or candidate
+            break
+        code = getattr(rr, "status_code", "no_response") if rr is not None else "no_response"
+        errors.append(f"{candidate}:{code}")
+    if r is None:
+        return "", [], f"could not fetch {url}; tried " + ", ".join(errors)
+    base = re.match(r"^(https?://[^/]+)", fetched_url)
+    base = base.group(1) if base else fetched_url
     soup = BeautifulSoup(_response_text_limited(r), "html.parser")
     pages_text.append(_visible(soup))
     socials |= _socials(soup)
-    # follow a few internal links that usually hold the good stuff
     links, seen = [], set()
     for a in soup.find_all("a", href=True):
         href_raw = a["href"].strip()
@@ -1075,8 +1104,22 @@ def run():
     write_status("loading_input", "Loading and de-duplicating input CSV by NGO name + district + state", run_status="starting")
     ngos = clean_and_load()
     done = load_done_ids()
-    todo = [n for n in ngos if n["id"] not in done]
-    print(f"{len(ngos)} unique NGOs | {len(done)} already done | {len(todo)} to process")
+    retryable_statuses = {"fetch_failed", "search_failed", "skipped_error"}
+    todo = []
+    for ngo in ngos:
+        previous = done.get(ngo["id"])
+        if not previous:
+            todo.append(ngo)
+            continue
+        if previous.get("status") in retryable_statuses:
+            retry_ngo = dict(ngo)
+            # A fetch retry should reuse the candidate already found and avoid
+            # spending another Serper query. Search failures still run search again.
+            if previous.get("status") == "fetch_failed" and previous.get("website"):
+                retry_ngo["website"] = previous.get("website")
+            todo.append(retry_ngo)
+    settled = max(0, len(ngos) - len(todo))
+    print(f"{len(ngos)} unique NGOs | {settled} settled | {len(todo)} new/retry rows to process")
     duplicate_count = 0
     try:
         if os.path.exists(DUPLICATE_CANDIDATES_CSV):
@@ -1095,7 +1138,12 @@ def run():
         try:
             processed_so_far = len(done) + idx - 1
             write_status("processing_ngo", "Starting NGO row", current_item=ngo["name"], total=len(ngos), done=processed_so_far)
-            url, organic, serr = find_official_site(ngo, total=len(ngos), done=processed_so_far)
+            supplied_url = str(ngo.get("website") or "").strip()
+            if supplied_url:
+                url, organic, serr = supplied_url, [], None
+                rec["note"] = "using verified website supplied by advanced recovery; Serper search skipped"
+            else:
+                url, organic, serr = find_official_site(ngo, total=len(ngos), done=processed_so_far)
             if serr:
                 rec["status"] = "search_failed"; rec["note"] = log_error(ngo["id"], ngo["name"], "search", serr)
                 checkpoint(rec); continue

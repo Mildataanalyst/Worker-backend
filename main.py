@@ -11,6 +11,7 @@ import uuid
 import threading
 import re
 import ipaddress
+import io
 import socket
 import tempfile
 from contextlib import contextmanager
@@ -83,6 +84,8 @@ STORY_OUTPUTS = {
 RECHECK_OUTPUTS = {
     "results": "dfp2_no_website_recheck.csv",
     "audit": "dfp2_no_website_recheck_audit.csv",
+    "avika_input": "dfp2_recovered_websites_for_avika_filter.csv",
+    "firecrawl_input": "dfp2_firecrawl_recovery_input.csv",
     "errors": "dfp2_no_website_recheck_errors.log",
     "status": "dfp2_no_website_recheck_status.json",
     "summary": "dfp2_no_website_recheck_summary.json",
@@ -563,7 +566,7 @@ def _job_sync_from_status(run_id: str, job_type: str, rd: Path, status_data: dic
             "run_dir": str(rd.resolve()),
         }
         # Keep useful counters when present without making the registry huge.
-        for k in ("current_item", "current_search", "current_url", "queries_used", "cap_hit", "mode", "run_type", "strategy", "module"):
+        for k in ("current_item", "current_search", "current_url", "queries_used", "cap_hit", "mode", "run_type", "strategy", "module", "input_filename", "remaining", "progress_pct", "resume_count"):
             if k in (status_data or {}):
                 payload[k] = (status_data or {}).get(k)
         if not _read_job(run_id):
@@ -1500,16 +1503,41 @@ def repository_cancel(run_id: str):
 # one Serper query per NGO by default, but has better official-site detection:
 # Knowledge Panel website, top organic result, and forgiving domain matching
 # such as "Bridges of Sports Foundation" -> bridgesofsports.org.
-RECHECK_MAX_ROWS = int(os.environ.get("RECHECK_MAX_ROWS", "5000"))
+RECHECK_MAX_ROWS = int(os.environ.get("RECHECK_MAX_ROWS", "30000"))
 RECHECK_SERPER_NUM = int(os.environ.get("RECHECK_SERPER_NUM", "10"))
 RECHECK_PACE_SEC = float(os.environ.get("RECHECK_PACE_SEC", "0.20"))
-SMART_RECHECK_MAX_QUERIES_PER_ROW = int(os.environ.get("SMART_RECHECK_MAX_QUERIES_PER_ROW", "3"))
-SMART_RECHECK_MAX_TOTAL_QUERIES = int(os.environ.get("SMART_RECHECK_MAX_TOTAL_QUERIES", "15000"))
+SMART_RECHECK_MAX_QUERIES_PER_ROW = int(os.environ.get("SMART_RECHECK_MAX_QUERIES_PER_ROW", "2"))
+SMART_RECHECK_MAX_TOTAL_QUERIES = int(os.environ.get("SMART_RECHECK_MAX_TOTAL_QUERIES", "58000"))
+SMART_RECHECK_BRAVE_MAX_QUERIES_PER_ROW = int(os.environ.get("SMART_RECHECK_BRAVE_MAX_QUERIES_PER_ROW", "2"))
 SMART_RECHECK_STOP_ON_HIGH_CONFIDENCE = os.environ.get("SMART_RECHECK_STOP_ON_HIGH_CONFIDENCE", "true").lower() != "false"
 SMART_RECHECK_FUZZY_THRESHOLD = float(os.environ.get("SMART_RECHECK_FUZZY_THRESHOLD", "0.84"))
 SMART_RECHECK_NOMINATION_SCORE = int(os.environ.get("SMART_RECHECK_NOMINATION_SCORE", "8"))
-SMART_RECHECK_MAX_VERIFY_PER_ROW = int(os.environ.get("SMART_RECHECK_MAX_VERIFY_PER_ROW", "2"))
-SMART_RECHECK_FETCH_TIMEOUT = int(os.environ.get("SMART_RECHECK_FETCH_TIMEOUT", "10"))
+SMART_RECHECK_MAX_VERIFY_PER_ROW = int(os.environ.get("SMART_RECHECK_MAX_VERIFY_PER_ROW", "3"))
+SMART_RECHECK_FETCH_TIMEOUT = int(os.environ.get("SMART_RECHECK_FETCH_TIMEOUT", "12"))
+SMART_RECHECK_FETCH_RETRY_ATTEMPTS = max(1, int(os.environ.get("SMART_RECHECK_FETCH_RETRY_ATTEMPTS", "2")))
+SMART_RECHECK_FETCH_RETRY_BACKOFF_SEC = max(0.0, float(os.environ.get("SMART_RECHECK_FETCH_RETRY_BACKOFF_SEC", "0.75")))
+SMART_RECHECK_VERIFY_MAX_PAGES = int(os.environ.get("SMART_RECHECK_VERIFY_MAX_PAGES", "7"))
+# Paid fallbacks are opt-in. The production default is Darpan-first Serper-only.
+SMART_RECHECK_USE_BRAVE = os.environ.get("SMART_RECHECK_USE_BRAVE", "false").lower() not in {"0", "false", "no"}
+SMART_RECHECK_USE_FIRECRAWL = os.environ.get("SMART_RECHECK_USE_FIRECRAWL", "false").lower() not in {"0", "false", "no"}
+SMART_RECHECK_ENABLE_RENAME_RECOVERY = os.environ.get("SMART_RECHECK_ENABLE_RENAME_RECOVERY", "false").lower() not in {"0", "false", "no"}
+
+# Firecrawl is a selective recovery layer, never the default search engine.
+# Budgets are conservative per-run ceilings. Search is exposed as a separate
+# strategy so the 2-credit search call is only spent on a user-selected queue.
+SMART_RECHECK_FIRECRAWL_TOTAL_CREDIT_BUDGET = max(0, int(os.environ.get("SMART_RECHECK_FIRECRAWL_TOTAL_CREDIT_BUDGET", "10000")))
+SMART_RECHECK_FIRECRAWL_VERIFY_CREDIT_BUDGET = max(0, int(os.environ.get("SMART_RECHECK_FIRECRAWL_VERIFY_CREDIT_BUDGET", "7000")))
+SMART_RECHECK_FIRECRAWL_SEARCH_CREDIT_BUDGET = max(0, int(os.environ.get("SMART_RECHECK_FIRECRAWL_SEARCH_CREDIT_BUDGET", "2000")))
+SMART_RECHECK_FIRECRAWL_RESERVE_CREDIT_BUDGET = max(0, int(os.environ.get("SMART_RECHECK_FIRECRAWL_RESERVE_CREDIT_BUDGET", "1000")))
+SMART_RECHECK_FIRECRAWL_MAX_SCRAPES_PER_DOMAIN = max(1, int(os.environ.get("SMART_RECHECK_FIRECRAWL_MAX_SCRAPES_PER_DOMAIN", "3")))
+SMART_RECHECK_FIRECRAWL_MAX_SEARCHES_PER_NGO = max(0, int(os.environ.get("SMART_RECHECK_FIRECRAWL_MAX_SEARCHES_PER_NGO", "1")))
+SMART_RECHECK_FIRECRAWL_SEARCH_LIMIT = min(10, max(1, int(os.environ.get("SMART_RECHECK_FIRECRAWL_SEARCH_LIMIT", "10"))))
+SMART_RECHECK_FIRECRAWL_SEARCH_MAX_VERIFY = max(1, int(os.environ.get("SMART_RECHECK_FIRECRAWL_SEARCH_MAX_VERIFY", "1")))
+SMART_RECHECK_FIRECRAWL_PROXY = os.environ.get("SMART_RECHECK_FIRECRAWL_PROXY", "basic").strip().lower()
+if SMART_RECHECK_FIRECRAWL_PROXY not in {"basic", "enhanced"}:
+    SMART_RECHECK_FIRECRAWL_PROXY = "basic"
+SMART_RECHECK_LOCAL_PDF_MAX_BYTES = max(1_000_000, int(os.environ.get("SMART_RECHECK_LOCAL_PDF_MAX_BYTES", "12000000")))
+SMART_RECHECK_LOCAL_PDF_MAX_PAGES = max(1, int(os.environ.get("SMART_RECHECK_LOCAL_PDF_MAX_PAGES", "40")))
 
 TIER_A_LEGAL = {"foundation","trust","society","sanstha","sansthan","samiti","samithi","samsthe","mission","ngo","association","organization","organisation","charitable","pratishthan"}
 TIER_B_COMMON = {"seva","welfare","rural","development","education","educational","humanity","care","help","social","service","services","public","national","india","indian","group","committee","council","centre","center","institute","institution"}
@@ -1530,16 +1558,20 @@ try:
 except Exception as _alias_err:
     print(f"SMART_RECHECK_ALIASES_JSON ignored: {_alias_err}", file=sys.stderr)
 RECHECK_FIELDS = [
-    "NGO Name", "State", "District", "Website", "Website Status", "Confidence",
-    "Source", "Query", "Note",
+    "NGO Name", "State", "District", "Darpan ID", "Email", "Phone", "Registered Address",
+    "Website", "Website Status", "Confidence", "Source", "Search Provider", "Query", "Note",
     "Match Route", "Evidence Grade", "Evidence Type", "Evidence Matched Text", "Evidence Page URL",
-    "Query Pass", "Variant Used", "Variant Type", "Searched", "Queries Used", "Duplicate Group Size"
+    "Query Pass", "Variant Used", "Variant Type", "Searched", "Queries Used", "Successful Searches",
+    "Failed Searches", "Fetch Status", "Fetch Errors", "Firecrawl Credits Used", "Firecrawl Action",
+    "Duplicate Group Size"
 ]
 RECHECK_AUDIT_FIELDS = [
-    "NGO Name", "State", "District", "Query", "Candidate URL", "Candidate Title",
+    "NGO Name", "State", "District", "Darpan ID", "Provider", "Query", "Candidate URL", "Candidate Title",
     "Candidate Source", "Score", "Decision", "Note",
     "Query Pass", "Variant Used", "Variant Type", "Candidate Domain", "Candidate Snippet",
-    "Match Route", "Evidence Grade", "Reject Reason", "Carrier URL", "Carrier Phrase"
+    "Match Route", "Evidence Grade", "Evidence Type", "Evidence Matched Text", "Evidence Page URL",
+    "Fetch Status", "Fetch Errors", "Firecrawl Credits Used", "Firecrawl Action",
+    "Reject Reason", "Carrier URL", "Carrier Phrase"
 ]
 RECHECK_BAD_DOMAINS = (
     "ngodarpan", "darpan.gov", "csrbox", "ngobox", "justdial", "sulekha",
@@ -1548,8 +1580,7 @@ RECHECK_BAD_DOMAINS = (
 )
 RECHECK_LISTING_DOMAINS = (
     "thehindu", "timesofindia", "hindustantimes", "indianexpress", "deccanherald",
-    "newindianexpress", "yourstory", "betterindia", "medium.com", "wordpress.com",
-    "blogspot.com", "news", "magazine",
+    "newindianexpress", "yourstory", "betterindia", "medium.com", "news", "magazine",
 )
 RECHECK_LEGAL_SUFFIXES = {
     "trust", "foundation", "society", "sanstha", "samiti", "mission", "ngo",
@@ -1608,8 +1639,160 @@ def _append_recheck_error(rd: Path, msg: str):
         f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
 
+
+
+
+def _recheck_pause_path(rd: Path) -> Path:
+    return rd / ".recheck_pause_requested"
+
+
+def _recheck_stop_path(rd: Path) -> Path:
+    return rd / ".recheck_stop_requested"
+
+
+def _recheck_read_all_csv(path: Path) -> list[dict]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _recheck_identity_key(row: dict, result_row: bool = False) -> str:
+    if result_row:
+        darpan = str(row.get("Darpan ID") or row.get("darpan_id") or "").strip()
+        name = str(row.get("NGO Name") or row.get("name") or "").strip()
+        district = str(row.get("District") or row.get("district") or "").strip()
+        state = str(row.get("State") or row.get("state") or "").strip()
+    else:
+        darpan = _smart_primary_darpan(row)
+        name = str(row.get("name") or row.get("NGO Name") or "").strip()
+        district = str(row.get("district") or row.get("District") or "").strip()
+        state = str(row.get("state") or row.get("State") or "").strip()
+    if darpan:
+        return "id:" + _smart_compact(darpan)
+    return "name:" + "|".join([_smart_norm(name), _smart_norm(district), _smart_norm(state)])
+
+
+def _recheck_control_action(rd: Path, run_id: str, cancel_event: threading.Event) -> str:
+    if _recheck_stop_path(rd).exists() or _should_cancel(run_id, cancel_event):
+        return "stop"
+    if _recheck_pause_path(rd).exists():
+        return "pause"
+    return ""
+
+
+def _recheck_progress_payload(processed: int, total: int, active_elapsed_sec: float) -> dict:
+    processed = max(0, int(processed or 0))
+    total = max(0, int(total or 0))
+    elapsed = max(0.0, float(active_elapsed_sec or 0.0))
+    remaining = max(0, total - processed)
+    progress_pct = round((processed / total) * 100, 2) if total else 0.0
+    rate_per_sec = (processed / elapsed) if processed > 0 and elapsed > 0 else 0.0
+    rate_per_min = round(rate_per_sec * 60, 2) if rate_per_sec else 0.0
+    eta_seconds = None
+    eta_at = ""
+    eta_quality = "calculating"
+    # Avoid publishing a very noisy ETA from the first few rows.
+    if processed >= 5 and rate_per_sec > 0:
+        eta_seconds = max(0, int(round(remaining / rate_per_sec)))
+        eta_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + eta_seconds))
+        eta_quality = "live_estimate"
+    if remaining == 0 and total:
+        eta_seconds = 0
+        eta_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        eta_quality = "complete"
+    return {
+        "processed": processed,
+        "total": total,
+        "remaining": remaining,
+        "progress_pct": progress_pct,
+        "active_elapsed_sec": round(elapsed, 1),
+        "throughput_rows_per_min": rate_per_min,
+        "eta_seconds": eta_seconds,
+        "eta_at": eta_at,
+        "eta_quality": eta_quality,
+    }
+
+
+def _recheck_append_csv(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
+    if not rows:
+        return
+    needs_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if needs_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(_safe_csv_row({k: row.get(k, "") for k in fieldnames}))
+
+
+def _recheck_append_checkpoint(rd: Path, result: dict, audit_rows: list[dict]) -> None:
+    """Append one completed NGO and its audit evidence without rewriting prior rows."""
+    _recheck_append_csv(rd / RECHECK_OUTPUTS["results"], RECHECK_FIELDS, [result])
+    _recheck_append_csv(rd / RECHECK_OUTPUTS["audit"], RECHECK_AUDIT_FIELDS, audit_rows)
+
+    avika_fields = ["name", "district", "state", "darpan_id", "website", "website_recovery_status"]
+    allowed = {"confirmed_official_site", "probable_official_site", "rename_verified_match"}
+    if result.get("Website") and result.get("Website Status") in allowed:
+        _recheck_append_csv(rd / RECHECK_OUTPUTS["avika_input"], avika_fields, [{
+            "name": result.get("NGO Name", ""), "district": result.get("District", ""),
+            "state": result.get("State", ""), "darpan_id": result.get("Darpan ID", ""),
+            "website": result.get("Website", ""), "website_recovery_status": result.get("Website Status", ""),
+        }])
+
+    firecrawl_fields = ["name", "district", "state", "darpan_id", "email", "phone", "registered_address", "website", "previous_website_status"]
+    firecrawl_statuses = {
+        "candidate_site_unreachable", "possible_site_manual_review", "needs_manual_verification",
+        "no_candidate_after_completed_search", "search_incomplete", "provider_failure",
+    }
+    if result.get("Website Status") in firecrawl_statuses:
+        _recheck_append_csv(rd / RECHECK_OUTPUTS["firecrawl_input"], firecrawl_fields, [{
+            "name": result.get("NGO Name", ""), "district": result.get("District", ""),
+            "state": result.get("State", ""), "darpan_id": result.get("Darpan ID", ""),
+            "email": result.get("Email", ""), "phone": result.get("Phone", ""),
+            "registered_address": result.get("Registered Address", ""), "website": result.get("Website", ""),
+            "previous_website_status": result.get("Website Status", ""),
+        }])
+
+
+def _recheck_initialize_outputs(rd: Path) -> None:
+    # Make partial downloads available immediately, even before row 1 completes.
+    _write_recheck_csvs(rd, [], [])
+    _smart_write_skipped(rd, [])
+    (rd / RECHECK_OUTPUTS["errors"]).touch(exist_ok=True)
+
+
+def _recheck_load_counter(rd: Path, strategy_name: str) -> dict:
+    status = {}
+    summary = {}
+    try:
+        status = json.loads(_recheck_status_path(rd).read_text(encoding="utf-8"))
+    except Exception:
+        status = {}
+    try:
+        summary = json.loads((rd / RECHECK_OUTPUTS["summary"]).read_text(encoding="utf-8"))
+    except Exception:
+        summary = status.get("summary") or {}
+    return _smart_firecrawl_counter_init({
+        "queries": int(status.get("queries_used") or summary.get("total_queries") or 0),
+        "serper_queries": int(summary.get("serper_queries") or 0),
+        "brave_queries": int(summary.get("brave_queries") or 0),
+        "firecrawl_credits": int(status.get("firecrawl_credits_used") or summary.get("firecrawl_credits_used") or 0),
+        "firecrawl_verify_credits": int(summary.get("firecrawl_verify_credits") or 0),
+        "firecrawl_search_credits": int(summary.get("firecrawl_search_credits") or 0),
+        "firecrawl_scrapes": int(summary.get("firecrawl_scrapes") or 0),
+        "firecrawl_searches": int(summary.get("firecrawl_searches") or 0),
+        "strategy": strategy_name,
+    })
+
+
 def _read_recheck_input(path: Path) -> list[dict]:
-    """Read CSV forgivingly. Accepts either a name column or a one-column/headerless file."""
+    """Read CSV forgivingly and preserve every identity field supplied by the user.
+
+    De-duplication prioritises Darpan/registration identifiers, then falls back to
+    name + district + state. This prevents identifier-bearing rows from being
+    collapsed merely because their display names are similar.
+    """
     rows: list[dict] = []
     seen = set()
     text = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -1632,19 +1815,31 @@ def _read_recheck_input(path: Path) -> list[dict]:
                 name = (r.get(name_key) or "").strip() if name_key else ""
                 if not name:
                     continue
-                state = (r.get("state") or r.get("State") or "").strip()
-                district = (r.get("district") or r.get("District") or "").strip()
-                norm = (re.sub(r"\s+", " ", name).lower(), district.lower(), state.lower())
+                clean = {str(k).strip(): (v or "").strip() for k, v in r.items() if k is not None}
+                state = (clean.get("state") or clean.get("State") or "").strip()
+                district = (clean.get("district") or clean.get("District") or "").strip()
+                darpan = ""
+                for k, v in clean.items():
+                    lk = k.lower()
+                    if "darpan" in lk or "unique id" in lk or "unique_id" in lk:
+                        darpan = v.strip()
+                        if darpan:
+                            break
+                if darpan:
+                    norm = ("id", re.sub(r"[^a-z0-9]", "", darpan.lower()))
+                else:
+                    norm = ("name", re.sub(r"\s+", " ", name).lower(), district.lower(), state.lower())
                 if norm in seen:
                     continue
                 seen.add(norm)
-                row = {str(k).strip(): (v or "") for k, v in r.items() if k is not None}
-                row.update({
+                clean.update({
                     "name": re.sub(r"\s+", " ", name),
                     "state": state,
                     "district": district,
                 })
-                rows.append(row)
+                if darpan:
+                    clean.setdefault("darpan_id", darpan)
+                rows.append(clean)
         else:
             reader = csv.reader(f)
             for r in reader:
@@ -1653,13 +1848,12 @@ def _read_recheck_input(path: Path) -> list[dict]:
                 name = (r[0] or "").strip()
                 if not name:
                     continue
-                norm = (re.sub(r"\s+", " ", name).lower(), "", "")
+                norm = ("name", re.sub(r"\s+", " ", name).lower(), "", "")
                 if norm in seen:
                     continue
                 seen.add(norm)
                 rows.append({"name": re.sub(r"\s+", " ", name), "state": "", "district": ""})
     return rows
-
 
 def _recheck_tokens(name: str) -> list[str]:
     return [
@@ -1678,7 +1872,17 @@ def _recheck_domain(url: str) -> str:
     return host
 
 
+def _recheck_is_document_url(url: str) -> bool:
+    path = (urlparse(str(url or "")).path or "").lower()
+    return path.endswith((".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"))
+
+
 def _recheck_bad_url(url: str) -> bool:
+    """Reject third-party/listing domains, but keep official-domain documents.
+
+    A PDF is not itself returned as the official homepage; it may nevertheless
+    contain the Darpan/FCRA evidence that proves ownership of its parent domain.
+    """
     low = (url or "").lower()
     dom = _recheck_domain(url)
     if not low.startswith(("http://", "https://")) or not dom:
@@ -1694,10 +1898,7 @@ def _recheck_bad_url(url: str) -> bool:
                 return True
         elif b in dom:
             return True
-    if low.endswith((".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")):
-        return True
     return False
-
 
 def _recheck_query(row: dict) -> str:
     name = row.get("name", "")
@@ -1714,6 +1915,106 @@ def _serper_search_full(query: str) -> tuple[dict, str | None]:
     except Exception as e:
         return {}, str(e)
 
+
+
+
+def _has_brave_key() -> bool:
+    return bool((os.environ.get("BRAVE_SEARCH_API_KEY") or os.environ.get("BRAVE_API_KEY") or "").strip())
+
+
+def _brave_search_full(query: str) -> tuple[dict, str | None]:
+    key = (os.environ.get("BRAVE_SEARCH_API_KEY") or os.environ.get("BRAVE_API_KEY") or "").strip()
+    if not key:
+        return {}, "BRAVE_SEARCH_API_KEY is not configured"
+    try:
+        r = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={"Accept": "application/json", "X-Subscription-Token": key},
+            params={"q": query, "country": "IN", "search_lang": "en", "count": min(20, RECHECK_SERPER_NUM), "extra_snippets": "true", "safesearch": "moderate"},
+            timeout=25,
+        )
+        if r.status_code != 200:
+            return {}, f"Brave failed {r.status_code}: {r.text[:220]}"
+        return r.json(), None
+    except Exception as e:
+        return {}, str(e)
+
+
+def _brave_candidates(data: dict) -> list[dict]:
+    candidates = []
+    for res in ((data.get("web") or {}).get("results") or []):
+        snippets = [res.get("description") or ""] + list(res.get("extra_snippets") or [])
+        candidates.append({
+            "url": res.get("url") or "",
+            "title": res.get("title") or "",
+            "snippet": " ".join(str(x) for x in snippets if x),
+            "source": "brave_web",
+        })
+    for res in ((data.get("locations") or {}).get("results") or []):
+        url = res.get("url") or res.get("website") or ""
+        if url:
+            candidates.append({"url": url, "title": res.get("title") or "", "snippet": res.get("address") or "", "source": "brave_location"})
+    return candidates
+
+
+def _smart_provider_available(provider: str) -> bool:
+    return _has_serper_keys() if provider == "serper" else (_has_brave_key() and SMART_RECHECK_USE_BRAVE)
+
+
+def _smart_search_provider(provider: str, query: str) -> tuple[list[dict], str | None]:
+    if provider == "brave":
+        data, err = _brave_search_full(query)
+        return (_brave_candidates(data or {}), err)
+    data, err = _serper_search_full(query)
+    return (_recheck_candidates(data or {}), err)
+
+
+def _smart_reserve_query(counter: dict, provider: str) -> bool:
+    if SMART_RECHECK_MAX_TOTAL_QUERIES and int(counter.get("queries", 0)) >= SMART_RECHECK_MAX_TOTAL_QUERIES:
+        return False
+    counter["queries"] = int(counter.get("queries", 0)) + 1
+    counter[f"{provider}_queries"] = int(counter.get(f"{provider}_queries", 0)) + 1
+    return True
+
+
+def _smart_domain_key(url: str) -> str:
+    dom = _recheck_domain(url)
+    if not dom:
+        return ""
+    labels = dom.split(".")
+    if len(labels) <= 2:
+        return dom
+    second_level_suffixes = {"co.in", "org.in", "net.in", "ac.in", "gov.in", "co.uk", "org.uk"}
+    tail2 = ".".join(labels[-2:])
+    if tail2 in second_level_suffixes and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return tail2
+
+
+def _smart_site_url(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    dom = _recheck_domain(url)
+    if not dom:
+        return str(url or "")
+    return f"{parsed.scheme or 'https'}://{dom}"
+
+
+def _smart_dedupe_nominees(nominees: list[dict]) -> list[dict]:
+    by_domain = {}
+    order = []
+    for cand in nominees:
+        key = _smart_domain_key(cand.get("url", "")) or cand.get("url", "")
+        if key not in by_domain:
+            by_domain[key] = {**cand, "evidence_urls": [cand.get("url", "")]}
+            order.append(key)
+        else:
+            current = by_domain[key]
+            if cand.get("url") and cand.get("url") not in current["evidence_urls"]:
+                current["evidence_urls"].append(cand.get("url"))
+            if cand.get("score", 0) > current.get("score", 0):
+                keep_urls = current["evidence_urls"]
+                by_domain[key] = {**cand, "evidence_urls": keep_urls}
+    return [by_domain[k] for k in order]
 
 def _recheck_candidates(data: dict) -> list[dict]:
     candidates: list[dict] = []
@@ -1834,6 +2135,42 @@ def _write_recheck_csvs(rd: Path, result_rows: list[dict], audit_rows: list[dict
         writer.writeheader()
         for row in audit_rows:
             writer.writerow(_safe_csv_row({k: row.get(k, "") for k in RECHECK_AUDIT_FIELDS}))
+
+    # Confirmed/probable websites can be uploaded directly into the normal
+    # repository scan. That scan applies the existing Avika-fit classifier and,
+    # because a website is supplied, does not spend another Serper query.
+    avika_fields = ["name", "district", "state", "darpan_id", "website", "website_recovery_status"]
+    allowed = {"confirmed_official_site", "probable_official_site", "rename_verified_match"}
+    with (rd / RECHECK_OUTPUTS["avika_input"]).open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=avika_fields)
+        writer.writeheader()
+        for row in result_rows:
+            if row.get("Website") and row.get("Website Status") in allowed:
+                writer.writerow(_safe_csv_row({
+                    "name": row.get("NGO Name", ""),
+                    "district": row.get("District", ""),
+                    "state": row.get("State", ""),
+                    "darpan_id": row.get("Darpan ID", ""),
+                    "website": row.get("Website", ""),
+                    "website_recovery_status": row.get("Website Status", ""),
+                }))
+
+    firecrawl_fields = ["name", "district", "state", "darpan_id", "email", "phone", "registered_address", "website", "previous_website_status"]
+    firecrawl_statuses = {
+        "candidate_site_unreachable", "possible_site_manual_review", "needs_manual_verification",
+        "no_candidate_after_completed_search", "search_incomplete", "provider_failure",
+    }
+    with (rd / RECHECK_OUTPUTS["firecrawl_input"]).open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=firecrawl_fields)
+        writer.writeheader()
+        for row in result_rows:
+            if row.get("Website Status") in firecrawl_statuses:
+                writer.writerow(_safe_csv_row({
+                    "name": row.get("NGO Name", ""), "district": row.get("District", ""), "state": row.get("State", ""),
+                    "darpan_id": row.get("Darpan ID", ""), "email": row.get("Email", ""), "phone": row.get("Phone", ""),
+                    "registered_address": row.get("Registered Address", ""), "website": row.get("Website", ""),
+                    "previous_website_status": row.get("Website Status", ""),
+                }))
 
 
 def _run_recheck_job(run_id: str, cancel_event: threading.Event):
@@ -1960,29 +2297,96 @@ def _smart_name_variants(name: str) -> dict:
     }
 
 
+def _smart_primary_darpan(row: dict) -> str:
+    for k, v in row.items():
+        key = str(k or "").lower()
+        val = str(v or "").strip()
+        if val and ("darpan" in key or "unique id" in key or "unique_id" in key):
+            return val
+    return ""
+
+
+def _smart_contact_values(row: dict) -> dict:
+    found = {"email": "", "phone": "", "address": "", "pincode": ""}
+    for k, v in row.items():
+        key = str(k or "").lower()
+        val = str(v or "").strip()
+        if not val:
+            continue
+        if not found["email"] and "email" in key and "@" in val:
+            found["email"] = val
+        elif not found["phone"] and any(x in key for x in ["phone", "mobile", "telephone", "contact no"]):
+            digits = re.sub(r"\D", "", val)
+            if len(digits) >= 8:
+                found["phone"] = val
+        elif not found["pincode"] and any(x in key for x in ["pincode", "pin code", "postal"]):
+            if len(re.sub(r"\D", "", val)) >= 6:
+                found["pincode"] = val
+        elif not found["address"] and "address" in key:
+            found["address"] = val
+    return found
+
+
+def _smart_public_brand_candidates(row: dict, vinfo: dict) -> list[str]:
+    """Return likely public-facing brands without spending a search request."""
+    out: list[str] = []
+    seen = set()
+    def add(value):
+        value = re.sub(r"\s+", " ", str(value or "")).strip()
+        key = _smart_norm(value)
+        if value and len(_smart_compact(value)) >= 5 and key not in seen and key != _smart_norm(row.get("name", "")):
+            seen.add(key); out.append(value)
+    for alias in vinfo.get("aliases") or []:
+        add(alias)
+    for key, value in row.items():
+        lk = str(key or "").lower()
+        if any(token in lk for token in ["public name", "brand", "programme", "program", "school", "home name", "institution", "centre name", "center name", "project name", "alias"]):
+            add(value)
+    core = " ".join(vinfo.get("core_tokens") or [])
+    if core and _smart_norm(core) != _smart_norm(row.get("name", "")):
+        add(core)
+    legal_removed = vinfo.get("legal_suffix_removed") or ""
+    if legal_removed and _smart_norm(legal_removed) != _smart_norm(row.get("name", "")):
+        add(legal_removed)
+    return out
+
+
 def _smart_queries(row: dict, vinfo: dict) -> list[dict]:
+    """Build a maximum-two-query Serper plan.
+
+    Query 1 uses the exact Darpan ID when available. Query 2 deliberately seeks
+    a public brand/programme name before repeating the registered legal name.
+    This improves recall for schools, homes and initiatives operated by a trust.
+    """
     name = row.get("name", "")
     district = row.get("district", "")
     state = row.get("state", "")
-    geo = " ".join([x for x in [district, state] if x])
-    core = " ".join(vinfo.get("core_tokens") or []) or vinfo.get("legal_suffix_removed") or name
-    legal = vinfo.get("legal_suffix_removed") or core
-    out = []
+    geo = " ".join([x for x in [district, state] if x]).strip()
+    public_brands = _smart_public_brand_candidates(row, vinfo)
+    out: list[dict] = []
+
     def add(query, p, variant, vt):
         query = re.sub(r"\s+", " ", str(query or "")).strip()
         if query and query.lower() not in {x["query"].lower() for x in out}:
             out.append({"query": query, "pass": p, "variant": variant, "variant_type": vt})
-    add(f'"{name}" {geo} official website', 1, name, "exact_name")
-    aliases = vinfo.get("aliases") or []
-    if aliases:
-        add(f'"{aliases[0]}" "{name}"', "alias", aliases[0], "known_alias")
-        add(f'{aliases[0]} official website', "alias", aliases[0], "known_alias")
-    if _smart_norm(core) != _smart_norm(name):
-        add(f'"{core}" {state} NGO website', 2, core, "core_brand")
-    add(f'{core} {geo}', 3, core, "core_brand")
-    add(f'{legal} foundation NGO India', 4, legal, "legal_suffix_removed")
-    return out[:max(1, SMART_RECHECK_MAX_QUERIES_PER_ROW)]
 
+    darpan = _smart_primary_darpan(row)
+    if darpan:
+        add(f'"{darpan}"', "identifier", darpan, "identifier:darpan")
+        if public_brands:
+            brand = public_brands[0]
+            add(f'"{brand}" {geo} official website', "public_brand_geo", brand, "public_brand")
+        else:
+            add(f'"{name}" {geo} official website', "registered_name_geo", name, "exact_name")
+    else:
+        add(f'"{name}" {geo} official website', "registered_name_geo", name, "exact_name")
+        if public_brands:
+            brand = public_brands[0]
+            add(f'"{brand}" {geo} NGO website', "public_brand_geo", brand, "public_brand")
+        else:
+            add(f'{name} {geo}', "registered_name_broad", name, "exact_name_broad")
+
+    return out[:max(1, SMART_RECHECK_MAX_QUERIES_PER_ROW)]
 
 def _smart_fuzzy_ratio(a: str, b: str) -> float:
     a = _smart_compact(a); b = _smart_compact(b)
@@ -2010,6 +2414,12 @@ def _smart_score_candidate(name: str, vinfo: dict, row: dict, cand: dict, qinfo:
     snippet = (cand.get("snippet") or "").lower()
     carrier = (cand.get("carrier_phrase") or "").lower()
     all_text = " ".join([title, snippet, carrier])
+    identifier_variant = str(qinfo.get("variant") or "") if str(qinfo.get("pass")) == "identifier" else ""
+    if identifier_variant:
+        identifier_compact = _smart_compact(identifier_variant)
+        candidate_compact = _smart_compact(" ".join([url, title, snippet]))
+        if identifier_compact and identifier_compact in candidate_compact:
+            return 30, "exact identifier appears in candidate URL/title/snippet", "identifier_search", ""
     core = vinfo.get("core_tokens") or []
     tier_b = vinfo.get("tier_b_tokens") or []
     score = 0
@@ -2080,17 +2490,8 @@ def _smart_html_to_text(html: str) -> str:
 
 
 def _smart_fetch_text(url: str) -> tuple[str, str]:
-    try:
-        _final_url, text = _safe_fetch_text(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 DFP2SmartRecovery/1.0"},
-            timeout=SMART_RECHECK_FETCH_TIMEOUT,
-            max_bytes=1_500_000,
-        )
-        return _smart_html_to_text(text), ""
-    except Exception as e:
-        return "", str(e)
-
+    final_url, text, _raw, err = _smart_fetch_page(url)
+    return text, err
 
 def _smart_record_identifiers(row: dict) -> list[tuple[str,str]]:
     out = []
@@ -2101,82 +2502,520 @@ def _smart_record_identifiers(row: dict) -> list[tuple[str,str]]:
     return out
 
 
-def _smart_verify_candidate(url: str, row: dict, route: str) -> dict:
+def _smart_firecrawl_keys() -> list[str]:
+    raw = (os.environ.get("FIRECRAWL_API_KEYS") or os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+    out = []
+    for value in re.split(r"[,\n\r]+", raw):
+        value = value.strip()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def _smart_firecrawl_counter_init(counter: dict | None = None) -> dict:
+    counter = counter if counter is not None else {}
+    counter.setdefault("firecrawl_credits", 0)
+    counter.setdefault("firecrawl_verify_credits", 0)
+    counter.setdefault("firecrawl_search_credits", 0)
+    counter.setdefault("firecrawl_reserve_credits", 0)
+    counter.setdefault("firecrawl_scrapes", 0)
+    counter.setdefault("firecrawl_searches", 0)
+    counter.setdefault("firecrawl_domain_scrapes", {})
+    counter.setdefault("firecrawl_budget_exhausted", False)
+    return counter
+
+
+def _smart_firecrawl_reserve(counter: dict | None, bucket: str, cost: int, domain: str = "") -> tuple[bool, str]:
+    counter = _smart_firecrawl_counter_init(counter)
+    cost = max(0, int(cost or 0))
+    total = int(counter.get("firecrawl_credits", 0))
+    total_cap = SMART_RECHECK_FIRECRAWL_TOTAL_CREDIT_BUDGET
+    bucket_key = f"firecrawl_{bucket}_credits"
+    bucket_cap = {
+        "verify": SMART_RECHECK_FIRECRAWL_VERIFY_CREDIT_BUDGET,
+        "search": SMART_RECHECK_FIRECRAWL_SEARCH_CREDIT_BUDGET,
+        "reserve": SMART_RECHECK_FIRECRAWL_RESERVE_CREDIT_BUDGET,
+    }.get(bucket, total_cap)
+    if total_cap and total + cost > total_cap:
+        counter["firecrawl_budget_exhausted"] = True
+        return False, "Firecrawl total credit budget exhausted"
+    if bucket_cap and int(counter.get(bucket_key, 0)) + cost > bucket_cap:
+        counter["firecrawl_budget_exhausted"] = True
+        return False, f"Firecrawl {bucket} credit budget exhausted"
+    if bucket == "verify" and domain:
+        uses = int((counter.get("firecrawl_domain_scrapes") or {}).get(domain, 0))
+        if uses >= SMART_RECHECK_FIRECRAWL_MAX_SCRAPES_PER_DOMAIN:
+            return False, "Firecrawl per-domain scrape limit reached"
+    counter["firecrawl_credits"] = total + cost
+    counter[bucket_key] = int(counter.get(bucket_key, 0)) + cost
+    if bucket == "verify":
+        counter["firecrawl_scrapes"] = int(counter.get("firecrawl_scrapes", 0)) + 1
+        if domain:
+            counter["firecrawl_domain_scrapes"][domain] = int(counter["firecrawl_domain_scrapes"].get(domain, 0)) + 1
+    elif bucket == "search":
+        counter["firecrawl_searches"] = int(counter.get("firecrawl_searches", 0)) + 1
+    return True, ""
+
+
+def _smart_firecrawl_refund(counter: dict | None, bucket: str, cost: int, domain: str = "") -> None:
+    if counter is None:
+        return
+    counter = _smart_firecrawl_counter_init(counter)
+    cost = max(0, int(cost or 0))
+    counter["firecrawl_credits"] = max(0, int(counter.get("firecrawl_credits", 0)) - cost)
+    key = f"firecrawl_{bucket}_credits"
+    counter[key] = max(0, int(counter.get(key, 0)) - cost)
+    if bucket == "verify":
+        counter["firecrawl_scrapes"] = max(0, int(counter.get("firecrawl_scrapes", 0)) - 1)
+        if domain:
+            counter["firecrawl_domain_scrapes"][domain] = max(0, int(counter["firecrawl_domain_scrapes"].get(domain, 0)) - 1)
+    elif bucket == "search":
+        counter["firecrawl_searches"] = max(0, int(counter.get("firecrawl_searches", 0)) - 1)
+
+
+def _smart_firecrawl_scrape(url: str, counter: dict | None = None, bucket: str = "verify") -> tuple[str, list[str], str, int]:
+    if not SMART_RECHECK_USE_FIRECRAWL:
+        return "", [], "Firecrawl disabled", 0
+    keys = _smart_firecrawl_keys()
+    if not keys:
+        return "", [], "No Firecrawl key configured", 0
+    domain = _smart_domain_key(url)
+    reserved, budget_error = _smart_firecrawl_reserve(counter, bucket, 1, domain=domain)
+    if not reserved:
+        return "", [], budget_error, 0
     errors = []
-    pages = []
-    root = f"{urlparse(url).scheme}://{_recheck_domain(url)}" if _recheck_domain(url) else url
-    for u in [url, root]:
-        if u and u not in pages:
-            pages.append(u)
-    page_texts = []
-    for u in pages[:2]:
-        text, err = _smart_fetch_text(u)
-        if err:
-            errors.append(f"{u}: {err}")
-        if text:
-            page_texts.append((u, text))
-        time.sleep(RECHECK_PACE_SEC)
+    for key in keys:
+        try:
+            r = requests.post(
+                "https://api.firecrawl.dev/v2/scrape",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={
+                    "url": url,
+                    "formats": ["markdown", "links"],
+                    "onlyMainContent": False,
+                    "removeBase64Images": True,
+                    "blockAds": True,
+                    "proxy": SMART_RECHECK_FIRECRAWL_PROXY,
+                    "parsers": [],
+                    "timeout": 60000,
+                },
+                timeout=90,
+            )
+            if r.status_code in {200, 201, 202}:
+                payload = r.json()
+                data = payload.get("data") or payload
+                markdown = str(data.get("markdown") or "")
+                links = [str(x) for x in (data.get("links") or []) if str(x).startswith(("http://", "https://"))]
+                return markdown, links, "", 1
+            errors.append(f"{r.status_code}: {r.text[:180]}")
+            if r.status_code not in {401, 402, 403, 429}:
+                break
+        except Exception as e:
+            errors.append(str(e))
+    # Firecrawl says failed requests are normally not billed; release the local reservation.
+    _smart_firecrawl_refund(counter, bucket, 1, domain=domain)
+    return "", [], " | ".join(errors) if errors else "Firecrawl scrape failed", 0
+
+
+def _smart_firecrawl_search(query: str, counter: dict | None = None) -> tuple[list[dict], str, int]:
+    if not SMART_RECHECK_USE_FIRECRAWL:
+        return [], "Firecrawl disabled", 0
+    keys = _smart_firecrawl_keys()
+    if not keys:
+        return [], "No Firecrawl key configured", 0
+    reserved, budget_error = _smart_firecrawl_reserve(counter, "search", 2)
+    if not reserved:
+        return [], budget_error, 0
+    errors = []
+    for key in keys:
+        try:
+            r = requests.post(
+                "https://api.firecrawl.dev/v2/search",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={
+                    "query": query,
+                    "limit": SMART_RECHECK_FIRECRAWL_SEARCH_LIMIT,
+                    "country": "IN",
+                    "location": "India",
+                },
+                timeout=60,
+            )
+            if r.status_code in {200, 201, 202}:
+                payload = r.json()
+                data = payload.get("data") or {}
+                web = data.get("web") if isinstance(data, dict) else []
+                if web is None and isinstance(data, list):
+                    web = data
+                candidates = []
+                for item in web or []:
+                    candidates.append({
+                        "url": item.get("url") or "",
+                        "title": item.get("title") or "",
+                        "snippet": item.get("description") or item.get("snippet") or "",
+                        "source": "firecrawl_search",
+                    })
+                return candidates, "", 2
+            errors.append(f"{r.status_code}: {r.text[:180]}")
+            if r.status_code not in {401, 402, 403, 429}:
+                break
+        except Exception as e:
+            errors.append(str(e))
+    _smart_firecrawl_refund(counter, "search", 2)
+    return [], " | ".join(errors) if errors else "Firecrawl search failed", 0
+
+
+def _smart_fetch_pdf_text(url: str) -> tuple[str, str, str]:
+    """Download and parse a PDF locally, consuming no Firecrawl credits."""
+    current = _validate_public_http_url(url)
+    headers = {"User-Agent": "Mozilla/5.0 DFP2SmartRecovery/4.0"}
+    for _ in range(5):
+        resp = requests.get(current, headers=headers, timeout=SMART_RECHECK_FETCH_TIMEOUT, allow_redirects=False, stream=True)
+        if 300 <= resp.status_code < 400 and resp.headers.get("Location"):
+            current = _validate_public_http_url(urljoin(current, resp.headers["Location"]))
+            continue
+        resp.raise_for_status()
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > SMART_RECHECK_LOCAL_PDF_MAX_BYTES:
+                raise ValueError("PDF exceeded local size limit")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        if not raw.startswith(b"%PDF") and "pdf" not in (resp.headers.get("content-type") or "").lower():
+            raise ValueError("Response was not a PDF")
+        try:
+            from pypdf import PdfReader
+        except Exception as exc:
+            raise RuntimeError("pypdf is not installed") from exc
+        reader = PdfReader(io.BytesIO(raw))
+        texts = []
+        for page in list(reader.pages)[:SMART_RECHECK_LOCAL_PDF_MAX_PAGES]:
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                continue
+        text = re.sub(r"\s+", " ", " ".join(texts)).strip()
+        if not text:
+            raise ValueError("PDF contained no extractable text")
+        return current, text, ""
+    raise ValueError("Too many PDF redirects")
+
+
+def _smart_is_challenge_text(text: str) -> bool:
+    low = (text or "").lower()
+    markers = ["just a moment", "checking your browser", "verify you are human", "enable javascript and cookies", "cf-chl", "access denied"]
+    return any(marker in low for marker in markers)
+
+def _smart_fetch_variants(url: str) -> list[str]:
+    """Generate conservative live-site variants without using another search query."""
+    raw = str(url or "").strip()
+    if not raw:
+        return []
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw.lstrip("/")
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or "/"
+    variants = [raw]
+    if host:
+        alt_host = host[4:] if host.startswith("www.") else "www." + host
+        variants.append(f"https://{alt_host}{path}")
+        if parsed.scheme == "https":
+            variants.append(f"http://{host}{path}")
+    out = []
+    for candidate in variants:
+        if candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def _smart_fetch_page(url: str, allow_firecrawl: bool = True, counter: dict | None = None) -> tuple[str, str, str, str]:
+    """Return final URL, visible text, raw HTML, and a combined error string.
+
+    Direct HTML and local PDF extraction run first. Firecrawl is spent only after
+    those free methods fail or produce a browser-challenge shell.
+    """
+    errors = []
+    variants = _smart_fetch_variants(url) or [url]
+    for variant_index, candidate in enumerate(variants):
+        attempts = SMART_RECHECK_FETCH_RETRY_ATTEMPTS if variant_index == 0 else 1
+        for attempt in range(attempts):
+            try:
+                if urlparse(candidate).path.lower().endswith(".pdf"):
+                    final_url, visible, _ = _smart_fetch_pdf_text(candidate)
+                    return final_url, visible, "", ""
+                final_url, raw = _safe_fetch_text(
+                    candidate,
+                    headers={"User-Agent": "Mozilla/5.0 DFP2SmartRecovery/4.0"},
+                    timeout=SMART_RECHECK_FETCH_TIMEOUT,
+                    max_bytes=2_500_000,
+                )
+                visible = _smart_html_to_text(raw)
+                if visible and not _smart_is_challenge_text(visible):
+                    return final_url, visible, raw, ""
+                errors.append(f"{candidate} attempt {attempt + 1}: empty/challenge response")
+            except Exception as direct_error:
+                # Some PDF endpoints lack a .pdf suffix but advertise PDF content.
+                if "unsupported content type" in str(direct_error).lower() and "pdf" in str(direct_error).lower():
+                    try:
+                        final_url, visible, _ = _smart_fetch_pdf_text(candidate)
+                        return final_url, visible, "", ""
+                    except Exception as pdf_error:
+                        errors.append(f"{candidate} PDF parse: {pdf_error}")
+                else:
+                    errors.append(f"{candidate} attempt {attempt + 1}: {direct_error}")
+            if attempt + 1 < attempts and SMART_RECHECK_FETCH_RETRY_BACKOFF_SEC:
+                time.sleep(SMART_RECHECK_FETCH_RETRY_BACKOFF_SEC * (attempt + 1))
+
+    if allow_firecrawl and not urlparse(url).path.lower().endswith(".pdf"):
+        markdown, links, fc_error, _credits = _smart_firecrawl_scrape(url, counter=counter, bucket="verify")
+        if markdown:
+            raw_links = "".join(f'<a href="{u}"></a>' for u in links[:100])
+            return url, markdown, raw_links, ""
+        if fc_error:
+            errors.append("firecrawl=" + fc_error)
+    return url, "", "", " | ".join(errors)[:1800]
+
+def _smart_target_links(raw_html: str, base_url: str) -> list[str]:
+    if not raw_html:
+        return []
+    root_domain = _recheck_domain(base_url)
+    keywords = ("about", "contact", "legal", "compliance", "governance", "annual", "report", "financial", "audit", "fcra", "registration", "80g", "12a", "trustee")
+    links = []
+    for match in re.finditer(r"(?is)href\s*=\s*[\"']([^\"'#]+)[\"']", raw_html):
+        href = match.group(1).strip()
+        full = urljoin(base_url, href)
+        if _recheck_domain(full) != root_domain:
+            continue
+        low = full.lower()
+        if any(k in low for k in keywords) or _recheck_is_document_url(full):
+            if full not in links:
+                links.append(full)
+    return links[:8]
+
+
+def _smart_record_attributes(row: dict) -> list[tuple[str, str, str]]:
+    attrs = []
+    for k, v in row.items():
+        key = str(k or "").lower()
+        val = str(v or "").strip()
+        if not val:
+            continue
+        kind = ""
+        normalized = ""
+        if "email" in key and "@" in val:
+            kind, normalized = "email", val.lower()
+        elif any(x in key for x in ["phone", "mobile", "telephone", "contact no"]):
+            digits = re.sub(r"\D", "", val)
+            if len(digits) >= 8:
+                kind, normalized = "phone", digits[-10:]
+        elif any(x in key for x in ["pincode", "pin code", "postal"]):
+            digits = re.sub(r"\D", "", val)
+            if len(digits) >= 6:
+                kind, normalized = "pincode", digits[-6:]
+        elif "address" in key and len(_smart_compact(val)) >= 10:
+            kind, normalized = "address", _smart_compact(val)
+        elif any(x in key for x in ["founder", "trustee", "chairperson", "secretary"]):
+            if len(_smart_compact(val)) >= 5:
+                kind, normalized = "person", _smart_compact(val)
+        if kind:
+            attrs.append((kind, val, normalized))
+    return attrs
+
+
+def _smart_evaluate_pages(page_texts: list[tuple[str, str]], row: dict, errors: list[str]) -> dict:
     all_text = " ".join(t for _, t in page_texts).lower()
     compact_all = _smart_compact(all_text)
     for key, val in _smart_record_identifiers(row):
         cv = _smart_compact(val)
         if cv and cv in compact_all:
-            page = next((u for u, t in page_texts if cv in _smart_compact(t)), url)
-            return {"grade":"A", "type":"identifier:"+key, "matched":val, "page":page, "errors":errors}
+            page = next((u for u, t in page_texts if cv in _smart_compact(t)), "")
+            return {"grade": "A", "type": "identifier:" + key, "matched": val, "page": page, "errors": errors}
+
+    matched_attrs = []
+    for kind, original, normalized in _smart_record_attributes(row):
+        if kind == "email":
+            present = normalized in all_text
+        elif kind in {"phone", "pincode"}:
+            present = normalized in re.sub(r"\D", "", all_text)
+        else:
+            present = normalized in compact_all
+        if present:
+            matched_attrs.append(f"{kind}:{original}")
+
     legal = row.get("name", "")
-    if legal and _smart_compact(legal) in compact_all:
-        page = next((u for u, t in page_texts if _smart_compact(legal) in _smart_compact(t)), url)
-        return {"grade":"B", "type":"registered_legal_name", "matched":legal, "page":page, "errors":errors}
+    legal_hit = bool(legal and _smart_compact(legal) in compact_all)
+    if legal_hit and matched_attrs:
+        page = next((u for u, t in page_texts if _smart_compact(legal) in _smart_compact(t)), "")
+        return {"grade": "B+", "type": "legal_name_plus_attribute", "matched": legal + " | " + " | ".join(matched_attrs[:3]), "page": page, "errors": errors}
+    if legal_hit:
+        page = next((u for u, t in page_texts if _smart_compact(legal) in _smart_compact(t)), "")
+        return {"grade": "B", "type": "registered_legal_name", "matched": legal, "page": page, "errors": errors}
+
     vinfo = _smart_name_variants(row.get("name", ""))
     brand_hits = [t for t in vinfo.get("core_tokens", []) if len(t) >= 3 and t in compact_all]
     geo_hits = [g for g in [row.get("district", ""), row.get("state", "")] if g and _smart_compact(g) in compact_all]
+    if brand_hits and matched_attrs:
+        return {"grade": "B+", "type": "brand_plus_matching_attribute", "matched": ", ".join(brand_hits + matched_attrs[:2]), "page": page_texts[0][0] if page_texts else "", "errors": errors}
     if brand_hits and geo_hits:
-        return {"grade":"C", "type":"brand_plus_geo", "matched":", ".join(brand_hits+geo_hits), "page":page_texts[0][0] if page_texts else url, "errors":errors}
-    return {"grade":"D", "type":"", "matched":"", "page":"", "errors":errors}
+        return {"grade": "C", "type": "brand_plus_geo", "matched": ", ".join(brand_hits + geo_hits), "page": page_texts[0][0] if page_texts else "", "errors": errors}
+    return {"grade": "D", "type": "", "matched": "", "page": "", "errors": errors}
 
+
+def _smart_verify_candidate(url: str, row: dict, route: str, evidence_urls: list[str] | None = None, counter: dict | None = None, firecrawl_recovery: bool = False) -> dict:
+    errors: list[str] = []
+    counter = _smart_firecrawl_counter_init(counter)
+    fc_before = int(counter.get("firecrawl_credits", 0))
+    page_texts: list[tuple[str, str]] = []
+    attempted_urls: list[str] = []
+    root = _smart_site_url(url)
+    queue = []
+    for u in list(evidence_urls or []) + [url, root]:
+        if u and u not in queue:
+            queue.append(u)
+
+    raw_by_url = {}
+    while queue and len(page_texts) < min(2, SMART_RECHECK_VERIFY_MAX_PAGES):
+        u = queue.pop(0)
+        attempted_urls.append(u)
+        final_url, text, raw, err = _smart_fetch_page(u, allow_firecrawl=firecrawl_recovery, counter=counter)
+        if err:
+            errors.append(f"{u}: {err}")
+        if text:
+            page_texts.append((final_url or u, text))
+            raw_by_url[final_url or u] = raw
+        time.sleep(RECHECK_PACE_SEC)
+
+    verify = _smart_evaluate_pages(page_texts, row, errors)
+    if firecrawl_recovery and verify.get("grade") not in {"A", "B+"} and root:
+        markdown, links, fc_error, _credits = _smart_firecrawl_scrape(root, counter=counter, bucket="verify")
+        if markdown:
+            page_texts.append((root, markdown))
+            raw_by_url[root] = "".join(f'<a href="{u}"></a>' for u in links[:100])
+            verify = _smart_evaluate_pages(page_texts, row, errors)
+        elif fc_error:
+            errors.append(f"{root}: firecrawl recovery: {fc_error}")
+    # When even the nominated page/homepage cannot be reached, do not hammer
+    # guessed subpaths. Preserve the candidate for a later direct retry.
+    if attempted_urls and not page_texts:
+        verify.update({
+            "fetch_attempted": len(attempted_urls),
+            "fetch_succeeded": 0,
+            "fetch_failed": len(attempted_urls),
+            "all_fetches_failed": True,
+            "fetch_status": "unreachable",
+            "fetch_errors": " | ".join(errors)[:1800],
+            "firecrawl_credits_used": max(0, int(counter.get("firecrawl_credits", 0)) - fc_before),
+            "firecrawl_action": "candidate_verification" if int(counter.get("firecrawl_credits", 0)) > fc_before else "",
+        })
+        return verify
+
+    if verify.get("grade") not in {"A", "B+"}:
+        target_urls: list[tuple[str, bool]] = []
+        seen_targets = set()
+        for source_url, raw in raw_by_url.items():
+            for link in _smart_target_links(raw, source_url):
+                if link not in seen_targets:
+                    seen_targets.add(link); target_urls.append((link, True))
+        for path in ["/about", "/about-us", "/contact", "/contact-us", "/compliance", "/annual-reports", "/reports"]:
+            candidate = urljoin(root.rstrip("/") + "/", path.lstrip("/"))
+            if candidate not in seen_targets:
+                seen_targets.add(candidate); target_urls.append((candidate, False))
+
+        for u, discovered in target_urls:
+            if len(page_texts) >= SMART_RECHECK_VERIFY_MAX_PAGES:
+                break
+            if any(existing == u for existing, _ in page_texts):
+                continue
+            attempted_urls.append(u)
+            final_url, text, _raw, err = _smart_fetch_page(u, allow_firecrawl=firecrawl_recovery, counter=counter)
+            if err:
+                errors.append(f"{u}: {err}")
+            if text:
+                page_texts.append((final_url or u, text))
+                verify = _smart_evaluate_pages(page_texts, row, errors)
+                if verify.get("grade") in {"A", "B+"}:
+                    break
+            time.sleep(RECHECK_PACE_SEC)
+
+    verify = _smart_evaluate_pages(page_texts, row, errors)
+    verify.update({
+        "fetch_attempted": len(attempted_urls),
+        "fetch_succeeded": len(page_texts),
+        "fetch_failed": max(0, len(attempted_urls) - len(page_texts)),
+        "all_fetches_failed": bool(attempted_urls and not page_texts),
+        "fetch_status": "unreachable" if attempted_urls and not page_texts else ("partial" if errors else "fetched"),
+        "fetch_errors": " | ".join(errors)[:1800],
+        "firecrawl_credits_used": max(0, int(counter.get("firecrawl_credits", 0)) - fc_before),
+        "firecrawl_action": "candidate_verification" if int(counter.get("firecrawl_credits", 0)) > fc_before else "",
+    })
+    return verify
 
 def _smart_status(route: str, grade: str) -> tuple[str, str]:
     if grade == "A":
-        if route == "rename_detected":
-            return "rename_verified_match", "medium"
-        return "high_confidence_official_site", "high"
+        return ("rename_verified_match", "high") if route == "rename_detected" else ("confirmed_official_site", "high")
+    if grade == "B+":
+        return ("rename_verified_match", "high") if route == "rename_detected" else ("confirmed_official_site", "high")
     if grade == "B":
-        if route == "rename_detected":
-            return "rename_verified_match", "medium"
-        if route in {"known_alias", "associated_entity"}:
-            return "alias_or_associated_entity_needs_review", "medium"
-        if route == "fuzzy_spelling":
-            return "fuzzy_spelling_match", "medium"
-        if route in {"brand_variant", "compact_domain", "carrier_extracted"}:
-            return "brand_variant_match", "high"
-        return "high_confidence_official_site", "high"
+        return "probable_official_site", "medium"
     if grade == "C":
-        return "brand_variant_match", "medium"
+        return "possible_site_manual_review", "low"
     return "needs_manual_verification", "low"
 
 
-def _smart_result(row: dict, website: str, status: str, confidence: str, source: str, query: str, note: str, route: str, verify: dict | None = None, qinfo: dict | None = None, searched: str = "yes", queries_used: int = 0) -> dict:
+def _smart_accepts_automatically(grade: str) -> bool:
+    return grade in {"A", "B+"}
+
+
+def _smart_is_reviewable(grade: str) -> bool:
+    return grade in {"A", "B+", "B", "C"}
+
+def _smart_result(row: dict, website: str, status: str, confidence: str, source: str, query: str, note: str, route: str, verify: dict | None = None, qinfo: dict | None = None, searched: str = "yes", queries_used: int = 0, successful_searches: int = 0, failed_searches: int = 0) -> dict:
     verify = verify or {}
+    qinfo = qinfo or {}
+    contacts = _smart_contact_values(row)
     return {
         "NGO Name": row.get("name", ""), "State": row.get("state", ""), "District": row.get("district", ""),
-        "Website": website or "", "Website Status": status, "Confidence": confidence, "Source": source or "",
-        "Query": query or "", "Note": note or "", "Match Route": route or "", "Evidence Grade": verify.get("grade", ""),
+        "Darpan ID": _smart_primary_darpan(row), "Email": contacts.get("email", ""), "Phone": contacts.get("phone", ""),
+        "Registered Address": contacts.get("address", ""),
+        "Website": _smart_site_url(website) if website else "", "Website Status": status, "Confidence": confidence, "Source": source or "",
+        "Search Provider": qinfo.get("provider", ""), "Query": query or "", "Note": note or "", "Match Route": route or "", "Evidence Grade": verify.get("grade", ""),
         "Evidence Type": verify.get("type", ""), "Evidence Matched Text": verify.get("matched", ""), "Evidence Page URL": verify.get("page", ""),
-        "Query Pass": (qinfo or {}).get("pass", ""), "Variant Used": (qinfo or {}).get("variant", ""), "Variant Type": (qinfo or {}).get("variant_type", ""),
-        "Searched": searched, "Queries Used": queries_used, "Duplicate Group Size": 1,
+        "Query Pass": qinfo.get("pass", ""), "Variant Used": qinfo.get("variant", ""), "Variant Type": qinfo.get("variant_type", ""),
+        "Searched": searched, "Queries Used": queries_used, "Successful Searches": successful_searches, "Failed Searches": failed_searches,
+        "Fetch Status": verify.get("fetch_status", ""), "Fetch Errors": verify.get("fetch_errors", ""),
+        "Firecrawl Credits Used": verify.get("firecrawl_credits_used", 0), "Firecrawl Action": verify.get("firecrawl_action", ""),
+        "Duplicate Group Size": 1,
     }
-
 
 def _smart_audit(row: dict, qinfo: dict, cand: dict | None = None, decision: str = "reviewed", note: str = "", reject: str = "", verify: dict | None = None) -> dict:
     cand = cand or {}; verify = verify or {}
     return {
-        "NGO Name": row.get("name", ""), "State": row.get("state", ""), "District": row.get("district", ""), "Query": qinfo.get("query", ""),
-        "Query Pass": qinfo.get("pass", ""), "Variant Used": qinfo.get("variant", ""), "Variant Type": qinfo.get("variant_type", ""),
+        "NGO Name": row.get("name", ""), "State": row.get("state", ""), "District": row.get("district", ""), "Darpan ID": _smart_primary_darpan(row),
+        "Provider": qinfo.get("provider", ""), "Query": qinfo.get("query", ""), "Query Pass": qinfo.get("pass", ""),
+        "Variant Used": qinfo.get("variant", ""), "Variant Type": qinfo.get("variant_type", ""),
         "Candidate URL": cand.get("url", ""), "Candidate Domain": _recheck_domain(cand.get("url", "")), "Candidate Title": cand.get("title", ""),
         "Candidate Snippet": cand.get("snippet", ""), "Candidate Source": cand.get("source", ""), "Score": cand.get("score", ""),
-        "Decision": decision, "Reject Reason": reject, "Note": note or cand.get("note", ""), "Match Route": cand.get("route", ""), "Evidence Grade": verify.get("grade", ""),
+        "Decision": decision, "Reject Reason": reject, "Note": note or cand.get("note", ""), "Match Route": cand.get("route", ""),
+        "Evidence Grade": verify.get("grade", ""), "Evidence Type": verify.get("type", ""), "Evidence Matched Text": verify.get("matched", ""),
+        "Evidence Page URL": verify.get("page", ""), "Fetch Status": verify.get("fetch_status", ""), "Fetch Errors": verify.get("fetch_errors", ""),
+        "Firecrawl Credits Used": verify.get("firecrawl_credits_used", 0), "Firecrawl Action": verify.get("firecrawl_action", ""),
         "Carrier URL": cand.get("carrier_url", ""), "Carrier Phrase": cand.get("carrier_phrase", ""),
     }
+
+def _smart_entity_keys(row: dict) -> list[str]:
+    keys = []
+    for _k, value in _smart_record_identifiers(row):
+        compact = _smart_compact(value)
+        if compact:
+            keys.append("id:" + compact)
+    name_key = "name:" + "|".join([_smart_norm(row.get("name", "")), _smart_norm(row.get("district", "")), _smart_norm(row.get("state", ""))])
+    keys.append(name_key)
+    keys.append("name:" + _smart_norm(row.get("name", "")))
+    return list(dict.fromkeys(keys))
 
 
 def _smart_load_entity_register(rd: Path | None = None) -> tuple[dict, str]:
@@ -2188,10 +3027,16 @@ def _smart_load_entity_register(rd: Path | None = None) -> tuple[dict, str]:
         data = json.loads(raw.decode("utf-8")); good = {}
         if isinstance(data, dict):
             for k, v in data.items():
-                if isinstance(v, dict) and all(v.get(x) for x in ["source", "approved_by", "approved_on"]):
-                    good[_smart_norm(k)] = v
-                else:
+                if not (isinstance(v, dict) and all(v.get(x) for x in ["source", "approved_by", "approved_on"])):
                     print(f"entity_register entry ignored: {k}", file=sys.stderr)
+                    continue
+                aliases = [str(k), v.get("registered_name", ""), v.get("name", "")]
+                for ident_key in ["darpan_id", "darpan", "registration_id", "fcra_number"]:
+                    if v.get(ident_key):
+                        good["id:" + _smart_compact(v.get(ident_key))] = v
+                for alias in aliases:
+                    if alias:
+                        good["name:" + _smart_norm(alias)] = v
         if rd:
             (rd / "entity_register_snapshot.json").write_bytes(raw)
         return good, sha
@@ -2200,7 +3045,13 @@ def _smart_load_entity_register(rd: Path | None = None) -> tuple[dict, str]:
         return {}, ""
 
 
-def _smart_write_summary(rd: Path, result_rows: list[dict], audit_rows: list[dict], query_count: int, start_ts: float, cap_hit: bool, prepass: dict, entity_sha: str, errors: int = 0):
+def _smart_entity_lookup(row: dict, register: dict) -> dict | None:
+    for key in _smart_entity_keys(row):
+        if key in register:
+            return register[key]
+    return None
+
+def _smart_write_summary(rd: Path, result_rows: list[dict], audit_rows: list[dict] | int, query_count: int, start_ts: float, cap_hit: bool, prepass: dict, entity_sha: str, errors: int = 0, counter: dict | None = None):
     counts = {}
     grades = {}
     for r in result_rows:
@@ -2208,22 +3059,39 @@ def _smart_write_summary(rd: Path, result_rows: list[dict], audit_rows: list[dic
         grades[r.get("Evidence Grade", "")] = grades.get(r.get("Evidence Grade", ""), 0) + 1
     searched = sum(1 for r in result_rows if str(r.get("Searched", "")).lower() == "yes")
     skipped = sum(1 for r in result_rows if str(r.get("Searched", "")).lower() == "no")
+    counter = counter or {}
     summary = {
         "prepass": prepass, "status_counts": counts, "evidence_grade_counts": grades,
-        "total_queries": query_count, "avg_queries_per_searched_row": round(query_count / max(1, searched), 3),
-        "rows_searched": searched, "rows_skipped": skipped, "audit_rows": len(audit_rows),
-        "env": {"SMART_RECHECK_MAX_QUERIES_PER_ROW": SMART_RECHECK_MAX_QUERIES_PER_ROW, "SMART_RECHECK_MAX_TOTAL_QUERIES": SMART_RECHECK_MAX_TOTAL_QUERIES, "SMART_RECHECK_FUZZY_THRESHOLD": SMART_RECHECK_FUZZY_THRESHOLD},
+        "total_queries": query_count, "serper_queries": int(counter.get("serper_queries", 0)), "brave_queries": int(counter.get("brave_queries", 0)),
+        "firecrawl_credits_used": int(counter.get("firecrawl_credits", 0)), "firecrawl_verify_credits": int(counter.get("firecrawl_verify_credits", 0)),
+        "firecrawl_search_credits": int(counter.get("firecrawl_search_credits", 0)), "firecrawl_scrapes": int(counter.get("firecrawl_scrapes", 0)), "firecrawl_searches": int(counter.get("firecrawl_searches", 0)),
+        "avg_queries_per_searched_row": round(query_count / max(1, searched), 3),
+        "rows_searched": searched, "rows_skipped": skipped, "audit_rows": (audit_rows if isinstance(audit_rows, int) else len(audit_rows)),
+        "env": {
+            "SMART_RECHECK_MAX_QUERIES_PER_ROW": SMART_RECHECK_MAX_QUERIES_PER_ROW,
+            "SMART_RECHECK_MAX_TOTAL_QUERIES": SMART_RECHECK_MAX_TOTAL_QUERIES,
+            "SMART_RECHECK_BRAVE_MAX_QUERIES_PER_ROW": SMART_RECHECK_BRAVE_MAX_QUERIES_PER_ROW,
+            "SMART_RECHECK_FETCH_RETRY_ATTEMPTS": SMART_RECHECK_FETCH_RETRY_ATTEMPTS,
+            "SMART_RECHECK_FUZZY_THRESHOLD": SMART_RECHECK_FUZZY_THRESHOLD,
+            "use_brave": SMART_RECHECK_USE_BRAVE, "use_firecrawl": SMART_RECHECK_USE_FIRECRAWL,
+            "rename_recovery_enabled": SMART_RECHECK_ENABLE_RENAME_RECOVERY,
+            "firecrawl_total_budget": SMART_RECHECK_FIRECRAWL_TOTAL_CREDIT_BUDGET,
+            "firecrawl_verify_budget": SMART_RECHECK_FIRECRAWL_VERIFY_CREDIT_BUDGET,
+            "firecrawl_search_budget": SMART_RECHECK_FIRECRAWL_SEARCH_CREDIT_BUDGET,
+            "firecrawl_proxy": SMART_RECHECK_FIRECRAWL_PROXY,
+            "brave_configured": _has_brave_key(), "firecrawl_configured": bool(_smart_firecrawl_keys()),
+        },
         "entity_register_sha256": entity_sha, "run_duration_sec": round(time.time() - start_ts, 1), "cap_hit": cap_hit, "error_count": errors,
     }
     _atomic_write_text((rd / RECHECK_OUTPUTS["summary"]), json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
 
-
 def _smart_write_skipped(rd: Path, rows: list[dict]):
     with (rd / RECHECK_OUTPUTS["skipped"]).open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["name", "district", "state"]); w.writeheader()
+        fieldnames = ["name", "district", "state", "darpan_id", "email", "phone", "registered_address"]
+        w = csv.DictWriter(f, fieldnames=fieldnames); w.writeheader()
         for r in rows:
-            w.writerow(_safe_csv_row({"name": r.get("name", ""), "district": r.get("district", ""), "state": r.get("state", "")}))
+            w.writerow(_safe_csv_row({k: r.get(k, "") for k in fieldnames}))
 
 
 
@@ -2364,9 +3232,9 @@ def _smart_extract_rename_brands(name: str, item: dict) -> list[dict]:
 
 def _smart_verify_rename_nominee(url: str, row: dict) -> dict:
     verify = _smart_verify_candidate(url, row, "rename_detected")
-    # Rename route is intentionally strict: Grade C is not enough because the whole risk is entity divergence.
-    if verify.get("grade") == "C":
-        verify = {**verify, "grade": "D", "type": "rename_grade_c_rejected", "matched": verify.get("matched", "")}
+    # Rename route is intentionally strict: legal-name-only or brand+geo is not enough.
+    if verify.get("grade") in {"B", "C"}:
+        verify = {**verify, "grade": "D", "type": "rename_requires_identifier_or_matching_attribute", "matched": verify.get("matched", "")}
     return verify
 
 
@@ -2376,8 +3244,9 @@ def _smart_rename_recovery(row: dict, audit_rows: list[dict], counter: dict) -> 
         return None
     if SMART_RECHECK_MAX_TOTAL_QUERIES and counter["queries"] >= SMART_RECHECK_MAX_TOTAL_QUERIES:
         return None
-    qinfo = {"query": f'"{name}" registered OR society OR trust OR foundation', "pass": "rename", "variant": name, "variant_type": "rename_carrier"}
-    counter["queries"] += 1
+    qinfo = {"query": f'"{name}" registered OR society OR trust OR foundation', "pass": "rename", "variant": name, "variant_type": "rename_carrier", "provider": "serper"}
+    if not _smart_reserve_query(counter, "serper"):
+        return None
     data, err = _serper_search_full(qinfo["query"])
     if err:
         audit_rows.append(_smart_audit(row, qinfo, decision="search_failed", note="rename carrier search failed: " + err[:220]))
@@ -2404,8 +3273,8 @@ def _smart_rename_recovery(row: dict, audit_rows: list[dict], counter: dict) -> 
         for u in direct_urls[:2]:
             cand = {"url": u, "title": brand, "snippet": carrier_phrase, "source": "rename_carrier_url", "score": "", "route": "rename_detected", "carrier_url": carrier_url, "carrier_phrase": carrier_phrase, "note": f"rename carrier extracted brand {brand}"}
             verify = _smart_verify_rename_nominee(u, row)
-            audit_rows.append(_smart_audit(row, qinfo, cand, decision="accepted" if verify.get("grade") in {"A","B"} else "nominated_not_verified", verify=verify, note="direct URL from carrier phrase"))
-            if verify.get("grade") in {"A", "B"}:
+            audit_rows.append(_smart_audit(row, qinfo, cand, decision="accepted" if verify.get("grade") in {"A","B+"} else "nominated_not_verified", verify=verify, note="direct URL from carrier phrase"))
+            if verify.get("grade") in {"A", "B+"}:
                 status, conf = _smart_status("rename_detected", verify.get("grade"))
                 return _smart_result(row, u, status, conf, "rename_carrier_url", qinfo["query"], f"rename detected via carrier phrase; extracted brand: {brand}", "rename_detected", verify, qinfo, searched="yes", queries_used=1)
             if not best_manual:
@@ -2414,8 +3283,9 @@ def _smart_rename_recovery(row: dict, audit_rows: list[dict], counter: dict) -> 
         # If no direct URL closed the loop, search the extracted brand's official website.
         if SMART_RECHECK_MAX_TOTAL_QUERIES and counter["queries"] >= SMART_RECHECK_MAX_TOTAL_QUERIES:
             break
-        target_qinfo = {"query": f'"{brand}" official website', "pass": "rename_target", "variant": brand, "variant_type": "rename_detected"}
-        counter["queries"] += 1
+        target_qinfo = {"query": f'"{brand}" official website', "pass": "rename_target", "variant": brand, "variant_type": "rename_detected", "provider": "serper"}
+        if not _smart_reserve_query(counter, "serper"):
+            break
         target_data, target_err = _serper_search_full(target_qinfo["query"])
         if target_err:
             audit_rows.append(_smart_audit(row, target_qinfo, decision="search_failed", note="rename target search failed: " + target_err[:220]))
@@ -2438,8 +3308,8 @@ def _smart_rename_recovery(row: dict, audit_rows: list[dict], counter: dict) -> 
         nominees.sort(key=lambda x: x.get("score", 0), reverse=True)
         for cand in nominees[:SMART_RECHECK_MAX_VERIFY_PER_ROW]:
             verify = _smart_verify_rename_nominee(cand.get("url", ""), row)
-            audit_rows.append(_smart_audit(row, target_qinfo, cand, decision="accepted" if verify.get("grade") in {"A","B"} else "nominated_not_verified", verify=verify))
-            if verify.get("grade") in {"A", "B"}:
+            audit_rows.append(_smart_audit(row, target_qinfo, cand, decision="accepted" if verify.get("grade") in {"A","B+"} else "nominated_not_verified", verify=verify))
+            if verify.get("grade") in {"A", "B+"}:
                 status, conf = _smart_status("rename_detected", verify.get("grade"))
                 return _smart_result(row, cand.get("url", ""), status, conf, cand.get("source", ""), target_qinfo["query"], f"rename detected via carrier phrase; extracted brand: {brand}", "rename_detected", verify, target_qinfo, searched="yes", queries_used=2)
             if not best_manual:
@@ -2452,111 +3322,419 @@ def _smart_rename_recovery(row: dict, audit_rows: list[dict], counter: dict) -> 
 
 
 def _smart_process_row(row: dict, rd: Path, audit_rows: list[dict], counter: dict) -> dict:
+    q_used = 0
+    successful_searches = 0
+    failed_searches = 0
+    best_review = None
+    best_unreachable = None
+
+    # Direct candidates from explicit website fields or an organisational email domain.
+    direct_urls = []
     source_url = row.get("website") or row.get("Website") or row.get("url") or row.get("URL") or row.get("Website / Source") or ""
     if source_url and str(source_url).startswith(("http://", "https://")):
-        verify = _smart_verify_candidate(str(source_url), row, "source_registry")
-        if verify.get("grade") in {"A", "B", "C"}:
-            status, conf = _smart_status("source_registry", verify.get("grade"))
-            return _smart_result(row, str(source_url), status, conf, "source_registry", "", "website from source registry, verified on-site", "source_registry", verify, searched="no", queries_used=0)
+        direct_urls.append((str(source_url), "source_registry"))
+    email = _smart_contact_values(row).get("email") or ""
+    if "@" in email:
+        domain = email.rsplit("@", 1)[-1].strip().lower()
+        if domain and domain not in {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "rediffmail.com"}:
+            direct_urls.append((f"https://{domain}", "email_domain"))
+
+    for direct_url, direct_route in direct_urls:
+        verify = _smart_verify_candidate(direct_url, row, direct_route, counter=counter)
+        grade = verify.get("grade", "D")
+        if verify.get("all_fetches_failed"):
+            best_unreachable = {
+                "url": direct_url, "source": direct_route, "query": "", "route": direct_route,
+                "verify": verify, "qinfo": {}, "score": 100,
+            }
+            if str(row.get("previous_website_status") or "").lower() == "candidate_site_unreachable":
+                return _smart_result(
+                    row, direct_url, "candidate_site_unreachable", "low", direct_route, "",
+                    "Candidate domain is still unreachable after direct retry; no additional Serper query was used.",
+                    direct_route, verify, searched="no", queries_used=0,
+                )
+        elif _smart_is_reviewable(grade):
+            status, conf = _smart_status(direct_route, grade)
+            result = _smart_result(row, direct_url, status, conf, direct_route, "", "Direct identity candidate verified on-site", direct_route, verify, searched="no", queries_used=0)
+            if _smart_accepts_automatically(grade) or grade == "B":
+                return result
+            best_review = {"result": result, "score": 100 if grade == "C" else 0}
+
     vinfo = _smart_name_variants(row.get("name", ""))
-    q_used = 0
-    best_manual = None
-    for qinfo in _smart_queries(row, vinfo):
-        if SMART_RECHECK_MAX_TOTAL_QUERIES and counter["queries"] >= SMART_RECHECK_MAX_TOTAL_QUERIES:
-            return _smart_result(row, "", "skipped_query_cap", "low", "serper", "", f"run query cap reached at {counter['queries']} queries", "", searched="no", queries_used=q_used)
-        counter["queries"] += 1; q_used += 1
-        data, err = _serper_search_full(qinfo["query"])
-        if err:
-            audit_rows.append(_smart_audit(row, qinfo, decision="search_failed", note=err[:250])); continue
-        cands = _recheck_candidates(data or {})
-        if not cands:
-            audit_rows.append(_smart_audit(row, qinfo, decision="no_candidate", note="Serper returned zero candidate URLs")); continue
-        nominees = []
-        for cand in cands[:10]:
-            score, note, route, reject = _smart_score_candidate(row.get("name", ""), vinfo, row, cand, qinfo)
-            cand = {**cand, "score": score, "note": note, "route": route}
-            if score >= SMART_RECHECK_NOMINATION_SCORE:
-                nominees.append(cand); audit_rows.append(_smart_audit(row, qinfo, cand, decision="nominated_not_verified"))
-            else:
-                audit_rows.append(_smart_audit(row, qinfo, cand, decision="rejected_bad_domain" if score == -999 else "rejected_weak_match", reject=reject, note=note))
-        nominees.sort(key=lambda x: x.get("score", 0), reverse=True)
-        for cand in nominees[:SMART_RECHECK_MAX_VERIFY_PER_ROW]:
-            verify = _smart_verify_candidate(cand.get("url", ""), row, cand.get("route", "direct"))
-            audit_rows.append(_smart_audit(row, qinfo, cand, decision="accepted" if verify.get("grade") in {"A","B","C"} else "nominated_not_verified", verify=verify))
-            if verify.get("grade") in {"A", "B", "C"}:
-                status, conf = _smart_status(cand.get("route", "direct"), verify.get("grade"))
-                return _smart_result(row, cand.get("url", ""), status, conf, cand.get("source", ""), qinfo.get("query", ""), cand.get("note", ""), cand.get("route", "direct"), verify, qinfo, searched="yes", queries_used=q_used)
-            if not best_manual or cand.get("score", 0) > best_manual.get("score", 0):
-                best_manual = {**cand, "verify": verify, "qinfo": qinfo, "q_used": q_used}
-        time.sleep(RECHECK_PACE_SEC)
-    rename_result = _smart_rename_recovery(row, audit_rows, counter)
-    if rename_result:
-        return rename_result
-    if best_manual:
-        return _smart_result(row, best_manual.get("url", ""), "needs_manual_verification", "low", best_manual.get("source", ""), best_manual.get("qinfo", {}).get("query", ""), "Candidate nominated but site did not verify registered identity", best_manual.get("route", ""), best_manual.get("verify"), best_manual.get("qinfo"), searched="yes", queries_used=best_manual.get("q_used", q_used))
-    return _smart_result(row, "", "no_candidate_found", "low", "serper", "", "No candidate found after staged searches or rename-carrier recovery", "", searched="yes", queries_used=q_used)
+    all_queries = _smart_queries(row, vinfo)
+    provider_plan = []
+    if _smart_provider_available("serper"):
+        provider_plan.append(("serper", all_queries))
+    if _smart_provider_available("brave"):
+        brave_queries = []
+        for q in all_queries:
+            if q.get("pass") in {"identifier", 1, 2} and len(brave_queries) < SMART_RECHECK_BRAVE_MAX_QUERIES_PER_ROW:
+                brave_queries.append(q)
+        if not brave_queries:
+            brave_queries = all_queries[:SMART_RECHECK_BRAVE_MAX_QUERIES_PER_ROW]
+        provider_plan.append(("brave", brave_queries))
+
+    if not provider_plan:
+        return _smart_result(row, "", "provider_failure", "low", "", "", "Neither Serper nor Brave is configured", "", searched="no")
+
+    for provider, queries in provider_plan:
+        for base_qinfo in queries:
+            if not _smart_reserve_query(counter, provider):
+                return _smart_result(row, "", "skipped_query_cap", "low", provider, "", f"run query cap reached at {counter.get('queries', 0)} queries", "", searched="no", queries_used=q_used, successful_searches=successful_searches, failed_searches=failed_searches)
+            q_used += 1
+            qinfo = {**base_qinfo, "provider": provider}
+            cands, err = _smart_search_provider(provider, qinfo["query"])
+            if err:
+                failed_searches += 1
+                audit_rows.append(_smart_audit(row, qinfo, decision="search_failed", note=err[:250]))
+                continue
+            successful_searches += 1
+            if not cands:
+                audit_rows.append(_smart_audit(row, qinfo, decision="no_candidate", note=f"{provider} returned zero candidate URLs"))
+                continue
+
+            nominees = []
+            for cand0 in cands[:12]:
+                score, note, route, reject = _smart_score_candidate(row.get("name", ""), vinfo, row, cand0, qinfo)
+                cand = {**cand0, "score": score, "note": note, "route": route}
+                if score >= SMART_RECHECK_NOMINATION_SCORE:
+                    nominees.append(cand)
+                    audit_rows.append(_smart_audit(row, qinfo, cand, decision="nominated_not_verified"))
+                else:
+                    audit_rows.append(_smart_audit(row, qinfo, cand, decision="rejected_bad_domain" if score == -999 else "rejected_weak_match", reject=reject, note=note))
+
+            nominees.sort(key=lambda x: x.get("score", 0), reverse=True)
+            nominees = _smart_dedupe_nominees(nominees)
+            for cand in nominees[:SMART_RECHECK_MAX_VERIFY_PER_ROW]:
+                verify = _smart_verify_candidate(cand.get("url", ""), row, cand.get("route", "direct"), cand.get("evidence_urls"), counter=counter)
+                grade = verify.get("grade", "D")
+                decision = "accepted" if _smart_accepts_automatically(grade) else ("probable" if grade == "B" else "nominated_not_verified")
+                audit_rows.append(_smart_audit(row, qinfo, cand, decision=decision, verify=verify))
+                if verify.get("all_fetches_failed"):
+                    if not best_unreachable or cand.get("score", 0) > best_unreachable.get("score", 0):
+                        best_unreachable = {
+                            "url": cand.get("url", ""), "source": cand.get("source", ""),
+                            "query": qinfo.get("query", ""), "route": cand.get("route", "direct"),
+                            "verify": verify, "qinfo": qinfo, "score": cand.get("score", 0),
+                        }
+                elif _smart_is_reviewable(grade):
+                    status, conf = _smart_status(cand.get("route", "direct"), grade)
+                    result = _smart_result(row, cand.get("url", ""), status, conf, cand.get("source", ""), qinfo.get("query", ""), cand.get("note", ""), cand.get("route", "direct"), verify, qinfo, searched="yes", queries_used=q_used, successful_searches=successful_searches, failed_searches=failed_searches)
+                    if _smart_accepts_automatically(grade) or grade == "B":
+                        return result
+                    if not best_review or cand.get("score", 0) > best_review.get("score", 0):
+                        best_review = {"result": result, "score": cand.get("score", 0)}
+            time.sleep(RECHECK_PACE_SEC)
+
+    # Rename recovery is available only as an explicit paid opt-in because it
+    # can exceed the two-query budget.
+    if SMART_RECHECK_ENABLE_RENAME_RECOVERY and _smart_provider_available("serper"):
+        rename_result = _smart_rename_recovery(row, audit_rows, counter)
+        if rename_result:
+            return rename_result
+
+    if best_review:
+        return best_review["result"]
+    if best_unreachable:
+        return _smart_result(
+            row, best_unreachable.get("url", ""), "candidate_site_unreachable", "low",
+            best_unreachable.get("source", ""), best_unreachable.get("query", ""),
+            "A plausible candidate domain was found, but all direct fetch retries failed. Retry later; this is not a no-website conclusion.",
+            best_unreachable.get("route", "direct"), best_unreachable.get("verify"), best_unreachable.get("qinfo"),
+            searched="yes" if q_used else "no", queries_used=q_used,
+            successful_searches=successful_searches, failed_searches=failed_searches,
+        )
+    if successful_searches == 0 and failed_searches > 0:
+        return _smart_result(row, "", "provider_failure", "low", "serper/brave", "", "All configured search-provider requests failed; no website conclusion was made", "", searched="yes", queries_used=q_used, successful_searches=successful_searches, failed_searches=failed_searches)
+    if failed_searches > 0:
+        return _smart_result(row, "", "search_incomplete", "low", "serper/brave", "", "Some required searches failed; rerun before treating this NGO as not found", "", searched="yes", queries_used=q_used, successful_searches=successful_searches, failed_searches=failed_searches)
+    return _smart_result(row, "", "no_candidate_after_completed_search", "low", "serper/brave", "", "No confirmed candidate located after completed staged searches", "", searched="yes", queries_used=q_used, successful_searches=successful_searches, failed_searches=failed_searches)
+
+def _smart_firecrawl_recovery_query(row: dict) -> dict:
+    vinfo = _smart_name_variants(row.get("name", ""))
+    brands = _smart_public_brand_candidates(row, vinfo)
+    brand = brands[0] if brands else (vinfo.get("legal_suffix_removed") or row.get("name", ""))
+    geo = " ".join(x for x in [row.get("district", ""), row.get("state", "")] if x).strip()
+    query = re.sub(r"\s+", " ", f'"{brand}" {geo} NGO school trust').strip()
+    return {"query": query, "pass": "firecrawl_public_brand", "variant": brand, "variant_type": "firecrawl_recovery", "provider": "firecrawl"}
 
 
-def _run_smart_recheck_job(run_id: str, cancel_event: threading.Event):
+def _smart_process_firecrawl_row(row: dict, rd: Path, audit_rows: list[dict], counter: dict) -> dict:
+    """Zero-Serper recovery: verify a known domain or spend one Firecrawl Search."""
+    start_credits = int(counter.get("firecrawl_credits", 0))
+
+    def finish(result: dict, action: str) -> dict:
+        result["Firecrawl Credits Used"] = max(0, int(counter.get("firecrawl_credits", 0)) - start_credits)
+        result["Firecrawl Action"] = action
+        return result
+
+    direct_url = row.get("website") or row.get("Website") or row.get("url") or row.get("URL") or ""
+    if direct_url and str(direct_url).startswith(("http://", "https://")):
+        verify = _smart_verify_candidate(str(direct_url), row, "firecrawl_candidate_recovery", counter=counter, firecrawl_recovery=True)
+        grade = verify.get("grade", "D")
+        if _smart_is_reviewable(grade):
+            status, conf = _smart_status("firecrawl_candidate_recovery", grade)
+            return finish(_smart_result(
+                row, str(direct_url), status, conf, "firecrawl", "",
+                "Known candidate rechecked with direct fetch, local PDF parsing and selective Firecrawl.",
+                "firecrawl_candidate_recovery", verify, {"provider":"firecrawl","pass":"candidate_recovery"},
+                searched="no", queries_used=0,
+            ), "candidate_verification")
+        if verify.get("all_fetches_failed"):
+            status = "firecrawl_budget_exhausted" if counter.get("firecrawl_budget_exhausted") else "candidate_site_unreachable"
+            note = "Firecrawl credit budget was exhausted before candidate verification completed." if status == "firecrawl_budget_exhausted" else "Candidate remains unreachable after selective recovery."
+            return finish(_smart_result(
+                row, str(direct_url), status, "low", "firecrawl", "", note,
+                "firecrawl_candidate_recovery", verify, {"provider":"firecrawl","pass":"candidate_recovery"},
+                searched="no", queries_used=0,
+            ), "candidate_verification")
+        return finish(_smart_result(
+            row, str(direct_url), "needs_manual_verification", "low", "firecrawl", "",
+            "Candidate was readable but identity could not be closed.", "firecrawl_candidate_recovery",
+            verify, {"provider":"firecrawl","pass":"candidate_recovery"}, searched="no", queries_used=0,
+        ), "candidate_verification")
+
+    if SMART_RECHECK_FIRECRAWL_MAX_SEARCHES_PER_NGO <= 0:
+        return finish(_smart_result(
+            row, "", "firecrawl_search_disabled", "low", "firecrawl", "",
+            "No candidate domain was supplied and Firecrawl Search is disabled.",
+            "firecrawl_search", searched="no", queries_used=0,
+        ), "none")
+
+    qinfo = _smart_firecrawl_recovery_query(row)
+    candidates, error, _credits = _smart_firecrawl_search(qinfo["query"], counter=counter)
+    if error:
+        status = "firecrawl_budget_exhausted" if "budget" in error.lower() else "firecrawl_provider_failure"
+        audit_rows.append(_smart_audit(row, qinfo, decision="search_failed", note=error))
+        return finish(_smart_result(
+            row, "", status, "low", "firecrawl", qinfo["query"], error,
+            "firecrawl_search", qinfo=qinfo, searched="yes", queries_used=0,
+        ), "search")
+    if not candidates:
+        audit_rows.append(_smart_audit(row, qinfo, decision="no_candidate", note="Firecrawl Search returned zero URLs"))
+        return finish(_smart_result(
+            row, "", "no_candidate_after_firecrawl_search", "low", "firecrawl", qinfo["query"],
+            "No candidate located after the selected Firecrawl recovery search.",
+            "firecrawl_search", qinfo=qinfo, searched="yes", queries_used=0,
+        ), "search")
+
+    vinfo = _smart_name_variants(row.get("name", ""))
+    nominees = []
+    for candidate in candidates[:SMART_RECHECK_FIRECRAWL_SEARCH_LIMIT]:
+        score, note, route, reject = _smart_score_candidate(row.get("name", ""), vinfo, row, candidate, qinfo)
+        candidate = {**candidate, "score": score, "note": note, "route": route or "firecrawl_search"}
+        if score >= SMART_RECHECK_NOMINATION_SCORE:
+            nominees.append(candidate)
+            audit_rows.append(_smart_audit(row, qinfo, candidate, decision="nominated_not_verified"))
+        else:
+            audit_rows.append(_smart_audit(row, qinfo, candidate, decision="rejected_weak_match", reject=reject, note=note))
+    nominees = _smart_dedupe_nominees(sorted(nominees, key=lambda x: x.get("score", 0), reverse=True))
+    best_review = None
+    best_unreachable = None
+    for candidate in nominees[:SMART_RECHECK_FIRECRAWL_SEARCH_MAX_VERIFY]:
+        verify = _smart_verify_candidate(
+            candidate.get("url", ""), row, "firecrawl_search", candidate.get("evidence_urls"),
+            counter=counter, firecrawl_recovery=True,
+        )
+        grade = verify.get("grade", "D")
+        audit_rows.append(_smart_audit(
+            row, qinfo, candidate,
+            decision="accepted" if _smart_accepts_automatically(grade) else "nominated_not_verified",
+            verify=verify,
+        ))
+        if _smart_is_reviewable(grade):
+            status, conf = _smart_status("firecrawl_search", grade)
+            result = _smart_result(
+                row, candidate.get("url", ""), status, conf, "firecrawl_search", qinfo["query"],
+                candidate.get("note", ""), "firecrawl_search", verify, qinfo,
+                searched="yes", queries_used=0,
+            )
+            if _smart_accepts_automatically(grade) or grade == "B":
+                return finish(result, "search_and_verify")
+            best_review = result
+        elif verify.get("all_fetches_failed"):
+            best_unreachable = (candidate, verify)
+    if best_review:
+        return finish(best_review, "search_and_verify")
+    if best_unreachable:
+        candidate, verify = best_unreachable
+        return finish(_smart_result(
+            row, candidate.get("url", ""), "candidate_site_unreachable", "low", "firecrawl_search",
+            qinfo["query"], "Firecrawl Search found a plausible candidate, but the site could not be verified.",
+            "firecrawl_search", verify, qinfo, searched="yes", queries_used=0,
+        ), "search_and_verify")
+    if counter.get("firecrawl_budget_exhausted"):
+        return finish(_smart_result(
+            row, "", "firecrawl_budget_exhausted", "low", "firecrawl", qinfo["query"],
+            "Firecrawl credit budget was exhausted.", "firecrawl_search", qinfo=qinfo,
+            searched="yes", queries_used=0,
+        ), "search")
+    return finish(_smart_result(
+        row, "", "no_candidate_after_firecrawl_search", "low", "firecrawl", qinfo["query"],
+        "Firecrawl Search completed but no candidate passed identity nomination.",
+        "firecrawl_search", qinfo=qinfo, searched="yes", queries_used=0,
+    ), "search")
+
+
+def _run_smart_recheck_job(run_id: str, cancel_event: threading.Event, strategy_name: str = "smart"):
     rd = _run_dir(run_id)
-    result_rows: list[dict] = []
-    audit_rows: list[dict] = []
-    skipped_rows: list[dict] = []
-    start_ts = time.time(); cap_hit = False; errors = 0; counter = {"queries": 0}
+    session_start = time.time()
+    previous_status = {}
+    try:
+        previous_status = json.loads(_recheck_status_path(rd).read_text(encoding="utf-8"))
+    except Exception:
+        previous_status = {}
+    first_start_ts = float(previous_status.get("started_at_epoch") or session_start)
+    active_elapsed_before = float(previous_status.get("active_elapsed_sec") or 0.0)
+    result_rows: list[dict] = _recheck_read_all_csv(rd / RECHECK_OUTPUTS["results"])
+    processed_keys = {_recheck_identity_key(r, result_row=True) for r in result_rows}
+    audit_count = _count_export_records(rd / RECHECK_OUTPUTS["audit"])
+    skipped_rows: list[dict] = _recheck_read_all_csv(rd / RECHECK_OUTPUTS["skipped"])
+    cap_hit = bool(previous_status.get("cap_hit")); errors = int(previous_status.get("errors") or 0)
+    counter = _recheck_load_counter(rd, strategy_name)
+
     try:
         rows = _read_recheck_input(rd / "uploaded_input.csv")[:RECHECK_MAX_ROWS]
+        total = len(rows)
         entity_register, entity_sha = _smart_load_entity_register(rd)
-        prepass = {"uploaded_rows": len(rows), "entity_register_hits": 0, "unique_search_rows": 0}
+        prepass = {
+            "uploaded_rows": total,
+            "entity_register_hits": sum(1 for r in result_rows if str(r.get("Source") or "") == "entity_register"),
+            "unique_search_rows": 0,
+        }
         search_rows = []
         for row in rows:
-            ent = entity_register.get(_smart_norm(row.get("name", "")))
+            if _recheck_identity_key(row) in processed_keys:
+                continue
+            ent = _smart_entity_lookup(row, entity_register)
             if ent:
                 prepass["entity_register_hits"] += 1
-                result_rows.append(_smart_result(row, ent.get("website", ""), "alias_or_associated_entity_needs_review", "medium", "entity_register", "", ent.get("notes", "Entity register match; review before ranking"), "entity_register", {"grade":"register", "type": ent.get("relation", ""), "matched": ent.get("source", ""), "page": ent.get("source", "")}, searched="no", queries_used=0))
+                result = _smart_result(
+                    row, ent.get("website", ""), "alias_or_associated_entity_needs_review", "medium",
+                    "entity_register", "", ent.get("notes", "Entity register match; review before ranking"),
+                    "entity_register", {"grade":"register", "type": ent.get("relation", ""), "matched": ent.get("source", ""), "page": ent.get("source", "")},
+                    searched="no", queries_used=0,
+                )
+                result_rows.append(result)
+                processed_keys.add(_recheck_identity_key(result, result_row=True))
+                _recheck_append_checkpoint(rd, result, [])
             else:
                 search_rows.append(row)
-        prepass["unique_search_rows"] = len(search_rows)
-        total = len(search_rows)
-        _write_recheck_status(rd, run_id=run_id, run_status="running", stage="smart_recovery", total=total, processed=0, strategy="smart", prepass=prepass)
-        for i, row in enumerate(search_rows, start=1):
-            if _should_cancel(run_id, cancel_event):
-                _write_recheck_status(rd, run_status="cancelled", stage="cancelled", processed=i-1, strategy="smart"); return
-            if SMART_RECHECK_MAX_TOTAL_QUERIES and counter["queries"] >= SMART_RECHECK_MAX_TOTAL_QUERIES:
+        if strategy_name == "firecrawl":
+            priority = {
+                "candidate_site_unreachable": 0, "possible_site_manual_review": 1, "needs_manual_verification": 1,
+                "search_incomplete": 2, "provider_failure": 2, "no_candidate_after_completed_search": 3,
+            }
+            search_rows.sort(key=lambda r: priority.get(str(r.get("previous_website_status") or r.get("Website Status") or "").lower(), 4))
+        prepass["unique_search_rows"] = total - prepass["entity_register_hits"]
+
+        active_elapsed = active_elapsed_before + (time.time() - session_start)
+        progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+        _write_recheck_status(
+            rd, run_id=run_id, run_status="running", stage="firecrawl_recovery" if strategy_name == "firecrawl" else "smart_recovery",
+            strategy=strategy_name, prepass=prepass, first_started_at_epoch=first_start_ts,
+            started_at_epoch=first_start_ts, **progress,
+        )
+
+        for row in search_rows:
+            action = _recheck_control_action(rd, run_id, cancel_event)
+            if action:
+                active_elapsed = active_elapsed_before + (time.time() - session_start)
+                progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+                summary = _smart_write_summary(rd, result_rows, audit_count, counter["queries"], first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
+                if action == "pause":
+                    _write_recheck_status(
+                        rd, ok=True, run_status="paused", stage="paused", current_item="Paused safely after the last completed NGO.",
+                        strategy=strategy_name, summary=summary, queries_used=counter["queries"], firecrawl_credits_used=counter.get("firecrawl_credits", 0),
+                        downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()}, **progress,
+                    )
+                    _job_update(run_id, status="paused", stage="paused")
+                else:
+                    _write_recheck_status(
+                        rd, ok=True, run_status="stopped", stage="stopped_partial", current_item="Search ended safely. Partial outputs are ready and the run can be resumed.",
+                        strategy=strategy_name, summary=summary, queries_used=counter["queries"], firecrawl_credits_used=counter.get("firecrawl_credits", 0),
+                        downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()}, **progress,
+                    )
+                    _job_update(run_id, status="stopped", stage="stopped_partial")
+                return
+
+            if strategy_name != "firecrawl" and SMART_RECHECK_MAX_TOTAL_QUERIES and counter["queries"] >= SMART_RECHECK_MAX_TOTAL_QUERIES:
                 cap_hit = True
-                for rem in search_rows[i-1:]:
+                for rem in search_rows[search_rows.index(row):]:
+                    if _recheck_identity_key(rem) in processed_keys:
+                        continue
                     skipped_rows.append(rem)
-                    result_rows.append(_smart_result(rem, "", "skipped_query_cap", "low", "serper", "", f"run query cap reached at {counter['queries']} queries", "", searched="no", queries_used=0))
+                    result = _smart_result(rem, "", "skipped_query_cap", "low", "serper", "", f"run query cap reached at {counter['queries']} queries", "", searched="no", queries_used=0)
+                    result_rows.append(result)
+                    processed_keys.add(_recheck_identity_key(result, result_row=True))
+                    _recheck_append_checkpoint(rd, result, [])
+                _smart_write_skipped(rd, skipped_rows)
                 break
-            _write_recheck_status(rd, stage="smart_recovery", current_item=row.get("name", ""), processed=i-1, total=total, queries_used=counter["queries"], strategy="smart")
+
+            active_elapsed = active_elapsed_before + (time.time() - session_start)
+            progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+            _write_recheck_status(
+                rd, stage="firecrawl_recovery" if strategy_name == "firecrawl" else "smart_recovery",
+                current_item=row.get("name", ""), current_search="", queries_used=counter["queries"],
+                firecrawl_credits_used=counter.get("firecrawl_credits", 0), strategy=strategy_name, **progress,
+            )
+            row_audit: list[dict] = []
             try:
-                result = _smart_process_row(row, rd, audit_rows, counter)
+                result = _smart_process_firecrawl_row(row, rd, row_audit, counter) if strategy_name == "firecrawl" else _smart_process_row(row, rd, row_audit, counter)
             except Exception as e:
-                errors += 1; _append_recheck_error(rd, f"{row.get('name','')} smart error: {e}")
-                result = _smart_result(row, "", "search_failed", "low", "smart_recheck", "", str(e)[:250], "", searched="yes", queries_used=0)
+                errors += 1
+                _append_recheck_error(rd, f"{row.get('name','')} smart error: {e}")
+                result = _smart_result(row, "", "firecrawl_provider_failure" if strategy_name == "firecrawl" else "search_failed", "low", strategy_name, "", str(e)[:250], "", searched="yes", queries_used=0)
             if result.get("Website Status") == "skipped_query_cap":
-                cap_hit = True; skipped_rows.append(row)
+                cap_hit = True
+                skipped_rows.append(row)
             result_rows.append(result)
-            _write_recheck_csvs(rd, result_rows, audit_rows)
+            processed_keys.add(_recheck_identity_key(result, result_row=True))
+            audit_count += len(row_audit)
+            _recheck_append_checkpoint(rd, result, row_audit)
             _smart_write_skipped(rd, skipped_rows)
-            summary = _smart_write_summary(rd, result_rows, audit_rows, counter["queries"], start_ts, cap_hit, prepass, entity_sha, errors)
-            _write_recheck_status(rd, processed=i, total=total, queries_used=counter["queries"], cap_hit=cap_hit, summary=summary, strategy="smart")
+            active_elapsed = active_elapsed_before + (time.time() - session_start)
+            progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+            summary = _smart_write_summary(rd, result_rows, audit_count, counter["queries"], first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
+            _write_recheck_status(
+                rd, run_status="running", queries_used=counter["queries"], cap_hit=cap_hit,
+                summary=summary, errors=errors, firecrawl_credits_used=counter.get("firecrawl_credits", 0), strategy=strategy_name, **progress,
+            )
             time.sleep(RECHECK_PACE_SEC)
-        _write_recheck_csvs(rd, result_rows, audit_rows)
-        _smart_write_skipped(rd, skipped_rows)
-        summary = _smart_write_summary(rd, result_rows, audit_rows, counter["queries"], start_ts, cap_hit, prepass, entity_sha, errors)
-        _write_recheck_status(rd, ok=True, run_status="complete", stage="results_ready_partial" if cap_hit else "results_ready", message="Smart website recovery complete", processed=total, total=total, queries_used=counter["queries"], cap_hit=cap_hit, summary=summary, errors=errors, strategy="smart", downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()})
+
+        active_elapsed = active_elapsed_before + (time.time() - session_start)
+        progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+        summary = _smart_write_summary(rd, result_rows, audit_count, counter["queries"], first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
+        _write_recheck_status(
+            rd, ok=True, run_status="complete", stage="results_ready_partial" if cap_hit else "results_ready",
+            message="Firecrawl recovery complete" if strategy_name == "firecrawl" else "Smart website recovery complete",
+            queries_used=counter["queries"], cap_hit=cap_hit, summary=summary, errors=errors,
+            firecrawl_credits_used=counter.get("firecrawl_credits", 0), strategy=strategy_name,
+            downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()}, **progress,
+        )
+        _recheck_pause_path(rd).unlink(missing_ok=True)
+        _recheck_stop_path(rd).unlink(missing_ok=True)
     except Exception as e:
+        active_elapsed = active_elapsed_before + (time.time() - session_start)
         _append_recheck_error(rd, f"fatal smart recheck error: {e}")
-        _write_recheck_status(rd, ok=False, run_status="error", stage="error", error=str(e)[:500], strategy="smart")
+        _write_recheck_status(rd, ok=False, run_status="error", stage="error", error=str(e)[:500], strategy=strategy_name, **_recheck_progress_payload(len(result_rows), len(_read_recheck_input(rd / "uploaded_input.csv")), active_elapsed))
+
+
+def _run_firecrawl_recovery_job(run_id: str, cancel_event: threading.Event):
+    return _run_smart_recheck_job(run_id, cancel_event, strategy_name="firecrawl")
 
 
 @app.post("/repository/recheck/start")
-async def recheck_start(file: UploadFile = File(...), strategy: str = "classic"):
-    strategy = (strategy or "classic").strip().lower()
-    if strategy not in {"classic", "smart"}:
-        return _json(False, status_code=400, stage="bad_strategy", error="strategy must be classic or smart")
-    if not _has_serper_keys():
-        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY or SERPER_API_KEYS must be set on Render")
+async def recheck_start(file: UploadFile = File(...), strategy: str = "smart"):
+    strategy = (strategy or "smart").strip().lower()
+    if strategy not in {"classic", "smart", "firecrawl"}:
+        return _json(False, status_code=400, stage="bad_strategy", error="strategy must be classic, smart or firecrawl")
+    if strategy == "classic" and not _has_serper_keys():
+        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY or SERPER_API_KEYS must be set")
+    if strategy == "smart" and not (_has_serper_keys() or (_has_brave_key() and SMART_RECHECK_USE_BRAVE)):
+        return _json(False, status_code=500, stage="missing_env", error="Configure SERPER_API_KEY(S). Brave is optional and disabled by default.")
+    if strategy == "firecrawl" and (not SMART_RECHECK_USE_FIRECRAWL or not _smart_firecrawl_keys()):
+        return _json(False, status_code=503, stage="firecrawl_not_configured", error="Firecrawl recovery requires SMART_RECHECK_USE_FIRECRAWL=true and FIRECRAWL_API_KEY(S)")
     active = [rid for rid, th in list(recheck_threads.items()) if th.is_alive()]
     if active:
         return _json(False, status_code=409, stage="another_recheck_active", error="Another no-website re-check is already active", active_runs=active)
@@ -2578,14 +3756,19 @@ async def recheck_start(file: UploadFile = File(...), strategy: str = "classic")
         msg = f"Re-check allows up to {RECHECK_MAX_ROWS} rows per run. Split this file."
         _write_recheck_status(rd, ok=False, run_id=run_id, run_status="blocked", stage="too_many_rows", error=msg, row_count=len(rows), strategy=strategy)
         return _json(False, status_code=400, run_id=run_id, stage="too_many_rows", error=msg, row_count=len(rows))
+    _recheck_initialize_outputs(rd)
+    _recheck_pause_path(rd).unlink(missing_ok=True)
+    _recheck_stop_path(rd).unlink(missing_ok=True)
     ev = threading.Event()
     recheck_cancel_flags[run_id] = ev
     _write_recheck_status(
         rd, ok=True, run_id=run_id, module="no_website_recheck", run_status="starting", stage="queued",
-        row_count_uploaded=len(rows), upload_bytes=upload_bytes, total=len(rows), processed=0,
+        row_count_uploaded=len(rows), upload_bytes=upload_bytes, total=len(rows), processed=0, remaining=len(rows), progress_pct=0.0,
+        active_elapsed_sec=0.0, throughput_rows_per_min=0.0, eta_seconds=None, eta_at="", eta_quality="calculating",
+        started_at_epoch=time.time(), resume_count=0, input_filename=Path(file.filename or "uploaded_input.csv").name,
         message=f"Queued {'smart ' if strategy == 'smart' else ''}no official website re-check", strategy=strategy,
     )
-    target = _run_smart_recheck_job if strategy == "smart" else _run_recheck_job
+    target = _run_firecrawl_recovery_job if strategy == "firecrawl" else (_run_smart_recheck_job if strategy == "smart" else _run_recheck_job)
     th = threading.Thread(target=target, args=(run_id, ev), daemon=True)
     recheck_threads[run_id] = th
     th.start()
@@ -2612,6 +3795,18 @@ def recheck_status(run_id: str):
     data["process_state"] = process_state
     data["downloads"] = {kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()}
     data["file_counts"] = _output_counts(rd, RECHECK_OUTPUTS)
+    run_status = str(data.get("run_status") or "").lower()
+    if process_state != "running" and run_status in {"queued", "starting", "running", "resuming", "pause_requested", "stop_requested", "cancelling"}:
+        # A backend/worker restart may leave the last persisted status active even
+        # though no thread owns the run. Present it as resumable interruption.
+        run_status = "interrupted"
+        data["run_status"] = "interrupted"
+        data["stage"] = "interrupted_restart"
+        data["current_item"] = data.get("current_item") or "Run interrupted before completion; resume from the saved checkpoint."
+    data["can_pause"] = process_state == "running" and run_status not in {"pause_requested", "stop_requested"}
+    data["can_stop"] = process_state == "running" and run_status != "stop_requested"
+    data["can_resume"] = process_state != "running" and (run_status in {"paused", "stopped", "interrupted", "error", "cancelled", "canceled"} or str(data.get("stage") or "").lower() in {"stopped_partial", "interrupted_restart"})
+    data["partial_outputs_available"] = bool(data["downloads"].get("results") or data["downloads"].get("audit"))
     _job_sync_from_status(run_id, "no_website_recheck", rd, data)
     data["job"] = _read_job(run_id)
     return JSONResponse(content=data)
@@ -2650,7 +3845,7 @@ def recheck_export(run_id: str, kind: str):
 
 
 @app.get("/repository/recheck/remaining/{run_id}")
-def recheck_remaining(run_id: str, include_statuses: str = "skipped_query_cap,search_failed"):
+def recheck_remaining(run_id: str, include_statuses: str = "skipped_query_cap,search_failed,provider_failure,search_incomplete,candidate_site_unreachable"):
     rd = _run_dir(run_id)
     if not rd.exists():
         return _run_not_found("recheck", run_id)
@@ -2664,34 +3859,195 @@ def recheck_remaining(run_id: str, include_statuses: str = "skipped_query_cap,se
     if path.exists():
         with path.open("r", encoding="utf-8-sig", newline="") as f:
             for r in csv.DictReader(f):
-                k = "|".join([_smart_norm(r.get("NGO Name", "")), _smart_norm(r.get("District", "")), _smart_norm(r.get("State", ""))])
+                darpan_key = _smart_compact(r.get("Darpan ID", ""))
+                if darpan_key:
+                    k = "id:" + darpan_key
+                else:
+                    k = "name:" + "|".join([_smart_norm(r.get("NGO Name", "")), _smart_norm(r.get("District", "")), _smart_norm(r.get("State", ""))])
                 result_map[k] = r
     remaining = []
     for row in input_rows:
-        k = "|".join([_smart_norm(row.get("name", "")), _smart_norm(row.get("district", "")), _smart_norm(row.get("state", ""))])
+        darpan_key = _smart_compact(_smart_primary_darpan(row))
+        if darpan_key:
+            k = "id:" + darpan_key
+        else:
+            k = "name:" + "|".join([_smart_norm(row.get("name", "")), _smart_norm(row.get("district", "")), _smart_norm(row.get("state", ""))])
         r = result_map.get(k)
         if not r or (r.get("Website Status", "").lower() in statuses):
-            remaining.append(row)
-    lines = ["name,district,state"]
-    for r in remaining:
-        vals = [r.get("name", ""), r.get("district", ""), r.get("state", "")]
-        lines.append(",".join('"' + str(v).replace('"','""') + '"' for v in vals))
-    return Response("\n".join(lines) + "\n", media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{run_id}_remaining.csv"'})
+            retry_row = dict(row)
+            if r and r.get("Website"):
+                retry_row["website"] = r.get("Website")
+                retry_row["previous_website_status"] = r.get("Website Status", "")
+            remaining.append(retry_row)
 
+    preferred = ["name", "district", "state", "darpan_id", "email", "phone", "registered_address"]
+    extras = []
+    for row in remaining:
+        for key in row.keys():
+            if key not in preferred and key not in extras:
+                extras.append(key)
+    fieldnames = preferred + extras
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in remaining:
+        writer.writerow(_safe_csv_row({k: row.get(k, "") for k in fieldnames}))
+    return Response(output.getvalue(), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{run_id}_remaining.csv"'})
+
+
+_RECHECK_RESUMABLE_STATUSES = {"paused", "stopped", "interrupted", "error", "cancelled", "canceled"}
+_RECHECK_RESUMABLE_STAGES = {"stopped_partial", "interrupted_restart"}
+
+
+def _recheck_resumable_rows(limit: int = 100) -> list[dict]:
+    """Return durable, checkpoint-backed website-recovery runs that can be resumed."""
+    rows: list[dict] = []
+    try:
+        candidates = [p for p in RUNS_DIR.iterdir() if p.is_dir() and p.name.startswith("recheck_")]
+    except Exception:
+        candidates = []
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for rd in candidates[:max(1, min(int(limit or 100), 300))]:
+        status_path = _recheck_status_path(rd)
+        uploaded = rd / "uploaded_input.csv"
+        if not status_path.exists() or not uploaded.exists():
+            continue
+        try:
+            data = json.loads(status_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+        except Exception:
+            continue
+        run_id = rd.name
+        live_state = _job_live_state(run_id)
+        run_status = str(data.get("run_status") or data.get("status") or "").strip().lower()
+        stage = str(data.get("stage") or "").strip().lower()
+        # Old runs sometimes retain a stale active status after a restart. If no
+        # process owns them, expose them as interrupted rather than hiding them.
+        if live_state != "running" and run_status in {"queued", "starting", "running", "resuming", "pause_requested", "stop_requested", "cancelling"}:
+            run_status = "interrupted"
+            stage = "interrupted_restart"
+        strategy = str(data.get("strategy") or "smart").strip().lower()
+        if strategy not in {"smart", "firecrawl"}:
+            continue
+        can_resume = live_state != "running" and (run_status in _RECHECK_RESUMABLE_STATUSES or stage in _RECHECK_RESUMABLE_STAGES)
+        if not can_resume:
+            continue
+        total = int(data.get("total") or data.get("row_count_uploaded") or 0)
+        processed = int(data.get("processed") or 0)
+        remaining = int(data.get("remaining") if data.get("remaining") not in {None, ""} else max(0, total - processed))
+        pct = data.get("progress_pct")
+        if pct in {None, ""}:
+            pct = round((processed / total * 100.0), 2) if total else 0.0
+        rows.append({
+            "run_id": run_id,
+            "run_status": run_status,
+            "stage": stage,
+            "strategy": strategy,
+            "processed": processed,
+            "total": total,
+            "remaining": remaining,
+            "progress_pct": pct,
+            "updated_at": data.get("updated_at", ""),
+            "started_at": data.get("started_at", data.get("created_at", "")),
+            "input_filename": data.get("input_filename", ""),
+            "current_item": data.get("current_item", ""),
+            "queries_used": data.get("queries_used", data.get("summary", {}).get("total_queries", 0) if isinstance(data.get("summary"), dict) else 0),
+            "firecrawl_credits_used": data.get("firecrawl_credits_used", data.get("summary", {}).get("firecrawl_credits_used", 0) if isinstance(data.get("summary"), dict) else 0),
+            "resume_count": int(data.get("resume_count") or 0),
+            "live_state": live_state,
+            "can_resume": True,
+            "downloads": {kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()},
+        })
+    return rows
+
+
+@app.get("/repository/recheck/resumable")
+def recheck_resumable(limit: int = 100):
+    rows = _recheck_resumable_rows(limit=limit)
+    active = [rid for rid, th in recheck_threads.items() if th.is_alive()]
+    return _json(True, rows=rows, count=len(rows), active_runs=active)
+
+
+@app.post("/repository/recheck/pause/{run_id}")
+def recheck_pause(run_id: str):
+    rd = _run_dir(run_id)
+    th = recheck_threads.get(run_id)
+    if not rd.exists():
+        return _run_not_found("No website re-check", run_id)
+    if not th or not th.is_alive():
+        return _json(False, status_code=409, run_id=run_id, stage="not_running", error="This recovery run is not currently active")
+    _recheck_pause_path(rd).write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+    _write_recheck_status(rd, ok=True, run_id=run_id, run_status="pause_requested", stage="pause_requested", current_item="Pause requested. The current NGO will finish, then the run will pause safely.")
+    _job_update(run_id, status="pause_requested", stage="pause_requested")
+    return _json(True, run_id=run_id, run_status="pause_requested", stage="pause_requested")
+
+
+@app.post("/repository/recheck/stop/{run_id}")
+def recheck_stop(run_id: str):
+    rd = _run_dir(run_id)
+    th = recheck_threads.get(run_id)
+    if not rd.exists():
+        return _run_not_found("No website re-check", run_id)
+    if not th or not th.is_alive():
+        # A paused run can be formally ended without losing its checkpoint.
+        try:
+            status = json.loads(_recheck_status_path(rd).read_text(encoding="utf-8"))
+        except Exception:
+            status = {}
+        if str(status.get("run_status") or "").lower() == "paused":
+            _write_recheck_status(rd, ok=True, run_status="stopped", stage="stopped_partial", current_item="Search ended. Partial outputs remain available and the run can be resumed.")
+            _job_update(run_id, status="stopped", stage="stopped_partial")
+            return _json(True, run_id=run_id, run_status="stopped", stage="stopped_partial")
+        return _json(False, status_code=409, run_id=run_id, stage="not_running", error="This recovery run is not currently active")
+    _recheck_stop_path(rd).write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+    _write_recheck_status(rd, ok=True, run_id=run_id, run_status="stop_requested", stage="stop_requested", current_item="End requested. The current NGO will finish, then partial outputs will be finalised.")
+    _job_update(run_id, status="stop_requested", stage="stop_requested")
+    return _json(True, run_id=run_id, run_status="stop_requested", stage="stop_requested")
+
+
+@app.post("/repository/recheck/resume/{run_id}")
+def recheck_resume(run_id: str):
+    rd = _run_dir(run_id)
+    if not rd.exists():
+        return _run_not_found("No website re-check", run_id)
+    if not (rd / "uploaded_input.csv").exists():
+        return _json(False, status_code=404, run_id=run_id, stage="input_missing", error="The saved input CSV is missing, so this old search cannot be resumed")
+    th = recheck_threads.get(run_id)
+    if th and th.is_alive():
+        return _json(False, status_code=409, run_id=run_id, stage="already_running", error="This recovery run is already active")
+    other_active = [rid for rid, thread in recheck_threads.items() if rid != run_id and thread.is_alive()]
+    if other_active:
+        return _json(False, status_code=409, run_id=run_id, stage="another_recheck_active", error="Another website-recovery run is active", active_runs=other_active)
+    try:
+        old = json.loads(_recheck_status_path(rd).read_text(encoding="utf-8"))
+    except Exception:
+        old = {}
+    strategy = str(old.get("strategy") or "smart").lower()
+    if strategy not in {"smart", "firecrawl"}:
+        return _json(False, status_code=400, run_id=run_id, stage="resume_not_supported", error="Checkpoint resume is supported for smart and Firecrawl recovery runs")
+    total = int(old.get("total") or old.get("row_count_uploaded") or 0)
+    processed = int(old.get("processed") or 0)
+    if total and processed >= total and str(old.get("run_status") or "").lower() == "complete":
+        return _json(True, run_id=run_id, stage="already_complete", processed=processed, total=total)
+    _recheck_pause_path(rd).unlink(missing_ok=True)
+    _recheck_stop_path(rd).unlink(missing_ok=True)
+    ev = threading.Event()
+    recheck_cancel_flags[run_id] = ev
+    resume_count = int(old.get("resume_count") or 0) + 1
+    _write_recheck_status(rd, ok=True, run_id=run_id, run_status="resuming", stage="resume_started", current_item="Resuming from the last completed NGO", resume_count=resume_count)
+    target = _run_firecrawl_recovery_job if strategy == "firecrawl" else _run_smart_recheck_job
+    thread = threading.Thread(target=target, args=(run_id, ev), daemon=True)
+    recheck_threads[run_id] = thread
+    thread.start()
+    _job_update(run_id, status="running", stage="resume_started", thread_alive=True, cancel_requested=False, cancel_requested_at="")
+    return _json(True, run_id=run_id, stage="resumed", strategy=strategy, processed=processed, total=total, resume_count=resume_count)
 
 
 @app.post("/repository/recheck/cancel/{run_id}")
 def recheck_cancel(run_id: str):
-    _job_request_cancel(run_id)
-    ev = recheck_cancel_flags.get(run_id)
-    th = recheck_threads.get(run_id)
-    if not ev or not th or not th.is_alive():
-        return _json(False, run_id=run_id, stage="not_running", error="No website re-check run is not active")
-    ev.set()
-    rd = _run_dir(run_id)
-    _write_recheck_status(rd, ok=True, run_id=run_id, run_status="cancelled", stage="cancelled", current_item="Cancelled safely")
-    _job_update(run_id, status="cancelled", stage="cancelled")
-    return _json(True, run_id=run_id, run_status="cancelled", stage="cancelled")
+    # Backward-compatible alias. The UI now calls this "End and save outputs".
+    return recheck_stop(run_id)
 
 
 @app.on_event("startup")
@@ -8609,3 +9965,146 @@ deep_enrichment_runtime = _deep_module.register_deep_enrichment(
     job_cancel_requested=_job_cancel_requested,
     utc_now_iso=_utc_now_iso,
 )
+
+
+# =============================================================================
+# RUN DELETION PATCH (v67) — in-app run deletion + disk usage
+# Added below; reuses existing _run_dir/_job_path/_job_live_state/_json/
+# _workstream_check_admin helpers defined earlier in this file.
+# =============================================================================
+import shutil
+
+# Prefixes we recognise as deletable run folders. Anything else is refused.
+_DELETABLE_RUN_PREFIXES = (
+    "run_", "recheck_", "presence_", "discovery", "discovery_state",
+    "story", "story_state", "enrich", "repair", "pre_count_rebuild",
+)
+
+# Names that must NEVER be deleted even if someone passes them.
+_PROTECTED_RUN_NAMES = {"_jobs", "undo_redo", "workspaces", "lost+found", "runs"}
+
+
+def _is_deletable_run_dir(run_id: str) -> tuple[bool, str]:
+    """Validate that run_id names a real, safe-to-delete run directory.
+    Returns (ok, reason_if_not)."""
+    name = str(run_id or "").strip()
+    if not name:
+        return False, "empty run id"
+    if name in _PROTECTED_RUN_NAMES:
+        return False, f"'{name}' is a protected system folder"
+    rd = _run_dir(name)  # already strips to alnum/_/- and joins under RUNS_DIR
+    try:
+        rd_resolved = rd.resolve()
+        runs_resolved = RUNS_DIR.resolve()
+    except Exception:
+        return False, "could not resolve path"
+    # Must be strictly inside RUNS_DIR (defence against traversal).
+    if runs_resolved not in rd_resolved.parents:
+        return False, "path escapes runs directory"
+    if not rd_resolved.is_dir():
+        return False, "run directory not found"
+    if not name.startswith(_DELETABLE_RUN_PREFIXES):
+        return False, "not a recognised run folder"
+    # Never delete a run that is still executing.
+    if _job_live_state(name) == "running":
+        return False, "run is still active; stop or cancel it first"
+    return True, ""
+
+
+def _delete_one_run(run_id: str) -> dict:
+    """Delete a single run directory and its job-registry record.
+    Returns a per-run result dict."""
+    ok, reason = _is_deletable_run_dir(run_id)
+    if not ok:
+        return {"run_id": run_id, "deleted": False, "reason": reason}
+    rd = _run_dir(run_id)
+    freed_bytes = 0
+    try:
+        for p in rd.rglob("*"):
+            if p.is_file():
+                try:
+                    freed_bytes += p.stat().st_size
+                except Exception:
+                    pass
+        shutil.rmtree(rd)
+    except Exception as e:
+        return {"run_id": run_id, "deleted": False, "reason": f"delete failed: {e}"}
+    # Best-effort remove the durable job record too.
+    try:
+        jp = _job_path(run_id)
+        if jp.exists():
+            jp.unlink()
+    except Exception:
+        pass
+    return {"run_id": run_id, "deleted": True, "freed_bytes": freed_bytes}
+
+
+@app.post("/repository/runs/delete")
+def repository_delete_run(payload: dict | None = None):
+    """Delete ONE run by id.  Body: {password, confirm: true, run_id}."""
+    payload = payload or {}
+    try:
+        _workstream_check_admin(payload)
+    except HTTPException as e:
+        return _json(False, status_code=e.status_code, error=str(e.detail))
+    if payload.get("confirm") is not True:
+        return _json(False, status_code=400, error="Confirmation required before deleting a run")
+    run_id = str(payload.get("run_id") or "").strip()
+    if not run_id:
+        return _json(False, status_code=400, error="run_id is required")
+    result = _delete_one_run(run_id)
+    if not result.get("deleted"):
+        return _json(False, status_code=400, error=result.get("reason", "could not delete"), result=result)
+    return _json(True, result=result)
+
+
+@app.post("/repository/runs/delete-many")
+def repository_delete_runs(payload: dict | None = None):
+    """Delete MANY runs.  Body: {password, confirm: true, run_ids: [...]}."""
+    payload = payload or {}
+    try:
+        _workstream_check_admin(payload)
+    except HTTPException as e:
+        return _json(False, status_code=e.status_code, error=str(e.detail))
+    if payload.get("confirm") is not True:
+        return _json(False, status_code=400, error="Confirmation required before deleting runs")
+    run_ids = payload.get("run_ids") or []
+    if not isinstance(run_ids, list) or not run_ids:
+        return _json(False, status_code=400, error="run_ids (non-empty list) is required")
+    results = [_delete_one_run(str(r).strip()) for r in run_ids]
+    deleted = [r for r in results if r.get("deleted")]
+    freed = sum(r.get("freed_bytes", 0) for r in deleted)
+    return _json(
+        True,
+        deleted_count=len(deleted),
+        failed_count=len(results) - len(deleted),
+        freed_bytes=freed,
+        freed_mb=round(freed / (1024 * 1024), 1),
+        results=results,
+    )
+
+
+@app.get("/repository/runs/disk-usage")
+def repository_disk_usage():
+    """Report volume usage so the UI can show how full RUNS_DIR is."""
+    import shutil as _sh
+    try:
+        total, used, free = _sh.disk_usage(str(RUNS_DIR))
+        runs_bytes = 0
+        for p in RUNS_DIR.rglob("*"):
+            if p.is_file():
+                try:
+                    runs_bytes += p.stat().st_size
+                except Exception:
+                    pass
+        return _json(
+            True,
+            runs_dir=str(RUNS_DIR),
+            volume_total_mb=round(total / (1024 * 1024), 1),
+            volume_used_mb=round(used / (1024 * 1024), 1),
+            volume_free_mb=round(free / (1024 * 1024), 1),
+            volume_used_pct=round(used / total * 100, 1) if total else 0,
+            runs_data_mb=round(runs_bytes / (1024 * 1024), 1),
+        )
+    except Exception as e:
+        return _json(False, status_code=500, error=str(e))

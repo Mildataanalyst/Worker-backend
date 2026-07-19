@@ -5,3 +5,4 @@ anthropic==0.42.0
 requests==2.32.3
 beautifulsoup4==4.12.3
 tqdm==4.67.1
+pypdf==5.9.0

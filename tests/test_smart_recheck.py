@@ -62,4 +62,4 @@ def test_rename_grade_c_does_not_accept():
     # The helper should downgrade Grade C in rename route before decisioning.
     # Avoid network: simulate by asserting status only accepts A/B for rename; C is not rename_verified_match.
     assert main._smart_status("rename_detected", "A")[0] == "rename_verified_match"
-    assert main._smart_status("rename_detected", "B")[0] == "rename_verified_match"
+    assert main._smart_status("rename_detected", "B")[0] == "probable_official_site"
