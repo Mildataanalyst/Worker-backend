@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DFP 2.0 — Kalkeri Alumni Outcomes Tutorial</title>
+<style>
+:root{
+  --black:#070809;--ink:#17191c;--muted:#66707a;--bg:#f2f3f5;--white:#fff;
+  --line:#e3e6ea;--red:#e22920;--orange:#ee8a2c;--purple:#96599f;
+  --green:#12643d;--green-soft:#edf8f2;--amber:#8a5900;--amber-soft:#fff7df;
+  --shadow:0 24px 70px rgba(0,0,0,.20);--radius:22px
+}
+*{box-sizing:border-box}
+html,body{width:100%;height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink);background:var(--bg)}
+button,input{font:inherit}button{cursor:pointer}
+.hidden{display:none!important}
+.app{width:100%;height:100%;display:flex;flex-direction:column}
+.browserbar{
+  height:56px;flex:0 0 56px;background:#f8f9fa;border-bottom:1px solid var(--line);
+  display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;align-items:center;padding:0 14px;z-index:80
+}
+.dots{display:flex;gap:6px}.dot{width:10px;height:10px;border-radius:50%;background:#d0d4d9}
+.address{height:33px;border:1px solid var(--line);background:#fff;border-radius:9px;padding:0 12px;display:flex;align-items:center;color:#68717c;font-size:12px;white-space:nowrap;overflow:hidden}
+.stage-label{font-size:11px;font-weight:900;color:#68717c;white-space:nowrap}
+.stage{position:relative;flex:1;min-height:0;overflow:hidden;background:#fff}
+.source-frame{width:100%;height:100%;border:0;background:#fff}
+.fallback{
+  position:absolute;left:14px;right:14px;bottom:92px;z-index:12;background:rgba(17,24,39,.95);color:#fff;
+  border-radius:13px;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:14px;font-size:12px
+}
+.fallback a{background:#fff;color:#111827;text-decoration:none;padding:8px 10px;border-radius:9px;font-weight:900;white-space:nowrap}
+
+/* intro */
+.overlay{position:absolute;inset:0;z-index:40;pointer-events:none}
+.dim{position:absolute;inset:0;background:rgba(0,0,0,.67);backdrop-filter:blur(2px)}
+.intro-card{
+  position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(720px,calc(100% - 34px));
+  padding:32px;background:#08090b;color:#fff;border:1px solid rgba(255,255,255,.12);border-radius:26px;text-align:center;
+  box-shadow:var(--shadow);pointer-events:auto
+}
+.kicker{display:inline-flex;padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#cbd0d6;font-size:11px;font-weight:900;letter-spacing:.1em;text-transform:uppercase}
+.intro-card h1{font-size:54px;line-height:.98;letter-spacing:-.064em;margin:20px 0 12px}
+.intro-card p{max-width:620px;margin:0 auto 25px;color:#bcc3cb;font-size:18px;line-height:1.55}
+.btn{border:1px solid var(--line);background:#fff;color:#111827;padding:11px 15px;border-radius:12px;font-weight:900}
+.btn-red{background:var(--red);color:#fff;border-color:var(--red)}
+.btn-dark{background:#111827;color:#fff;border-color:#111827}
+.btn-green{background:var(--green);color:#fff;border-color:var(--green)}
+
+/* giant guided targets */
+.target{
+  position:absolute;z-index:45;pointer-events:auto;border:8px solid var(--red);border-radius:999px;background:rgba(226,41,32,.035);
+  box-shadow:0 0 0 12px rgba(226,41,32,.16),0 0 0 30px rgba(226,41,32,.07);
+  animation:pulse 1.25s ease-in-out infinite
+}
+.target-label{
+  position:absolute;background:var(--red);color:#fff;padding:11px 14px;border-radius:12px;font-size:14px;font-weight:950;
+  white-space:nowrap;box-shadow:0 13px 36px rgba(0,0,0,.25)
+}
+@keyframes pulse{
+  0%,100%{transform:scale(1);box-shadow:0 0 0 12px rgba(226,41,32,.16),0 0 0 30px rgba(226,41,32,.07)}
+  50%{transform:scale(1.05);box-shadow:0 0 0 18px rgba(226,41,32,.10),0 0 0 40px rgba(226,41,32,.03)}
+}
+#whoTarget{right:26%;top:14px;width:160px;height:78px}
+#whoTarget .target-label{left:50%;top:94px;transform:translateX(-50%)}
+#annualTarget{right:16%;top:92px;width:210px;height:88px}
+#annualTarget .target-label{left:50%;top:104px;transform:translateX(-50%)}
+#reportTarget{left:50%;top:50%;transform:translate(-50%,-50%);width:240px;height:240px}
+#reportTarget:hover{transform:translate(-50%,-50%) scale(1.05)}
+#reportTarget .target-label{left:50%;top:260px;transform:translateX(-50%)}
+
+/* evidence tray */
+.tray{
+  position:absolute;left:14px;right:14px;bottom:14px;z-index:60;background:rgba(255,255,255,.97);backdrop-filter:blur(16px);
+  border:1px solid var(--line);border-radius:17px;box-shadow:0 18px 50px rgba(0,0,0,.18);overflow:hidden
+}
+.tray-head{min-height:62px;display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 15px}
+.tray-title{display:flex;align-items:center;gap:11px}
+.counter{width:39px;height:39px;border-radius:12px;background:#111827;color:#fff;display:grid;place-items:center;font-size:12px;font-weight:950}
+.tray-title strong{display:block;font-size:14px}.tray-title span{display:block;color:var(--muted);font-size:11px;margin-top:2px}
+.tray-toggle{border:1px solid var(--line);background:#fff;border-radius:10px;padding:8px 10px;font-size:11px;font-weight:900}
+.tray-body{display:none;border-top:1px solid var(--line);padding:12px 15px;max-height:250px;overflow:auto}
+.tray.open .tray-body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.fact{border:1px solid var(--line);border-radius:13px;padding:11px;background:#fff}
+.fact.empty{color:#9aa2ad;background:#f7f8f9}.fact b{display:block;font-size:12px;margin-bottom:4px}.fact p{font-size:12px;line-height:1.45;color:#535d68;margin:0}.fact small{display:block;color:#8a939e;margin-top:6px;font-size:10px}
+
+/* report viewer */
+.report-shell{position:absolute;inset:0 0 78px 0;background:#292c31;z-index:18;display:grid;grid-template-columns:100px minmax(0,1fr)}
+.report-thumbs{padding:10px;background:#202328;border-right:1px solid #41464e;overflow:auto}
+.thumb{display:block;width:100%;padding:8px 3px;border:3px solid transparent;border-radius:8px;margin-bottom:9px;background:#fff;color:#111827;font-weight:950;font-size:11px}
+.thumb.active{border-color:var(--red)}
+.report-stage{overflow:auto;padding:15px;position:relative}
+.report-toolbar{
+  position:sticky;top:0;z-index:28;background:#15171a;color:#fff;border-radius:12px;padding:10px 12px;margin-bottom:14px;
+  display:flex;align-items:center;justify-content:space-between;gap:10px
+}
+.report-toolbar b{display:block;font-size:12px}.report-toolbar span{display:block;color:#b8bec6;font-size:10px;margin-top:2px}
+.report-toolbar a{color:#fff;text-decoration:none;border:1px solid #555c65;border-radius:9px;padding:8px 10px;font-size:11px;font-weight:900}
+.pdf-frame{width:100%;height:calc(100vh - 162px);min-height:650px;border:0;background:#fff;border-radius:8px}
+.report-circle{
+  position:absolute;z-index:30;border:8px solid var(--red);border-radius:50%;pointer-events:none;
+  box-shadow:0 0 0 13px rgba(226,41,32,.14),0 0 0 31px rgba(226,41,32,.05);animation:pulse 1.25s ease-in-out infinite
+}
+.report-callout{
+  position:absolute;z-index:31;background:var(--red);color:#fff;border-radius:12px;padding:10px 13px;font-size:13px;font-weight:950;pointer-events:none;box-shadow:0 13px 34px rgba(0,0,0,.26)
+}
+.collect{
+  position:fixed;right:26px;bottom:97px;z-index:70;border:0;background:#111827;color:#fff;border-radius:14px;padding:13px 17px;font-weight:900;box-shadow:var(--shadow)
+}
+
+/* rating */
+.rating-screen,.calibration-screen,.end-screen{
+  position:absolute;inset:0;background:#f3f4f6;z-index:22;display:grid;place-items:center;padding:28px;overflow:auto
+}
+.card{width:min(820px,100%);background:#fff;border:1px solid var(--line);border-radius:25px;padding:31px;box-shadow:0 22px 65px rgba(0,0,0,.11)}
+.card .eyebrow{display:inline-flex;padding:7px 10px;border-radius:999px;background:#fff1ef;color:var(--red);border:1px solid #ffd2cd;font-size:11px;font-weight:900;letter-spacing:.09em;text-transform:uppercase}
+.card h2{font-size:44px;line-height:1.02;letter-spacing:-.058em;margin:17px 0 10px}.card>p{font-size:16px;line-height:1.55;color:#5d6671;margin:0}
+.score-row{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin:23px 0}
+.score{position:relative}.score input{position:absolute;opacity:0}
+.score label{display:block;text-align:center;border:1px solid var(--line);border-radius:14px;padding:15px 3px;font-size:23px;font-weight:950}
+.score label span{display:block;font-size:9px;color:#7b8490;margin-top:4px}
+.score input:checked+label{background:#111827;color:#fff;border-color:#111827}.score input:checked+label span{color:#d5dae0}
+.full{width:100%}
+.compare{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:15px}
+.compare-box{border:1px solid var(--line);border-radius:16px;padding:17px}.compare-box span{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#6b7280;font-weight:900}.compare-box b{display:block;font-size:43px;line-height:1;margin-top:5px}
+.compare-box.cal{background:var(--green-soft);border-color:#bde1ca}
+.reason,.ceiling{border-radius:15px;padding:16px;margin-top:11px}.reason{background:var(--green-soft);border:1px solid #bde1ca;color:#315a43}.ceiling{background:var(--amber-soft);border:1px solid #ecd89e;color:#60440c}
+.reason strong,.ceiling strong{display:block;margin-bottom:6px}.reason p,.ceiling p{font-size:14px;line-height:1.5;margin:0}
+.ladder{margin-top:17px}.ladder h3{font-size:17px;margin:0 0 8px}
+.example{border:1px solid var(--line);border-radius:13px;padding:12px;margin-top:8px}.example-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.example-head strong{font-size:13px}.badge{width:32px;height:32px;border-radius:9px;background:#111827;color:#fff;display:grid;place-items:center;font-weight:950}.example p{font-size:12px;line-height:1.45;color:#5f6873;margin:6px 0 0}
+.end-screen{text-align:center}.end-screen .card{max-width:720px}.end-screen h2{font-size:48px}.end-screen p{font-size:17px}
+.end-line{margin-top:18px;padding:16px;border-radius:15px;background:#111827;color:#fff;text-align:left;font-size:14px;line-height:1.55}
+
+@media(max-width:900px){
+  .tray.open .tray-body{grid-template-columns:1fr}
+  #whoTarget{right:32%;top:15px}#annualTarget{right:9%;top:88px}
+  .report-shell{grid-template-columns:72px 1fr}.compare{grid-template-columns:1fr}
+}
+@media(max-width:650px){
+  .intro-card h1,.card h2{font-size:40px}.address{font-size:10px}.stage-label{display:none}
+  #whoTarget{left:50%;right:auto;transform:translateX(-50%);top:22px}
+  #whoTarget:hover{transform:translateX(-50%) scale(1.05)}
+  #annualTarget{left:50%;right:auto;transform:translateX(-50%);top:110px}
+  #annualTarget:hover{transform:translateX(-50%) scale(1.05)}
+  .score-row{gap:5px}.score label{font-size:19px;padding:12px 2px}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="browserbar">
+    <div class="dots"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+    <div class="address" id="address">ksv.org.in</div>
+    <div class="stage-label" id="stageLabel">Actual website</div>
+  </div>
+
+  <main class="stage">
+    <iframe id="sourceFrame" class="source-frame" src="https://www.ksv.org.in/" title="Kalkeri Sangeet Vidyalaya website"></iframe>
+    <div class="fallback" id="fallback">
+      <span>This is Kalkeri’s actual website. Some browsers may prevent a live site from appearing inside another page.</span>
+      <a id="fallbackLink" href="https://www.ksv.org.in/" target="_blank" rel="noopener">Open actual website ↗</a>
+    </div>
+
+    <section class="overlay" id="intro">
+      <div class="dim"></div>
+      <div class="intro-card">
+        <span class="kicker">Practice metric</span>
+        <h1>You are evaluating Alumni Outcomes.</h1>
+        <p><strong>What have former students gone on to achieve?</strong><br>You will use Kalkeri’s actual website and exact annual-report pages. Four factual sentences will be collected. Then you will give only a number.</p>
+        <button class="btn btn-red" id="begin">Begin →</button>
+      </div>
+    </section>
+
+    <section class="overlay hidden" id="whoOverlay">
+      <button class="target" id="whoTarget">
+        <span class="target-label">CLICK “WHO WE ARE”</span>
+      </button>
+    </section>
+
+    <section class="overlay hidden" id="annualOverlay">
+      <button class="target" id="annualTarget">
+        <span class="target-label">CLICK “ANNUAL REPORT”</span>
+      </button>
+    </section>
+
+    <section class="overlay hidden" id="reportOverlay">
+      <div class="dim" style="background:rgba(0,0,0,.42)"></div>
+      <button class="target" id="reportTarget">
+        <span class="target-label">OPEN THE 2020–21 REPORT</span>
+      </button>
+    </section>
+
+    <section class="report-shell hidden" id="reportShell">
+      <div class="report-thumbs">
+        <button class="thumb active" data-step="0">Page 15<br>Higher education</button>
+        <button class="thumb" data-step="1">Page 16–17<br>Sangeeta</button>
+        <button class="thumb" data-step="2">Page 18<br>Prakash</button>
+        <button class="thumb" data-step="3">Page 20<br>Progression</button>
+      </div>
+      <div class="report-stage">
+        <div class="report-toolbar">
+          <div><b id="reportTitle">KSV Annual Report 2020–21 · Page 15</b><span id="reportPrompt">Read the higher-education numbers.</span></div>
+          <a id="pdfOpen" href="https://www.ksv.org.in/wp-content/uploads/2022/02/KSV_AnnualReport_2020-2021_web.pdf#page=15" target="_blank" rel="noopener">Open full PDF ↗</a>
+        </div>
+        <iframe id="pdfFrame" class="pdf-frame" src="https://www.ksv.org.in/wp-content/uploads/2022/02/KSV_AnnualReport_2020-2021_web.pdf#page=15&zoom=page-width" title="KSV annual report"></iframe>
+        <span class="report-circle" id="reportCircle"></span>
+        <span class="report-callout" id="reportCallout">READ THESE NUMBERS</span>
+      </div>
+      <button class="collect" id="collect">Add this evidence →</button>
+    </section>
+
+    <section class="rating-screen hidden" id="ratingScreen">
+      <div class="card">
+        <span class="eyebrow">Your judgement</span>
+        <h2>How would you rate Kalkeri’s Alumni Outcomes?</h2>
+        <p>Use only the four factual sentences collected from the report. Do not score its learning model, residential environment or reputation here.</p>
+        <div class="score-row">
+          <div class="score"><input type="radio" name="rating" id="r1" value="1"><label for="r1">1<span>Minimal</span></label></div>
+          <div class="score"><input type="radio" name="rating" id="r2" value="2"><label for="r2">2<span>Limited</span></label></div>
+          <div class="score"><input type="radio" name="rating" id="r3" value="3"><label for="r3">3<span>Meaningful</span></label></div>
+          <div class="score"><input type="radio" name="rating" id="r4" value="4"><label for="r4">4<span>Strong</span></label></div>
+          <div class="score"><input type="radio" name="rating" id="r5" value="5"><label for="r5">5<span>Benchmark</span></label></div>
+        </div>
+        <button class="btn btn-red full" id="submit">Submit rating</button>
+      </div>
+    </section>
+
+    <section class="calibration-screen hidden" id="calibrationScreen">
+      <div class="card">
+        <div class="compare">
+          <div class="compare-box"><span>Your rating</span><b id="userRating">—</b></div>
+          <div class="compare-box cal"><span>DFP calibration</span><b>4</b></div>
+        </div>
+
+        <div class="reason">
+          <strong>Why Kalkeri receives 4</strong>
+          <p>The evidence goes beyond isolated stories. It shows 65 students in higher education, 10 completions in one year, repeated progression from Class 10 into PUC and from PUC into undergraduate study, and named alumni reaching a master’s degree, teaching and a managerial role at IndusInd Bank.</p>
+        </div>
+
+        <div class="ceiling">
+          <strong>Mandatory ceiling: why this cannot receive 5</strong>
+          <p>A 5 requires broad, repeated and well-documented long-term destinations across multiple alumni cohorts. Kalkeri’s public material gives strong progression numbers and two excellent alumni profiles, but not a complete multi-year college-completion and employment picture across most former students. The score is therefore capped at 4.</p>
+        </div>
+
+        <div class="ladder">
+          <h3>Why not one point lower or higher?</h3>
+          <div class="example"><div class="example-head"><strong>Why not 3?</strong><span class="badge">↑</span></div><p>The evidence includes aggregate numbers, several transition stages and named destinations. It is materially stronger than a few isolated alumni anecdotes.</p></div>
+          <div class="example"><div class="example-head"><strong>Why not 5?</strong><span class="badge">↓</span></div><p>The evidence does not yet provide broad longitudinal outcomes across several graduating cohorts or a comprehensive set of college and employment destinations.</p></div>
+        </div>
+
+        <button class="btn btn-green full" id="finish" style="margin-top:17px">Finish tutorial</button>
+      </div>
+    </section>
+
+    <section class="end-screen hidden" id="endScreen">
+      <div class="card">
+        <span class="eyebrow">Tutorial complete</span>
+        <h2>This is the assessment method.</h2>
+        <p>For the real shortlist, the same sequence is used for every NGO and every dimension: review the required sources, collect a short factual package, apply that dimension’s mandatory ceiling, give the rating, and retain the evidence trail.</p>
+        <div class="end-line"><strong>On similar lines:</strong> Learning Model asks how children are taught or trained. Development Environment asks what sustained support surrounds the child beyond instruction. Each dimension has separate exclusions and mandatory ceilings, so the same claim cannot inflate multiple scores.</div>
+      </div>
+    </section>
+
+    <aside class="tray" id="tray">
+      <div class="tray-head">
+        <div class="tray-title">
+          <div class="counter" id="counter">0/4</div>
+          <div><strong>Alumni Outcomes evidence collected</strong><span>Factual synthesis only. Interpretation appears after your rating.</span></div>
+        </div>
+        <button class="tray-toggle" id="trayToggle">Expand</button>
+      </div>
+      <div class="tray-body" id="trayBody"></div>
+    </aside>
+  </main>
+</div>
+
+<script>
+const SITE_HOME="https://www.ksv.org.in/";
+const ANNUAL_PAGE="https://www.ksv.org.in/who-we-are/annual-report/";
+const PDF="https://www.ksv.org.in/wp-content/uploads/2022/02/KSV_AnnualReport_2020-2021_web.pdf";
+
+const facts=[
+  {
+    title:"Higher-education scale",
+    text:"KSV reported 65 students in higher education: 26 in PUC, 28 in undergraduate programmes, 3 in postgraduate programmes and 8 in vocational training.",
+    source:"Annual Report 2020–21 · Page 15"
+  },
+  {
+    title:"Completion and named academic progression",
+    text:"Ten students completed higher education that year; Sangeeta Chavan completed a master’s in English with 70%, topped her batch and was expected to join KSV as an English teacher.",
+    source:"Annual Report 2020–21 · Pages 16–17"
+  },
+  {
+    title:"Named employment outcome",
+    text:"Prakash Chavan completed a B.Com and an MBA in Finance and Marketing and became a Service Delivery Manager at IndusInd Bank in Bengaluru.",
+    source:"Annual Report 2020–21 · Page 18"
+  },
+  {
+    title:"Repeated transition rates",
+    text:"Fourteen of 15 Class 10 students entered PU college; 85% of students finishing PUC continued to undergraduate study, and 62% completing bachelor’s degrees continued to further study or government-job coaching.",
+    source:"Annual Report 2020–21 · Page 20"
+  }
+];
+
+const reportSteps=[
+  {
+    page:"15",title:"KSV Annual Report 2020–21 · Page 15",prompt:"Read the higher-education numbers.",
+    callout:"READ THESE NUMBERS",circle:{left:"17%",top:"13%",width:"56%",height:"27%"},label:{left:"18%",top:"8%"}
+  },
+  {
+    page:"16",title:"KSV Annual Report 2020–21 · Pages 16–17",prompt:"Read the completion count, then Sangeeta’s progression.",
+    callout:"10 COMPLETIONS + SANGEETA",circle:{left:"8%",top:"10%",width:"82%",height:"45%"},label:{left:"11%",top:"5%"}
+  },
+  {
+    page:"18",title:"KSV Annual Report 2020–21 · Page 18",prompt:"Read Prakash’s qualification and employment destination.",
+    callout:"NAMED EMPLOYMENT OUTCOME",circle:{left:"27%",top:"10%",width:"64%",height:"36%"},label:{left:"30%",top:"5%"}
+  },
+  {
+    page:"20",title:"KSV Annual Report 2020–21 · Page 20",prompt:"Read the three progression rates.",
+    callout:"READ THE TRANSITION RATES",circle:{left:"8%",top:"10%",width:"82%",height:"41%"},label:{left:"11%",top:"5%"}
+  }
+];
+
+let step=0;
+let collected=[false,false,false,false];
+const frame=document.getElementById("sourceFrame");
+const fallbackLink=document.getElementById("fallbackLink");
+const address=document.getElementById("address");
+const stageLabel=document.getElementById("stageLabel");
+const tray=document.getElementById("tray");
+
+function showOnly(id){
+  ["intro","whoOverlay","annualOverlay","reportOverlay","reportShell","ratingScreen","calibrationScreen","endScreen"]
+    .forEach(x=>document.getElementById(x).classList.toggle("hidden",x!==id));
+  document.getElementById("fallback").classList.toggle("hidden",!["intro","whoOverlay","annualOverlay","reportOverlay"].includes(id));
+  tray.classList.toggle("hidden",["intro","calibrationScreen","endScreen"].includes(id));
+}
+
+function renderTray(){
+  const count=collected.filter(Boolean).length;
+  document.getElementById("counter").textContent=`${count}/4`;
+  document.getElementById("trayBody").innerHTML=facts.map((f,i)=>collected[i]
+    ? `<div class="fact"><b>${i+1}. ${f.title}</b><p>${f.text}</p><small>${f.source}</small></div>`
+    : `<div class="fact empty"><b>${i+1}. Evidence not collected yet</b><p>Review the highlighted source page.</p></div>`
+  ).join("");
+}
+
+document.getElementById("trayToggle").onclick=()=>{
+  tray.classList.toggle("open");
+  document.getElementById("trayToggle").textContent=tray.classList.contains("open")?"Collapse":"Expand";
+};
+
+document.getElementById("begin").onclick=()=>{
+  showOnly("whoOverlay");
+};
+
+document.getElementById("whoTarget").onclick=()=>{
+  frame.src=SITE_HOME;
+  address.textContent="ksv.org.in";
+  stageLabel.textContent="Actual website";
+  showOnly("annualOverlay");
+};
+
+document.getElementById("annualTarget").onclick=()=>{
+  frame.src=ANNUAL_PAGE;
+  fallbackLink.href=ANNUAL_PAGE;
+  address.textContent="ksv.org.in/who-we-are/annual-report";
+  setTimeout(()=>showOnly("reportOverlay"),450);
+};
+
+document.getElementById("reportTarget").onclick=()=>{
+  step=0;
+  address.textContent="KSV Annual Report 2020–21";
+  stageLabel.textContent="Exact annual-report evidence";
+  showOnly("reportShell");
+  renderReport();
+};
+
+function renderReport(){
+  const s=reportSteps[step];
+  document.getElementById("reportTitle").textContent=s.title;
+  document.getElementById("reportPrompt").textContent=s.prompt;
+  document.getElementById("pdfFrame").src=`${PDF}#page=${s.page}&zoom=page-width`;
+  document.getElementById("pdfOpen").href=`${PDF}#page=${s.page}`;
+  const circle=document.getElementById("reportCircle");
+  Object.assign(circle.style,s.circle);
+  const label=document.getElementById("reportCallout");
+  label.textContent=s.callout;
+  Object.assign(label.style,s.label);
+  document.querySelectorAll("[data-step]").forEach((b,i)=>b.classList.toggle("active",i===step));
+  document.getElementById("collect").textContent=collected[step]
+    ? (step===3?"Give rating →":"Next source →")
+    : "Add this evidence →";
+  renderTray();
+}
+
+document.querySelectorAll("[data-step]").forEach((b,i)=>b.onclick=()=>{
+  step=i;
+  renderReport();
+});
+
+document.getElementById("collect").onclick=()=>{
+  if(!collected[step]){
+    collected[step]=true;
+    tray.classList.add("open");
+    document.getElementById("trayToggle").textContent="Collapse";
+    renderTray();
+    document.getElementById("collect").textContent=step===3?"Give rating →":"Next source →";
+    return;
+  }
+  if(step<3){
+    step++;
+    renderReport();
+  }else{
+    address.textContent="DFP 2.0 / Alumni Outcomes";
+    stageLabel.textContent="Your rating";
+    showOnly("ratingScreen");
+    tray.classList.add("open");
+    renderTray();
+  }
+};
+
+document.getElementById("submit").onclick=()=>{
+  const selected=document.querySelector('input[name="rating"]:checked');
+  if(!selected){alert("Choose a rating first.");return}
+  document.getElementById("userRating").textContent=selected.value;
+  stageLabel.textContent="DFP calibration";
+  showOnly("calibrationScreen");
+};
+
+document.getElementById("finish").onclick=()=>{
+  stageLabel.textContent="Tutorial complete";
+  showOnly("endScreen");
+};
+
+renderTray();
+</script>
+</body>
+</html>
