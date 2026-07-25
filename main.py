@@ -15,7 +15,7 @@ import io
 import socket
 import tempfile
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, urljoin
@@ -1883,6 +1883,54 @@ SMART_RECHECK_MAX_ROW_SECONDS = max(0.0, float(os.environ.get("SMART_RECHECK_MAX
 SMART_RECHECK_FETCH_RETRY_ATTEMPTS = max(1, int(os.environ.get("SMART_RECHECK_FETCH_RETRY_ATTEMPTS", "2")))
 SMART_RECHECK_FETCH_RETRY_BACKOFF_SEC = max(0.0, float(os.environ.get("SMART_RECHECK_FETCH_RETRY_BACKOFF_SEC", "0.75")))
 SMART_RECHECK_VERIFY_MAX_PAGES = int(os.environ.get("SMART_RECHECK_VERIFY_MAX_PAGES", "7"))
+
+# Fast Recovery is intentionally shallower than Deep Recovery. The Avika stage
+# performs the programme-fit judgement later, so Fast only needs a bounded
+# official-site identity check rather than multi-page deep verification.
+FAST_RECOVERY_MAX_VERIFY_PER_ROW = max(1, int(os.environ.get("FAST_RECOVERY_MAX_VERIFY_PER_ROW", "1")))
+FAST_RECOVERY_VERIFY_MAX_PAGES = max(1, int(os.environ.get("FAST_RECOVERY_VERIFY_MAX_PAGES", "2")))
+FAST_RECOVERY_FETCH_TIMEOUT = max(3, int(os.environ.get("FAST_RECOVERY_FETCH_TIMEOUT", "8")))
+FAST_RECOVERY_HARD_FETCH_DEADLINE_SEC = max(3.0, float(os.environ.get("FAST_RECOVERY_HARD_FETCH_DEADLINE_SEC", "12")))
+FAST_RECOVERY_MAX_ROW_SECONDS = max(10.0, float(os.environ.get("FAST_RECOVERY_MAX_ROW_SECONDS", "45")))
+FAST_RECOVERY_FETCH_RETRY_ATTEMPTS = max(1, int(os.environ.get("FAST_RECOVERY_FETCH_RETRY_ATTEMPTS", "1")))
+_RECOVERY_STRATEGY_STATE = threading.local()
+
+@contextmanager
+def _smart_recovery_strategy(strategy_name: str):
+    previous = getattr(_RECOVERY_STRATEGY_STATE, "strategy", None)
+    _RECOVERY_STRATEGY_STATE.strategy = str(strategy_name or "")
+    try:
+        yield
+    finally:
+        _RECOVERY_STRATEGY_STATE.strategy = previous
+
+
+def _is_fast_recovery_strategy() -> bool:
+    return getattr(_RECOVERY_STRATEGY_STATE, "strategy", "") == "fast"
+
+
+def _strategy_row_deadline(strategy_name: str) -> float:
+    return FAST_RECOVERY_MAX_ROW_SECONDS if str(strategy_name or "") == "fast" else SMART_RECHECK_MAX_ROW_SECONDS
+
+
+def _active_verify_max_pages() -> int:
+    return FAST_RECOVERY_VERIFY_MAX_PAGES if _is_fast_recovery_strategy() else SMART_RECHECK_VERIFY_MAX_PAGES
+
+
+def _active_max_verify_per_row() -> int:
+    return FAST_RECOVERY_MAX_VERIFY_PER_ROW if _is_fast_recovery_strategy() else SMART_RECHECK_MAX_VERIFY_PER_ROW
+
+
+def _active_fetch_timeout() -> int:
+    return FAST_RECOVERY_FETCH_TIMEOUT if _is_fast_recovery_strategy() else SMART_RECHECK_FETCH_TIMEOUT
+
+
+def _active_fetch_hard_deadline() -> float:
+    return FAST_RECOVERY_HARD_FETCH_DEADLINE_SEC if _is_fast_recovery_strategy() else SMART_RECHECK_HARD_FETCH_DEADLINE_SEC
+
+
+def _active_fetch_retry_attempts() -> int:
+    return FAST_RECOVERY_FETCH_RETRY_ATTEMPTS if _is_fast_recovery_strategy() else SMART_RECHECK_FETCH_RETRY_ATTEMPTS
 # Paid fallbacks are opt-in. The production default is Darpan-first Serper-only.
 SMART_RECHECK_USE_BRAVE = os.environ.get("SMART_RECHECK_USE_BRAVE", "false").lower() not in {"0", "false", "no"}
 SMART_RECHECK_USE_FIRECRAWL = os.environ.get("SMART_RECHECK_USE_FIRECRAWL", "false").lower() not in {"0", "false", "no"}
@@ -2713,8 +2761,9 @@ def _smart_process_row_concurrent(row: dict, rd: Path, counter: dict, strategy_n
     try:
         with _provider_run_context(rd.name):
             _raise_if_provider_paused()
-            with _smart_recheck_row_deadline(SMART_RECHECK_MAX_ROW_SECONDS):
-                result = _smart_process_firecrawl_row(row, rd, row_audit, counter) if strategy_name == "firecrawl" else _smart_process_row(row, rd, row_audit, counter)
+            with _smart_recovery_strategy(strategy_name):
+                with _smart_recheck_row_deadline(_strategy_row_deadline(strategy_name)):
+                    result = _smart_process_firecrawl_row(row, rd, row_audit, counter) if strategy_name == "firecrawl" else _smart_process_row(row, rd, row_audit, counter)
         return result, row_audit, 0, 0, ""
     except ProviderPauseRequested:
         raise
@@ -2722,7 +2771,7 @@ def _smart_process_row_concurrent(row: dict, rd: Path, counter: dict, strategy_n
         row_audit.append(_smart_audit(row, {"provider": strategy_name, "pass": "row_watchdog", "query": ""}, decision="row_timeout", note=str(e)[:250]))
         result = _smart_result(
             row, "", "row_timeout", "low", strategy_name, "",
-            f"NGO exceeded the {SMART_RECHECK_MAX_ROW_SECONDS:g}s processing deadline; saved as retryable and continued.",
+            f"NGO exceeded the {_strategy_row_deadline(strategy_name):g}s processing deadline; saved as retryable and continued.",
             "row_watchdog", searched="yes", queries_used=0,
         )
         return result, row_audit, 1, 1, str(e)
@@ -3349,7 +3398,7 @@ def _smart_fetch_page(url: str, allow_firecrawl: bool = True, counter: dict | No
     errors = []
     variants = _smart_fetch_variants(url) or [url]
     for variant_index, candidate in enumerate(variants):
-        attempts = SMART_RECHECK_FETCH_RETRY_ATTEMPTS if variant_index == 0 else 1
+        attempts = _active_fetch_retry_attempts() if variant_index == 0 else 1
         for attempt in range(attempts):
             try:
                 if urlparse(candidate).path.lower().endswith(".pdf"):
@@ -3358,9 +3407,9 @@ def _smart_fetch_page(url: str, allow_firecrawl: bool = True, counter: dict | No
                 final_url, raw = _safe_fetch_text(
                     candidate,
                     headers={"User-Agent": "Mozilla/5.0 DFP2SmartRecovery/4.0"},
-                    timeout=SMART_RECHECK_FETCH_TIMEOUT,
+                    timeout=_active_fetch_timeout(),
                     max_bytes=2_500_000,
-                    hard_deadline_sec=SMART_RECHECK_HARD_FETCH_DEADLINE_SEC,
+                    hard_deadline_sec=_active_fetch_hard_deadline(),
                 )
                 visible = _smart_html_to_text(raw)
                 if visible and not _smart_is_challenge_text(visible):
@@ -3491,7 +3540,8 @@ def _smart_verify_candidate(url: str, row: dict, route: str, evidence_urls: list
             queue.append(u)
 
     raw_by_url = {}
-    while queue and len(page_texts) < min(2, SMART_RECHECK_VERIFY_MAX_PAGES):
+    verify_max_pages = _active_verify_max_pages()
+    while queue and len(page_texts) < min(2, verify_max_pages):
         u = queue.pop(0)
         attempted_urls.append(u)
         final_url, text, raw, err = _smart_fetch_page(u, allow_firecrawl=firecrawl_recovery, counter=counter)
@@ -3539,7 +3589,7 @@ def _smart_verify_candidate(url: str, row: dict, route: str, evidence_urls: list
                 seen_targets.add(candidate); target_urls.append((candidate, False))
 
         for u, discovered in target_urls:
-            if len(page_texts) >= SMART_RECHECK_VERIFY_MAX_PAGES:
+            if len(page_texts) >= verify_max_pages:
                 break
             if any(existing == u for existing, _ in page_texts):
                 continue
@@ -3687,6 +3737,11 @@ def _smart_write_summary(rd: Path, result_rows: list[dict], audit_rows: list[dic
             "SMART_RECHECK_FETCH_RETRY_ATTEMPTS": SMART_RECHECK_FETCH_RETRY_ATTEMPTS,
             "SMART_RECHECK_HARD_FETCH_DEADLINE_SEC": SMART_RECHECK_HARD_FETCH_DEADLINE_SEC,
             "SMART_RECHECK_MAX_ROW_SECONDS": SMART_RECHECK_MAX_ROW_SECONDS,
+            "FAST_RECOVERY_MAX_ROW_SECONDS": FAST_RECOVERY_MAX_ROW_SECONDS,
+            "FAST_RECOVERY_MAX_VERIFY_PER_ROW": FAST_RECOVERY_MAX_VERIFY_PER_ROW,
+            "FAST_RECOVERY_VERIFY_MAX_PAGES": FAST_RECOVERY_VERIFY_MAX_PAGES,
+            "FAST_RECOVERY_FETCH_TIMEOUT": FAST_RECOVERY_FETCH_TIMEOUT,
+            "FAST_RECOVERY_HARD_FETCH_DEADLINE_SEC": FAST_RECOVERY_HARD_FETCH_DEADLINE_SEC,
             "SMART_RECHECK_FUZZY_THRESHOLD": SMART_RECHECK_FUZZY_THRESHOLD,
             "use_brave": SMART_RECHECK_USE_BRAVE, "use_firecrawl": SMART_RECHECK_USE_FIRECRAWL,
             "rename_recovery_enabled": SMART_RECHECK_ENABLE_RENAME_RECOVERY,
@@ -3921,7 +3976,7 @@ def _smart_rename_recovery(row: dict, audit_rows: list[dict], counter: dict) -> 
             else:
                 audit_rows.append(_smart_audit(row, target_qinfo, cand, decision="rejected_bad_domain" if score == -999 else "rejected_weak_match", reject=reject, note=note))
         nominees.sort(key=lambda x: x.get("score", 0), reverse=True)
-        for cand in nominees[:SMART_RECHECK_MAX_VERIFY_PER_ROW]:
+        for cand in nominees[:_active_max_verify_per_row()]:
             verify = _smart_verify_rename_nominee(cand.get("url", ""), row)
             audit_rows.append(_smart_audit(row, target_qinfo, cand, decision="accepted" if verify.get("grade") in {"A","B+"} else "nominated_not_verified", verify=verify))
             if verify.get("grade") in {"A", "B+"}:
@@ -4020,7 +4075,7 @@ def _smart_process_row(row: dict, rd: Path, audit_rows: list[dict], counter: dic
 
             nominees.sort(key=lambda x: x.get("score", 0), reverse=True)
             nominees = _smart_dedupe_nominees(nominees)
-            for cand in nominees[:SMART_RECHECK_MAX_VERIFY_PER_ROW]:
+            for cand in nominees[:_active_max_verify_per_row()]:
                 verify = _smart_verify_candidate(cand.get("url", ""), row, cand.get("route", "direct"), cand.get("evidence_urls"), counter=counter)
                 grade = verify.get("grade", "D")
                 decision = "accepted" if _smart_accepts_automatically(grade) else ("probable" if grade == "B" else "nominated_not_verified")
@@ -4269,60 +4324,49 @@ def _run_smart_recheck_job(run_id: str, cancel_event: threading.Event, strategy_
         )
 
         cursor = 0
-        while cursor < len(search_rows):
-            action = _recheck_control_action(rd, run_id, cancel_event)
-            if action:
-                active_elapsed = active_elapsed_before + (time.time() - session_start)
-                progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
-                summary = _smart_write_summary(rd, result_rows, audit_count, int(counter.get("queries", 0)), first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
-                summary["serper_key_stats"] = _serper_key_stats()
-                run_status = "paused" if action == "pause" else "stopped"
-                stage = "paused" if action == "pause" else "stopped_partial"
-                _write_recheck_status(
-                    rd, ok=True, run_status=run_status, stage=stage,
-                    current_item="Paused safely after the last completed parallel batch." if action == "pause" else "Search ended safely. Partial raw recovery outputs are ready; Avika filtering runs on completion.",
-                    strategy=strategy_name, summary=summary, queries_used=int(counter.get("queries", 0)),
-                    firecrawl_credits_used=counter.get("firecrawl_credits", 0),
-                    downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()},
-                    row_timeouts=row_timeouts, current_item_started_at_epoch=None,
-                    last_progress_at_epoch=last_progress_epoch, concurrency=workers,
-                    serper_key_stats=_serper_key_stats(), **progress,
-                )
-                _job_update(run_id, status=run_status, stage=stage)
-                return
+        inflight: dict = {}
+        requested_action: str | None = None
+        provider_pause_exc: ProviderPauseRequested | None = None
 
-            if strategy_name != "firecrawl" and SMART_RECHECK_MAX_TOTAL_QUERIES and int(counter.get("queries", 0)) >= SMART_RECHECK_MAX_TOTAL_QUERIES:
-                cap_hit = True
-                for rem in search_rows[cursor:]:
-                    if _recheck_identity_key(rem) in processed_keys:
-                        continue
-                    skipped_rows.append(rem)
-                    result = _smart_result(rem, "", "skipped_query_cap", "low", "serper", "", f"run query cap reached at {counter.get('queries', 0)} queries", "", searched="no", queries_used=0)
-                    result_rows.append(result)
-                    processed_keys.add(_recheck_identity_key(result, result_row=True))
-                    _recheck_append_checkpoint(rd, result, [])
-                _smart_write_skipped(rd, skipped_rows)
-                break
+        def submit_available(executor: ThreadPoolExecutor) -> None:
+            nonlocal cursor
+            while (
+                cursor < len(search_rows)
+                and len(inflight) < workers
+                and requested_action is None
+                and provider_pause_exc is None
+            ):
+                row = search_rows[cursor]
+                cursor += 1
+                fut = executor.submit(_smart_process_row_concurrent, row, rd, counter, strategy_name)
+                inflight[fut] = row
 
-            chunk = search_rows[cursor:cursor + workers]
-            cursor += len(chunk)
-            active_elapsed = active_elapsed_before + (time.time() - session_start)
-            progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
-            _write_recheck_status(
-                rd, stage="firecrawl_recovery" if strategy_name == "firecrawl" else "fast_recovery",
-                current_item=f"Processing {len(chunk)} NGOs in parallel", current_search="",
-                queries_used=int(counter.get("queries", 0)), current_item_started_at_epoch=time.time(),
-                row_deadline_seconds=SMART_RECHECK_MAX_ROW_SECONDS, last_progress_at_epoch=last_progress_epoch,
-                row_timeouts=row_timeouts, firecrawl_credits_used=counter.get("firecrawl_credits", 0),
-                strategy=strategy_name, concurrency=workers, serper_key_stats=_serper_key_stats(), **progress,
-            )
+        continuous_started_at = time.time()
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            submit_available(executor)
+            while inflight:
+                if requested_action is None and provider_pause_exc is None:
+                    action = _recheck_control_action(rd, run_id, cancel_event)
+                    if action:
+                        requested_action = action
 
-            with ThreadPoolExecutor(max_workers=len(chunk)) as executor:
-                futures = {executor.submit(_smart_process_row_concurrent, row, rd, counter, strategy_name): row for row in chunk}
+                done, _pending = wait(list(inflight.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
+                if not done:
+                    active_elapsed = active_elapsed_before + (time.time() - session_start)
+                    progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+                    _write_recheck_status(
+                        rd, stage="firecrawl_recovery" if strategy_name == "firecrawl" else "fast_recovery",
+                        current_item=f"Processing {len(inflight)} NGOs continuously in parallel", current_search="",
+                        queries_used=int(counter.get("queries", 0)), current_item_started_at_epoch=continuous_started_at,
+                        row_deadline_seconds=_strategy_row_deadline(strategy_name), last_progress_at_epoch=last_progress_epoch,
+                        row_timeouts=row_timeouts, firecrawl_credits_used=counter.get("firecrawl_credits", 0),
+                        strategy=strategy_name, concurrency=workers, serper_key_stats=_serper_key_stats(), **progress,
+                    )
+                    continue
+
                 completed_batch = []
-                provider_pause_exc: ProviderPauseRequested | None = None
-                for fut in as_completed(futures):
-                    row = futures[fut]
+                for fut in done:
+                    row = inflight.pop(fut)
                     try:
                         result, row_audit, error_inc, timeout_inc, error_message = fut.result()
                         completed_batch.append((row, result, row_audit, error_inc, timeout_inc, error_message))
@@ -4330,43 +4374,87 @@ def _run_smart_recheck_job(run_id: str, cancel_event: threading.Event, strategy_
                         if provider_pause_exc is None:
                             provider_pause_exc = exc
 
-            for row, result, row_audit, error_inc, timeout_inc, error_message in completed_batch:
-                errors += error_inc
-                row_timeouts += timeout_inc
-                if error_message:
-                    _append_recheck_error(rd, f"{row.get('name','')} :: {error_message}")
-                if result.get("Website Status") == "skipped_query_cap":
-                    cap_hit = True
-                    skipped_rows.append(row)
-                result_rows.append(result)
-                processed_keys.add(_recheck_identity_key(result, result_row=True))
-                audit_count += len(row_audit)
-                _recheck_append_checkpoint(rd, result, row_audit)
+                for row, result, row_audit, error_inc, timeout_inc, error_message in completed_batch:
+                    errors += error_inc
+                    row_timeouts += timeout_inc
+                    if error_message:
+                        _append_recheck_error(rd, f"{row.get('name','')} :: {error_message}")
+                    if result.get("Website Status") == "skipped_query_cap":
+                        cap_hit = True
+                        skipped_rows.append(row)
+                    result_rows.append(result)
+                    processed_keys.add(_recheck_identity_key(result, result_row=True))
+                    audit_count += len(row_audit)
+                    _recheck_append_checkpoint(rd, result, row_audit)
 
-            _smart_write_skipped(rd, skipped_rows)
+                _smart_write_skipped(rd, skipped_rows)
+                active_elapsed = active_elapsed_before + (time.time() - session_start)
+                progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+                summary = _smart_write_summary(rd, result_rows, audit_count, int(counter.get("queries", 0)), first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
+                summary["serper_key_stats"] = _serper_key_stats()
+                last_progress_epoch = time.time()
+                _write_recheck_status(
+                    rd, run_status="running", queries_used=int(counter.get("queries", 0)), cap_hit=cap_hit,
+                    summary=summary, errors=errors, row_timeouts=row_timeouts,
+                    current_item=f"Processing {len(inflight)} NGOs continuously in parallel" if inflight else "",
+                    current_item_started_at_epoch=continuous_started_at if inflight else None,
+                    last_completed_item=completed_batch[-1][0].get("name", "") if completed_batch else "",
+                    last_progress_at_epoch=last_progress_epoch, firecrawl_credits_used=counter.get("firecrawl_credits", 0),
+                    strategy=strategy_name, concurrency=workers, serper_key_stats=_serper_key_stats(), **progress,
+                )
+
+                if provider_pause_exc is None and requested_action is None:
+                    if strategy_name != "firecrawl" and SMART_RECHECK_MAX_TOTAL_QUERIES and int(counter.get("queries", 0)) >= SMART_RECHECK_MAX_TOTAL_QUERIES:
+                        cap_hit = True
+                        requested_action = "query_cap"
+                    else:
+                        submit_available(executor)
+
+            # All requests that were already in flight have now settled safely.
+
+        if provider_pause_exc is not None:
             active_elapsed = active_elapsed_before + (time.time() - session_start)
             progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
             summary = _smart_write_summary(rd, result_rows, audit_count, int(counter.get("queries", 0)), first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
             summary["serper_key_stats"] = _serper_key_stats()
-            last_progress_epoch = time.time()
-            _write_recheck_status(
-                rd, run_status="running", queries_used=int(counter.get("queries", 0)), cap_hit=cap_hit,
-                summary=summary, errors=errors, row_timeouts=row_timeouts,
-                current_item="", current_item_started_at_epoch=None,
-                last_completed_item=completed_batch[-1][0].get("name", "") if completed_batch else "",
-                last_progress_at_epoch=last_progress_epoch, firecrawl_credits_used=counter.get("firecrawl_credits", 0),
-                strategy=strategy_name, concurrency=workers, serper_key_stats=_serper_key_stats(), **progress,
+            _pause_recheck_for_provider(
+                rd, run_id, provider_pause_exc, strategy_name=strategy_name, result_rows=result_rows,
+                total=total, active_elapsed=active_elapsed, summary=summary, counter=counter,
+                errors=errors, row_timeouts=row_timeouts, workers=workers,
+                last_progress_epoch=time.time(),
             )
-            if provider_pause_exc is not None:
-                _pause_recheck_for_provider(
-                    rd, run_id, provider_pause_exc, strategy_name=strategy_name, result_rows=result_rows,
-                    total=total, active_elapsed=active_elapsed, summary=summary, counter=counter,
-                    errors=errors, row_timeouts=row_timeouts, workers=workers,
-                    last_progress_epoch=last_progress_epoch,
-                )
-                return
-            if RECHECK_PACE_SEC > 0:
-                time.sleep(min(RECHECK_PACE_SEC, 0.5))
+            return
+
+        if requested_action in {"pause", "stop"}:
+            active_elapsed = active_elapsed_before + (time.time() - session_start)
+            progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+            summary = _smart_write_summary(rd, result_rows, audit_count, int(counter.get("queries", 0)), first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
+            summary["serper_key_stats"] = _serper_key_stats()
+            run_status = "paused" if requested_action == "pause" else "stopped"
+            stage = "paused" if requested_action == "pause" else "stopped_partial"
+            _write_recheck_status(
+                rd, ok=True, run_status=run_status, stage=stage,
+                current_item="Paused safely after active requests settled." if requested_action == "pause" else "Search ended safely. Partial raw recovery outputs are ready; Avika filtering runs on completion.",
+                strategy=strategy_name, summary=summary, queries_used=int(counter.get("queries", 0)),
+                firecrawl_credits_used=counter.get("firecrawl_credits", 0),
+                downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()},
+                row_timeouts=row_timeouts, current_item_started_at_epoch=None,
+                last_progress_at_epoch=time.time(), concurrency=workers,
+                serper_key_stats=_serper_key_stats(), **progress,
+            )
+            _job_update(run_id, status=run_status, stage=stage)
+            return
+
+        if requested_action == "query_cap":
+            for rem in search_rows[cursor:]:
+                if _recheck_identity_key(rem) in processed_keys:
+                    continue
+                skipped_rows.append(rem)
+                result = _smart_result(rem, "", "skipped_query_cap", "low", "serper", "", f"run query cap reached at {counter.get('queries', 0)} queries", "", searched="no", queries_used=0)
+                result_rows.append(result)
+                processed_keys.add(_recheck_identity_key(result, result_row=True))
+                _recheck_append_checkpoint(rd, result, [])
+            _smart_write_skipped(rd, skipped_rows)
 
         active_elapsed = active_elapsed_before + (time.time() - session_start)
         progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
