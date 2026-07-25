@@ -2587,7 +2587,14 @@ def _run_avika_filter_for_recheck(rd: Path, strategy_name: str) -> dict:
         return info
 
     filter_dir = rd / "avika_filter"
-    input_hash = hashlib.sha256(input_path.read_bytes()).hexdigest()
+    filter_signature = json.dumps({
+        "version": "avika_fit_v3_rule_compact",
+        "rule_prefilter": os.environ.get("AVIKA_RULE_PREFILTER", "true"),
+        "classification_only": os.environ.get("AVIKA_CLASSIFICATION_ONLY", "true"),
+        "site_text_chars": os.environ.get("AVIKA_SITE_TEXT_CHARS", "1500"),
+        "max_tokens": os.environ.get("AVIKA_MAX_TOKENS", "80"),
+    }, sort_keys=True).encode("utf-8")
+    input_hash = hashlib.sha256(input_path.read_bytes() + b"\n" + filter_signature).hexdigest()
     signature_path = filter_dir / ".input_sha256"
     previous_hash = signature_path.read_text(encoding="utf-8").strip() if signature_path.exists() else ""
     if previous_hash != input_hash and filter_dir.exists():
@@ -2601,6 +2608,13 @@ def _run_avika_filter_for_recheck(rd: Path, strategy_name: str) -> dict:
     env["DFP_RUN_TYPE"] = "repository"
     env["DFP_PROVIDER_HARD_PAUSE"] = "true"
     env.setdefault("AI_PROFILE_MODE", "batch")
+    # Fast Recovery needs Avika only for yes/maybe/no classification. Obvious
+    # exclusions are removed locally first; no rule can auto-approve a row.
+    env.setdefault("AVIKA_RULE_PREFILTER", "true")
+    env.setdefault("AVIKA_CLASSIFICATION_ONLY", "true")
+    env.setdefault("AVIKA_SITE_TEXT_CHARS", "1500")
+    env.setdefault("AVIKA_MAX_TOKENS", "80")
+    env.setdefault("DFP_FILTER_VERSION", "avika_fit_v3_rule_compact")
     env.setdefault("BULK_SEARCH_CONCURRENCY", str(max(4, min(FAST_RECOVERY_CONCURRENCY, 24))))
     env.setdefault("SERPER_CONCURRENCY_PER_KEY", str(_serper_per_key_concurrency()))
 
@@ -2686,6 +2700,9 @@ def _run_avika_filter_for_recheck(rd: Path, strategy_name: str) -> dict:
         "rejected": int(engine_status.get("rejected") or engine_status.get("rejected_rows") or 0),
         "filter_version": engine_status.get("filter_version", "avika_fit_v2"),
         "result_quality": engine_status.get("result_quality", ""),
+        "prefilter_rejected": int(engine_status.get("prefilter_rejected") or 0),
+        "ai_profiles_expected": int(engine_status.get("ai_profiles_expected") or 0),
+        "avika_classification_only": bool(engine_status.get("avika_classification_only", True)),
         "engine_stage": engine_stage,
     })
     return info

@@ -288,6 +288,13 @@ MAX_RESPONSE_BYTES = int(os.environ.get("MAX_RESPONSE_BYTES", "1500000"))
 SERPER_PACE_SEC  = float(os.environ.get("SERPER_PACE_SEC", "0.20"))    # small gap between searches to stay under limits
 SERPER_QUERIES_PER_NGO = int(os.environ.get("SERPER_QUERIES_PER_NGO", "1"))  # bulk-safe default: one exact query per NGO
 AI_BATCH_SIZE    = int(os.environ.get("AI_BATCH_SIZE", "500"))     # NGOs profiled per AI batch job (keeps batches tidy)
+
+# Avika cost controls. Fast Recovery enables these explicitly in the parent worker.
+# Bulk Discovery keeps its existing rich profile unless these variables are set.
+AVIKA_RULE_PREFILTER = os.environ.get("AVIKA_RULE_PREFILTER", "false").strip().lower() in {"1", "true", "yes", "on"}
+AVIKA_CLASSIFICATION_ONLY = os.environ.get("AVIKA_CLASSIFICATION_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
+AVIKA_SITE_TEXT_CHARS = max(600, int(os.environ.get("AVIKA_SITE_TEXT_CHARS", "1500")))
+AVIKA_MAX_TOKENS = max(48, int(os.environ.get("AVIKA_MAX_TOKENS", "80")))
 # Rapid Mode speed-up: small runs should not wait for Claude Batch queueing.
 # auto = direct for rapid/small runs, batch for bulk.
 AI_PROFILE_MODE = os.environ.get("AI_PROFILE_MODE", "auto").strip().lower()
@@ -379,6 +386,7 @@ def _status_counts(done=None):
         "fetch_failed": 0,
         "search_failed": 0,
         "dropped_not_children": 0,
+        "prefilter_rejected": 0,
         "filtered_rejected": 0,
         "shortlisted": 0,
         "maybe": 0,
@@ -417,6 +425,7 @@ def write_status(stage, message="", *, module="repository", ok=True, total=None,
         "fetch_failed": counts.get("fetch_failed", 0),
         "search_failed": counts.get("search_failed", 0),
         "dropped_not_children": counts.get("dropped_not_children", 0),
+        "prefilter_rejected": counts.get("prefilter_rejected", 0),
         "filtered_rejected": counts.get("filtered_rejected", 0),
         "shortlisted": counts.get("shortlisted", 0),
         "maybe": counts.get("maybe", 0),
@@ -976,6 +985,241 @@ def is_about_children(text, cause_hint=""):
     return True, "ambiguous — kept on purpose"
 
 # ============================================================================
+# 6.5 HIGH-CONFIDENCE AVIKA RULE PREFILTER
+# ----------------------------------------------------------------------------
+# Rejects only obvious non-fits. It never auto-approves an NGO. Ambiguous and
+# plausibly child-focused rows always continue to Haiku.
+# ============================================================================
+
+_AVIKA_WRONG_SOURCE_DOMAINS = {
+    "facebook.com", "instagram.com", "linkedin.com", "youtube.com", "youtu.be",
+    "wikipedia.org", "justdial.com", "indiamart.com", "sulekha.com",
+    "ngosindia.org", "ngo4you.com", "give.do", "globalgiving.org",
+    "guidestarindia.org", "thebetterindia.com", "medium.com", "blogspot.com",
+    "wordpress.com", "google.com", "google.co.in", "maps.google.com",
+}
+
+_AVIKA_CHILD_CORE_TERMS = (
+    "underprivileged child", "underserved child", "vulnerable child", "orphan",
+    "children's home", "childrens home", "child care institution", "cci",
+    "street child", "child labour", "child labor", "school dropout", "dropout child",
+    "government school", "anganwadi", "free education", "free school",
+    "subsidised education", "subsidized education", "low income student",
+    "rural child", "slum child", "special needs child", "children with disabilities",
+    "residential school for", "shelter home for children", "malnutrition",
+    "mid day meal", "mid-day meal", "nutrition for children", "learning centre",
+    "learning center", "bridge school", "remedial education",
+)
+
+_AVIKA_CHILD_PROGRAM_TERMS = (
+    "child", "children", "student", "school", "education", "learning", "orphan",
+    "anganwadi", "adolescent", "youth", "special needs", "disability", "nutrition",
+    "residential", "shelter", "creche", "crèche", "sports for", "arts for",
+)
+
+_AVIKA_EDUCATION_PROGRAM_TERMS = (
+    "school", "education", "learning", "classroom", "teacher", "student",
+    "special education", "vocational training for children", "remedial",
+)
+
+_AVIKA_REASON_LABELS = {
+    "higher_education": "Higher-education or professional-institute identity",
+    "health_only": "Hospital, clinic, medical fundraising, or health-only identity",
+    "elderly_care": "Elderly or senior-citizen care without a child programme",
+    "adult_livelihood_skilling": "Adult livelihood, SHG, farmer, or women-only skilling focus",
+    "spiritual_religious": "Religious or spiritual body without a clear child programme",
+    "cultural_community_association": "Community, caste, cultural, or membership association without a clear child programme",
+    "fee_charging_school_likely": "Clearly private or premium fee-charging school",
+    "wrong_source_or_blog": "Directory, social page, news/blog article, or other non-owned source",
+}
+
+
+def _avika_text(*parts):
+    value = " ".join(str(x or "") for x in parts)
+    value = html.unescape(value).lower()
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _avika_domain(url):
+    try:
+        return (urlparse(str(url or "")).netloc or "").lower().split(":", 1)[0].removeprefix("www.")
+    except Exception:
+        return ""
+
+
+def _contains_any(blob, terms):
+    return any(term in blob for term in terms)
+
+
+def _count_terms(blob, terms):
+    return sum(1 for term in terms if term in blob)
+
+
+def deterministic_avika_exclusion(ngo, website, site_text):
+    """Return an obvious rejection dict, or None when Haiku should decide.
+
+    Rules are deliberately asymmetric: they can reject only high-confidence
+    non-fits and can never shortlist/approve an NGO.
+    """
+    if not AVIKA_RULE_PREFILTER:
+        return None
+
+    name = _avika_text((ngo or {}).get("name", ""))
+    text = _avika_text(site_text)
+    blob = _avika_text(name, text)
+    domain = _avika_domain(website)
+    path = ""
+    try:
+        path = (urlparse(str(website or "")).path or "").lower()
+    except Exception:
+        pass
+
+    child_core = _contains_any(blob, _AVIKA_CHILD_CORE_TERMS)
+    child_program = child_core or _count_terms(blob, _AVIKA_CHILD_PROGRAM_TERMS) >= 2
+    education_program = _contains_any(blob, _AVIKA_EDUCATION_PROGRAM_TERMS)
+
+    if any(domain == d or domain.endswith("." + d) for d in _AVIKA_WRONG_SOURCE_DOMAINS):
+        return {"reason_code": "wrong_source_or_blog", "reason": _AVIKA_REASON_LABELS["wrong_source_or_blog"]}
+    if re.search(r"/(news|article|articles|directory|listing|listings|amp)(/|$)", path) and not child_core:
+        return {"reason_code": "wrong_source_or_blog", "reason": _AVIKA_REASON_LABELS["wrong_source_or_blog"]}
+
+    higher_ed_name = re.search(
+        r"\b(university|degree college|engineering college|medical college|nursing college|law college|"
+        r"polytechnic|pu college|pre university college|institute of technology|management institute|"
+        r"business school|b\.?ed\.? college|pharmacy college|professional college)\b",
+        name,
+    )
+    higher_ed_terms = (
+        "undergraduate", "postgraduate", "bachelor degree", "master degree", "doctoral",
+        "ph.d", "degree programmes", "degree programs", "university affiliation",
+        "campus placements", "placement cell", "admission to courses", "semester",
+    )
+    if higher_ed_name or (_count_terms(text, higher_ed_terms) >= 3 and not child_core):
+        return {"reason_code": "higher_education", "reason": _AVIKA_REASON_LABELS["higher_education"]}
+
+    elderly_terms = (
+        "old age home", "old-age home", "senior citizen home", "elderly care",
+        "geriatric care", "home for the aged", "vriddhashrama", "vridha ashrama",
+    )
+    if _contains_any(blob, elderly_terms) and not child_program:
+        return {"reason_code": "elderly_care", "reason": _AVIKA_REASON_LABELS["elderly_care"]}
+
+    medical_name = re.search(
+        r"\b(hospital|clinic|medical centre|medical center|diagnostic centre|diagnostic center|"
+        r"cancer hospital|eye hospital|nursing home)\b",
+        name,
+    )
+    health_terms = (
+        "outpatient", "inpatient", "surgery", "surgeries", "diagnostic services",
+        "hospital beds", "medical treatment", "patient care", "clinical services",
+        "health camp", "blood donation", "dialysis", "ambulance service",
+    )
+    health_strength = _count_terms(text, health_terms)
+    if (medical_name or health_strength >= 4) and not education_program and not child_core:
+        return {"reason_code": "health_only", "reason": _AVIKA_REASON_LABELS["health_only"]}
+
+    livelihood_terms = (
+        "self help group", "self-help group", "shg", "farmer producer", "farmers",
+        "agriculture training", "dairy farmers", "micro enterprise", "micro-enterprise",
+        "women entrepreneurship", "women livelihood", "adult vocational training",
+        "tailoring for women", "income generation for women", "rural livelihood",
+    )
+    if _count_terms(blob, livelihood_terms) >= 2 and not child_program:
+        return {"reason_code": "adult_livelihood_skilling", "reason": _AVIKA_REASON_LABELS["adult_livelihood_skilling"]}
+
+    religious_name = re.search(
+        r"\b(temple|church|mosque|masjid|dargah|devasthan|mutt|matha|math|ashram|"
+        r"spiritual mission|satsang|gurudwara|religious society)\b",
+        name,
+    )
+    religious_text_terms = (
+        "daily pooja", "daily puja", "religious discourse", "spiritual discourse",
+        "devotees", "pilgrimage", "temple festival", "church ministry", "prayer meeting",
+        "religious activities", "propagation of religion",
+    )
+    if religious_name and _contains_any(text, religious_text_terms) and not child_program:
+        return {"reason_code": "spiritual_religious", "reason": _AVIKA_REASON_LABELS["spiritual_religious"]}
+
+    community_name = re.search(
+        r"\b(community association|welfare association|seva sangha|seva sangh|brahmana sangha|"
+        r"samaja|samaj|caste association|residents association|merchant association|"
+        r"professional association|employees association|youth club)\b",
+        name,
+    )
+    community_terms = (
+        "membership", "members of the community", "community hall", "annual gathering",
+        "cultural festival", "marriage bureau", "association members", "office bearers",
+    )
+    if community_name and _contains_any(text, community_terms) and not child_program:
+        return {"reason_code": "cultural_community_association", "reason": _AVIKA_REASON_LABELS["cultural_community_association"]}
+
+    school_identity = re.search(r"\b(international school|public school|world school|global school|academy)\b", name)
+    fee_terms = (
+        "fee structure", "tuition fee", "annual fee", "admission fee", "apply for admission",
+        "admissions open", "school fees", "transport fee", "hostel fee",
+    )
+    premium_terms = (
+        "international curriculum", "cambridge curriculum", "ib curriculum", "state of the art",
+        "state-of-the-art", "smart classrooms", "air conditioned", "air-conditioned",
+        "world class campus", "premium boarding", "luxury", "cbse", "icse",
+    )
+    explicit_access_terms = (
+        "free education", "no fees", "fully subsidised", "fully subsidized", "low income",
+        "underprivileged", "economically weaker", "scholarship for poor", "rural poor",
+    )
+    if school_identity and _contains_any(text, fee_terms) and _count_terms(text, premium_terms) >= 2 and not _contains_any(text, explicit_access_terms):
+        return {"reason_code": "fee_charging_school_likely", "reason": _AVIKA_REASON_LABELS["fee_charging_school_likely"]}
+
+    return None
+
+
+def compact_avika_evidence(site_text, max_chars=None):
+    """Select high-signal snippets instead of paying to send the whole website."""
+    text = re.sub(r"\s+", " ", html.unescape(str(site_text or ""))).strip()
+    cap = max(600, int(max_chars or AVIKA_SITE_TEXT_CHARS))
+    if len(text) <= cap:
+        return text
+
+    signals = tuple(dict.fromkeys(
+        _AVIKA_CHILD_CORE_TERMS
+        + _AVIKA_CHILD_PROGRAM_TERMS
+        + (
+            "fee", "admission", "college", "university", "hospital", "clinic", "elderly",
+            "senior citizen", "self help group", "farmer", "livelihood", "religious",
+            "spiritual", "community association", "free", "subsid", "government school",
+        )
+    ))
+    sentences = re.split(r"(?<=[.!?])\s+|\s*[|•·]\s*", text)
+    selected = []
+    seen = set()
+
+    def add(part):
+        part = re.sub(r"\s+", " ", str(part or "")).strip()
+        if not part:
+            return
+        key = part.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        selected.append(part)
+
+    add(text[:320])
+    scored = []
+    for idx, sentence in enumerate(sentences):
+        low = sentence.lower()
+        hits = sum(1 for term in signals if term in low)
+        if hits:
+            scored.append((hits, -idx, sentence))
+    for _hits, _neg_idx, sentence in sorted(scored, reverse=True):
+        add(sentence)
+        if len(" ".join(selected)) >= cap:
+            break
+    joined = " ".join(selected)
+    if len(joined) < min(cap, 900):
+        joined = (joined + " " + text[320:cap]).strip()
+    return joined[:cap]
+
+# ============================================================================
 # 7. STAGE 4  —  AI PROFILING via the Message Batches API (Claude Haiku)
 # ----------------------------------------------------------------------------
 #  Batches run on far higher rate limits than a normal loop and cost ~50% less.
@@ -1021,6 +1265,96 @@ Website text:
 ---BEGIN WEBSITE TEXT---
 {text}
 ---END WEBSITE TEXT---'''
+
+COMPACT_PROFILE_PROMPT = '''Classify this Indian NGO for Feeding India's Avika filter. Return JSON only.
+
+YES: vulnerable/underserved children are a core group in an ongoing education, care, residential/shelter, special-needs, government-school/anganwadi, underserved sport/arts/STEM, or food/nutrition programme.
+MAYBE: plausibly relevant but access, fees, programme depth, or evidence is unclear. Thin but plausible child evidence stays maybe.
+NO: private/premium school; higher education/coaching-only; health-only; elderly; adult livelihood/SHG/farmers/women-only skilling; religious/community body; scholarship-only; broad charity with children peripheral; wrong/non-owned source; unrelated/unfinished site.
+
+Return exactly: {{"m":"yes|maybe|no","d":"yes|maybe|no","c":"high|medium|low","r":"code"}}
+m=official-site match; d=Avika decision. r must be one of: child_fit, child_unclear, fees_unclear, private_school, higher_ed, health, elderly, adult_livelihood, religious_community, scholarship_only, broad_peripheral, bad_source, unrelated.
+
+NGO: {name}
+Location: {geo}
+URL: {website}
+Evidence: {text}'''
+
+
+def _compact_reason_text(code):
+    return _AVIKA_REASON_LABELS.get(str(code or "").strip().lower(), str(code or "").replace("_", " ").strip())
+
+
+_COMPACT_REASON_CODE_MAP = {
+    "child_fit": "thin_impact_detail",
+    "child_unclear": "child_program_unclear",
+    "fees_unclear": "fees_unclear",
+    "private_school": "fee_charging_school_likely",
+    "higher_ed": "higher_education",
+    "health": "health_only",
+    "elderly": "elderly_care",
+    "adult_livelihood": "adult_livelihood_skilling",
+    "religious_community": "cultural_community_association",
+    "scholarship_only": "scholarship_prize_only",
+    "broad_peripheral": "broad_charity_children_peripheral",
+    "bad_source": "wrong_source_or_blog",
+    "unrelated": "unrelated",
+}
+
+
+def normalize_avika_profile(profile):
+    if not isinstance(profile, dict):
+        return {"_error": "ai reply was not a JSON object"}
+    if profile.get("_error"):
+        return profile
+    website_match = str(profile.get("official_website_match", profile.get("m", "")) or "").strip().lower()
+    decision = str(profile.get("decision", profile.get("d", "")) or "").strip().lower()
+    confidence = str(profile.get("confidence", profile.get("c", "")) or "").strip().lower()
+    reason_code = str(profile.get("reason_code", profile.get("r", "")) or "").strip().lower()
+    reason_code = _COMPACT_REASON_CODE_MAP.get(reason_code, reason_code)
+    if website_match not in {"yes", "maybe", "no"}:
+        website_match = "maybe"
+    if decision not in {"yes", "maybe", "no"}:
+        return {"_error": "ai decision missing or invalid"}
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "medium"
+    if not reason_code:
+        reason_code = "child_program_unclear" if decision == "maybe" else ("unrelated" if decision == "no" else "thin_impact_detail")
+    normalized = dict(profile)
+    normalized.update({
+        "official_website_match": website_match,
+        "decision": decision,
+        "confidence": confidence,
+        "reason_code": reason_code,
+        "internal_reason": str(profile.get("internal_reason") or _compact_reason_text(reason_code)),
+    })
+    for key, default in {
+        "serves": "", "summary": "", "story": "", "location": "",
+        "digital_presence": "", "partners_found": [], "cause_tags": [],
+    }.items():
+        normalized.setdefault(key, default)
+    return normalized
+
+
+def _ai_prompt_for_item(it):
+    if AVIKA_CLASSIFICATION_ONLY:
+        return COMPACT_PROFILE_PROMPT.format(
+            name=it.get("name", ""),
+            geo=" ".join(x for x in (it.get("district", ""), it.get("state", "")) if x),
+            website=it.get("website", ""),
+            text=compact_avika_evidence(it.get("site_text", ""), AVIKA_SITE_TEXT_CHARS),
+        )
+    return PROFILE_PROMPT.format(
+        name=it.get("name", ""),
+        geo=" ".join(x for x in (it.get("district", ""), it.get("state", "")) if x),
+        text=(it.get("site_text") or "")[:4000],
+    )
+
+
+def _ai_max_tokens():
+    return AVIKA_MAX_TOKENS if AVIKA_CLASSIFICATION_ONLY else 700
+
+
 def build_batch_requests(items):
     reqs = []
     for it in items:
@@ -1028,15 +1362,8 @@ def build_batch_requests(items):
             "custom_id": it["id"],
             "params": {
                 "model": HAIKU_MODEL,
-                "max_tokens": 700,
-                "messages": [{
-                    "role": "user",
-                    "content": PROFILE_PROMPT.format(
-                        name=it["name"],
-                        geo=" ".join(x for x in (it["district"], it["state"]) if x),
-                        text=it["site_text"][:4000],
-                    )
-                }]
+                "max_tokens": _ai_max_tokens(),
+                "messages": [{"role": "user", "content": _ai_prompt_for_item(it)}]
             }
         })
     return reqs
@@ -1127,7 +1454,7 @@ def run_ai_batch(items):
             try:
                 if result.result.type == "succeeded":
                     txt = "".join(blk.text for blk in result.result.message.content if blk.type == "text")
-                    out[cid] = _safe_json(txt)
+                    out[cid] = normalize_avika_profile(_safe_json(txt))
                 else:
                     out[cid] = {"_error": f"ai result {result.result.type}"}
             except Exception as e:
@@ -1137,13 +1464,6 @@ def run_ai_batch(items):
         log_error(batch_id, "Claude batch", "ai_batch_results_read", e)
         write_status("ai_batch_results_read_failed", "Could not read Claude batch results", ok=False, error=e, module="repository", extra={"batch_id": batch_id})
     return out
-
-def _ai_prompt_for_item(it):
-    return PROFILE_PROMPT.format(
-        name=it["name"],
-        geo=" ".join(x for x in (it.get("district", ""), it.get("state", "")) if x),
-        text=(it.get("site_text") or "")[:4000],
-    )
 
 def _anthropic_retry_delay(err, attempt):
     """Return a safe delay for Anthropic direct-call retries.
@@ -1186,11 +1506,11 @@ def _one_direct_ai_profile(it):
         try:
             msg = client.messages.create(
                 model=HAIKU_MODEL,
-                max_tokens=700,
+                max_tokens=_ai_max_tokens(),
                 messages=[{"role": "user", "content": _ai_prompt_for_item(it)}],
             )
             txt = "".join(blk.text for blk in msg.content if getattr(blk, "type", "") == "text")
-            return it["id"], _safe_json(txt)
+            return it["id"], normalize_avika_profile(_safe_json(txt))
         except Exception as e:
             _raise_if_anthropic_capacity_error(e)
             last_err = e
@@ -1295,6 +1615,12 @@ def _search_fetch_one(ngo, total, processed_hint):
         rec["socials"] = socials
         if ferr and not text:
             rec["status"] = "fetch_failed"; rec["note"] = log_error(ngo["id"], ngo["name"], "fetch", ferr)
+            return rec, None
+        exclusion = deterministic_avika_exclusion(ngo, url, text)
+        if exclusion:
+            rec["status"] = "prefilter_rejected"
+            rec["prefilter_reason_code"] = exclusion.get("reason_code", "rule_rejected")
+            rec["note"] = "Rule prefilter: " + exclusion.get("reason", "obvious non-fit")
             return rec, None
         keep, why = is_about_children(text)
         if not keep:
@@ -1461,6 +1787,10 @@ def run():
                 "ai_profiles_expected": ai_expected,
                 "ai_profiles_completed": ai_completed,
                 "ai_profiles_missing": ai_missing,
+                "prefilter_rejected": _status_counts(latest_done).get("prefilter_rejected", 0),
+                "avika_classification_only": AVIKA_CLASSIFICATION_ONLY,
+                "avika_site_text_chars": AVIKA_SITE_TEXT_CHARS,
+                "avika_max_tokens": _ai_max_tokens(),
                 "shortlisted": output_counts.get("shortlisted", 0),
                 "maybe": output_counts.get("maybe", 0),
                 "rejected": output_counts.get("rejected", 0),
@@ -1490,6 +1820,10 @@ def run():
                 "ai_profiles_expected": ai_expected,
                 "ai_profiles_completed": ai_completed,
                 "ai_profiles_missing": ai_missing,
+                "prefilter_rejected": _status_counts(latest_done).get("prefilter_rejected", 0),
+                "avika_classification_only": AVIKA_CLASSIFICATION_ONLY,
+                "avika_site_text_chars": AVIKA_SITE_TEXT_CHARS,
+                "avika_max_tokens": _ai_max_tokens(),
                 "shortlisted": output_counts.get("shortlisted", 0),
                 "maybe": output_counts.get("maybe", 0),
                 "rejected": output_counts.get("rejected", 0),
@@ -1633,6 +1967,10 @@ def _note_for_reviewable(action, code, reason, rec, profile):
 
 def _final_decision_for(ngo, rec, profiles):
     status = rec.get("status", "")
+    if status == "prefilter_rejected":
+        code = rec.get("prefilter_reason_code") or "rule_rejected"
+        reason = rec.get("note", "") or _compact_reason_text(code)
+        return "rejected", code, reason, {}
     if status != "ready_for_ai":
         code = status or "not_processed"
         reason = rec.get("note", "") or status or "not processed"
