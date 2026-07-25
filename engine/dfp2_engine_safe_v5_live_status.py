@@ -46,7 +46,7 @@
 # In Colab, run this line in its own cell first (remove the # ):
 # !pip install anthropic requests tqdm beautifulsoup4 --quiet
 
-import os, re, csv, json, time, html, hashlib, traceback, tempfile
+import os, re, csv, json, time, html, hashlib, traceback, tempfile, threading, sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 import ipaddress, socket
@@ -61,6 +61,81 @@ SERPER_API_KEY    = os.environ.get("SERPER_API_KEY", "").strip()      # from ser
 SERPER_API_KEYS_RAW = os.environ.get("SERPER_API_KEYS", "").strip()   # optional: comma/newline-separated legitimate keys
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()   # from console.anthropic.com / Render env
 
+
+class ProviderPauseRequested(RuntimeError):
+    def __init__(self, provider, reason, *, key_label="", status_code=None, detail=""):
+        self.provider = str(provider or "provider").lower()
+        self.reason = str(reason or "provider_capacity_exhausted")
+        self.key_label = str(key_label or "")
+        self.status_code = status_code
+        self.detail = str(detail or "")[:500]
+        label = f" ({self.key_label})" if self.key_label else ""
+        code = f" HTTP {self.status_code}" if self.status_code is not None else ""
+        super().__init__(f"{self.provider}{label}{code}: {self.reason}. {self.detail}".strip())
+
+
+def _provider_error_reason(status_code, body):
+    low = str(body or "").lower()
+    credit_markers = (
+        "insufficient credit", "insufficient credits", "credits exhausted",
+        "credit balance", "credit_balance", "billing", "payment required",
+        "usage limit reached", "spend limit", "monthly limit", "quota exhausted",
+        "quota exceeded", "not enough credits",
+    )
+    if status_code == 402 or any(marker in low for marker in credit_markers):
+        return "credits_exhausted"
+    if status_code in {401, 403}:
+        return "key_rejected"
+    return "provider_capacity_exhausted"
+
+
+def _anthropic_error_body(err):
+    parts = [str(err or "")]
+    try:
+        response = getattr(err, "response", None)
+        text = getattr(response, "text", None)
+        if text:
+            parts.append(str(text))
+        body = getattr(response, "body", None)
+        if body:
+            parts.append(str(body))
+    except Exception:
+        pass
+    return " | ".join(x for x in parts if x)[:1000]
+
+
+def _anthropic_status_code_safe(err):
+    try:
+        return int(getattr(err, "status_code"))
+    except Exception:
+        pass
+    try:
+        response = getattr(err, "response", None)
+        return int(getattr(response, "status_code"))
+    except Exception:
+        return None
+
+
+def _raise_if_anthropic_capacity_error(err):
+    code = _anthropic_status_code_safe(err)
+    body = _anthropic_error_body(err)
+    low = body.lower()
+    markers = (
+        "credit balance", "credit_balance", "insufficient credit",
+        "credits exhausted", "payment required", "billing",
+        "spend limit", "monthly limit", "usage limit reached",
+        "quota exhausted", "not enough credits",
+    )
+    if code in {401, 402, 403} or any(marker in low for marker in markers):
+        raise ProviderPauseRequested(
+            "anthropic",
+            _provider_error_reason(code, body),
+            key_label=_mask_key(ANTHROPIC_API_KEY),
+            status_code=code,
+            detail=body,
+        ) from err
+
+
 def _serper_keys():
     parts = re.split(r"[,\n\s]+", SERPER_API_KEYS_RAW.strip()) if SERPER_API_KEYS_RAW.strip() else []
     if SERPER_API_KEY:
@@ -74,37 +149,115 @@ def _serper_keys():
 
 _SERPER_KEY_INDEX = 0
 _SERPER_DISABLED_KEYS = set()
+_SERPER_KEY_COOLDOWNS = {}
+_SERPER_KEY_INFLIGHT = {}
+_SERPER_KEY_USAGE = {}
+_SERPER_CONDITION = threading.Condition(threading.Lock())
+
 
 def _mask_key(key):
     return ("..." + key[-6:]) if key and len(key) > 6 else "..."
 
-def _serper_is_key_error(status_code, body):
+
+def _serper_per_key_concurrency():
+    return max(1, int(os.environ.get("SERPER_CONCURRENCY_PER_KEY", "3")))
+
+
+def _serper_429_cooldown_seconds(response=None):
+    default = max(2.0, float(os.environ.get("SERPER_429_COOLDOWN_SEC", "20")))
+    try:
+        return max(default, float((response.headers or {}).get("Retry-After", default)))
+    except Exception:
+        return default
+
+
+def _serper_is_permanent_key_error(status_code, body):
     low = (body or "").lower()
-    if status_code in {401, 402, 403, 429}:
+    if status_code in {401, 402, 403}:
         return True
-    return any(x in low for x in ["quota", "credit", "credits", "limit exceeded", "insufficient", "billing", "payment", "exhausted", "unauthorized", "api key"])
+    permanent_markers = [
+        "insufficient credit", "insufficient credits", "credits exhausted",
+        "credit balance", "billing", "payment required", "invalid api key",
+        "unauthorized", "forbidden",
+    ]
+    return any(x in low for x in permanent_markers)
 
-def _next_serper_key():
-    keys = _serper_keys()
-    if not keys:
-        return None
-    for _ in range(len(keys)):
-        k = keys[_SERPER_KEY_INDEX % len(keys)]
-        if k not in _SERPER_DISABLED_KEYS:
-            return k
-    return None
 
-def _disable_serper_key(key):
+def _lease_serper_key(wait_timeout=30.0):
     global _SERPER_KEY_INDEX
-    _SERPER_DISABLED_KEYS.add(key)
-    keys = _serper_keys()
-    if keys:
-        try:
-            idx = keys.index(key)
-            if idx == (_SERPER_KEY_INDEX % len(keys)):
+    deadline = time.monotonic() + max(1.0, float(wait_timeout or 30.0))
+    with _SERPER_CONDITION:
+        while True:
+            keys = _serper_keys()
+            if not keys:
+                return None
+            now = time.monotonic()
+            limit = _serper_per_key_concurrency()
+            for offset in range(len(keys)):
+                idx = (_SERPER_KEY_INDEX + offset) % len(keys)
+                key = keys[idx]
+                if key in _SERPER_DISABLED_KEYS:
+                    continue
+                if float(_SERPER_KEY_COOLDOWNS.get(key, 0.0)) > now:
+                    continue
+                if int(_SERPER_KEY_INFLIGHT.get(key, 0)) >= limit:
+                    continue
                 _SERPER_KEY_INDEX = (idx + 1) % len(keys)
-        except ValueError:
-            _SERPER_KEY_INDEX = (_SERPER_KEY_INDEX + 1) % len(keys)
+                _SERPER_KEY_INFLIGHT[key] = int(_SERPER_KEY_INFLIGHT.get(key, 0)) + 1
+                _SERPER_KEY_USAGE[key] = int(_SERPER_KEY_USAGE.get(key, 0)) + 1
+                return key
+            live = [k for k in keys if k not in _SERPER_DISABLED_KEYS]
+            if not live:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            next_ready = min([float(_SERPER_KEY_COOLDOWNS.get(k, now)) for k in live] or [now])
+            wait_for = min(0.25, remaining)
+            if next_ready > now:
+                wait_for = min(max(0.05, next_ready - now), remaining)
+            _SERPER_CONDITION.wait(timeout=wait_for)
+
+
+def _release_serper_key(key):
+    if not key:
+        return
+    with _SERPER_CONDITION:
+        _SERPER_KEY_INFLIGHT[key] = max(0, int(_SERPER_KEY_INFLIGHT.get(key, 0)) - 1)
+        _SERPER_CONDITION.notify_all()
+
+
+def _disable_serper_key(key, reason="exhausted_or_invalid"):
+    if not key:
+        return
+    with _SERPER_CONDITION:
+        _SERPER_DISABLED_KEYS.add(key)
+        _SERPER_KEY_COOLDOWNS.pop(key, None)
+        _SERPER_CONDITION.notify_all()
+
+
+def _cooldown_serper_key(key, seconds):
+    if not key:
+        return
+    with _SERPER_CONDITION:
+        _SERPER_KEY_COOLDOWNS[key] = max(float(_SERPER_KEY_COOLDOWNS.get(key, 0.0)), time.monotonic() + max(1.0, float(seconds or 1.0)))
+        _SERPER_CONDITION.notify_all()
+
+
+def _serper_key_stats():
+    now = time.monotonic()
+    with _SERPER_CONDITION:
+        return [
+            {
+                "key": _mask_key(k),
+                "requests_this_run": int(_SERPER_KEY_USAGE.get(k, 0)),
+                "inflight": int(_SERPER_KEY_INFLIGHT.get(k, 0)),
+                "disabled": k in _SERPER_DISABLED_KEYS,
+                "cooldown_seconds": round(max(0.0, float(_SERPER_KEY_COOLDOWNS.get(k, 0.0)) - now), 1),
+            }
+            for k in _serper_keys()
+        ]
+
 
 def _has_serper_keys():
     return bool(_serper_keys())
@@ -140,6 +293,7 @@ AI_BATCH_SIZE    = int(os.environ.get("AI_BATCH_SIZE", "500"))     # NGOs profil
 AI_PROFILE_MODE = os.environ.get("AI_PROFILE_MODE", "auto").strip().lower()
 DIRECT_AI_MAX_ITEMS = int(os.environ.get("DIRECT_AI_MAX_ITEMS", "25"))
 DIRECT_AI_CONCURRENCY = max(1, int(os.environ.get("DIRECT_AI_CONCURRENCY", "1")))
+BULK_SEARCH_CONCURRENCY = max(1, int(os.environ.get("BULK_SEARCH_CONCURRENCY", "16")))
 DFP_RUN_MODE = os.environ.get("DFP_RUN_MODE", "").strip().lower()
 CHECKPOINT_EVERY = 1       # save after every NGO (most crash-proof setting)
 
@@ -577,19 +731,19 @@ def _owned_site_score(name, url, title="", snippet="", source="organic"):
     return -50, "name/domain/title match too weak"
 
 def serper_search(query):
-    """Serper search with bounded retries and optional multi-key failover.
+    """Serper search with concurrent, key-aware rotation and safe failover.
 
-    SERPER_API_KEYS may contain comma/newline-separated legitimate keys. The
-    engine uses the current key until Serper returns a quota/auth/limit-style
-    error, then moves to the next key. One request still uses one Serper credit.
+    Keys are leased round-robin, capped per key, and tracked independently.
+    Exhausted/invalid keys are disabled for the run. HTTP 429 cools down only
+    that key and does not incorrectly treat its remaining credits as zero.
     """
-    global _SERPER_KEY_INDEX
-    delay = 2.0
+    delay = 1.0
     last_err = None
-    for attempt in range(MAX_RETRIES):
-        key = _next_serper_key()
+    attempts = max(MAX_RETRIES, len(_serper_keys()) * 2)
+    for attempt in range(attempts):
+        key = _lease_serper_key(wait_timeout=max(SEARCH_TIMEOUT, 30))
         if not key:
-            return None, "all configured Serper keys failed or appear exhausted"
+            return None, "all configured Serper keys are exhausted, invalid, cooling down, or busy"
         try:
             r = requests.post(
                 "https://google.serper.dev/search",
@@ -599,18 +753,30 @@ def serper_search(query):
             )
             if r.status_code == 200:
                 return r.json().get("organic", []), None
-            body = r.text[:220]
-            if _serper_is_key_error(r.status_code, body):
-                _disable_serper_key(key)
+            body = r.text[:300]
+            if r.status_code == 429:
+                _cooldown_serper_key(key, _serper_429_cooldown_seconds(r))
+                last_err = f"temporary Serper rate limit on {_mask_key(key)}"
                 continue
+            if _serper_is_permanent_key_error(r.status_code, body):
+                _disable_serper_key(key)
+                raise ProviderPauseRequested(
+                    "serper",
+                    _provider_error_reason(r.status_code, body),
+                    key_label=_mask_key(key),
+                    status_code=r.status_code,
+                    detail=body,
+                )
             if r.status_code >= 500:
                 wait = float(r.headers.get("Retry-After", delay))
-                time.sleep(min(wait, 30)); delay *= 2; continue
+                time.sleep(min(wait, 15)); delay = min(delay * 2, 15); continue
             return None, f"serper status {r.status_code}: {body}"
         except requests.RequestException as e:
             last_err = e
-            time.sleep(delay); delay *= 2
-    return None, f"serper failed after {MAX_RETRIES} retries: {last_err}"
+            time.sleep(min(delay, 10)); delay = min(delay * 2, 10)
+        finally:
+            _release_serper_key(key)
+    return None, f"serper failed after bounded retries: {last_err}"
 
 def find_official_site(ngo, total=None, done=None):
     """One exact query by default.
@@ -911,6 +1077,7 @@ def run_ai_batch(items):
             batch_id = batch.id
             checkpoint_ai_batch(sig, batch_id, len(items))
         except Exception as e:
+            _raise_if_anthropic_capacity_error(e)
             for it in items:
                 log_error(it["id"], it["name"], "ai_batch_create", e)
             write_status("ai_batch_create_failed", "Claude batch could not be created", ok=False, error=e, module="repository")
@@ -924,6 +1091,7 @@ def run_ai_batch(items):
             b = client.messages.batches.retrieve(batch_id)
             status = getattr(b, "processing_status", "unknown")
         except Exception as e:
+            _raise_if_anthropic_capacity_error(e)
             write_status("ai_batch_poll_retry", "Temporary error while checking Claude batch", error=e, module="repository", extra={"batch_id": batch_id})
             time.sleep(15)
             if time.time() - start > MAX_BATCH_WAIT_SEC:
@@ -965,6 +1133,7 @@ def run_ai_batch(items):
             except Exception as e:
                 out[cid] = {"_error": f"ai parse: {e}"}
     except Exception as e:
+        _raise_if_anthropic_capacity_error(e)
         log_error(batch_id, "Claude batch", "ai_batch_results_read", e)
         write_status("ai_batch_results_read_failed", "Could not read Claude batch results", ok=False, error=e, module="repository", extra={"batch_id": batch_id})
     return out
@@ -1023,6 +1192,7 @@ def _one_direct_ai_profile(it):
             txt = "".join(blk.text for blk in msg.content if getattr(blk, "type", "") == "text")
             return it["id"], _safe_json(txt)
         except Exception as e:
+            _raise_if_anthropic_capacity_error(e)
             last_err = e
             code = _anthropic_status_code(e)
             delay = _anthropic_retry_delay(e, attempt) if code == 429 else min(2 ** attempt, 12)
@@ -1064,6 +1234,8 @@ def run_ai_direct(items):
             try:
                 ngo_id, profile = fut.result()
                 out[ngo_id] = profile
+            except ProviderPauseRequested:
+                raise
             except Exception as e:
                 log_error(it.get("id", ""), it.get("name", ""), "ai_direct_future", e)
                 out[it["id"]] = {"_error": f"direct ai future failed: {e}"}
@@ -1099,6 +1271,44 @@ def _safe_json(txt):
 # ============================================================================
 # 8. RUN  —  the main loop (search + fetch + filter), checkpointing every NGO
 # ============================================================================
+def _search_fetch_one(ngo, total, processed_hint):
+    rec = {"id": ngo["id"], "name": ngo["name"], "district": ngo["district"],
+           "state": ngo["state"], "status": "", "website": "", "site_text": "",
+           "socials": [], "note": ""}
+    try:
+        write_status("processing_ngo", "Starting NGO row", current_item=ngo["name"], total=total, done=processed_hint)
+        supplied_url = str(ngo.get("website") or "").strip()
+        if supplied_url:
+            url, serr = supplied_url, None
+            rec["note"] = "using verified website supplied by recovery; Serper search skipped"
+        else:
+            url, _organic, serr = find_official_site(ngo, total=total, done=processed_hint)
+        if serr:
+            rec["status"] = "search_failed"; rec["note"] = log_error(ngo["id"], ngo["name"], "search", serr)
+            return rec, None
+        if not url:
+            rec["status"] = "no_official_website"; rec["note"] = "no owned site in results"
+            return rec, None
+        rec["website"] = url
+        write_status("fetching_website", "Fetching official website text", current_item=ngo["name"], current_url=url, total=total, done=processed_hint)
+        text, socials, ferr = fetch_site_text(url)
+        rec["socials"] = socials
+        if ferr and not text:
+            rec["status"] = "fetch_failed"; rec["note"] = log_error(ngo["id"], ngo["name"], "fetch", ferr)
+            return rec, None
+        keep, why = is_about_children(text)
+        if not keep:
+            rec["status"] = "dropped_not_children"; rec["note"] = why
+            return rec, None
+        rec["status"] = "ready_for_ai"; rec["site_text"] = text; rec["note"] = why
+        return rec, {**ngo, "site_text": text, "socials": socials, "website": url}
+    except ProviderPauseRequested:
+        raise
+    except Exception:
+        rec["status"] = "skipped_error"
+        rec["note"] = log_error(ngo["id"], ngo["name"], "loop", traceback.format_exc().splitlines()[-1])
+        return rec, None
+
 def run():
     print("Loading and de-duplicating the list ...")
     write_status("loading_input", "Loading and de-duplicating input CSV by NGO name + district + state", run_status="starting")
@@ -1130,46 +1340,43 @@ def run():
     write_status("input_loaded", f"{len(ngos)} unique NGO+location rows loaded; {duplicate_count} exact duplicate rows skipped; {len(todo)} to process", total=len(ngos), done=len(done), extra={"duplicate_rows_skipped": duplicate_count})
 
     staged = []  # NGOs that passed filters and need AI profiling
-
-    for idx, ngo in enumerate(tqdm(todo, desc="Search + fetch", unit="ngo"), start=1):
-        rec = {"id": ngo["id"], "name": ngo["name"], "district": ngo["district"],
-               "state": ngo["state"], "status": "", "website": "", "site_text": "",
-               "socials": [], "note": ""}
-        try:
-            processed_so_far = len(done) + idx - 1
-            write_status("processing_ngo", "Starting NGO row", current_item=ngo["name"], total=len(ngos), done=processed_so_far)
-            supplied_url = str(ngo.get("website") or "").strip()
-            if supplied_url:
-                url, organic, serr = supplied_url, [], None
-                rec["note"] = "using verified website supplied by advanced recovery; Serper search skipped"
-            else:
-                url, organic, serr = find_official_site(ngo, total=len(ngos), done=processed_so_far)
-            if serr:
-                rec["status"] = "search_failed"; rec["note"] = log_error(ngo["id"], ngo["name"], "search", serr)
-                checkpoint(rec); continue
-            if not url:
-                rec["status"] = "no_official_website"; rec["note"] = "no owned site in results"
-                checkpoint(rec); continue
-            rec["website"] = url
-            write_status("fetching_website", "Fetching official website text", current_item=ngo["name"], current_url=url, total=len(ngos), done=processed_so_far)
-            text, socials, ferr = fetch_site_text(url)
-            rec["socials"] = socials
-            if ferr and not text:
-                rec["status"] = "fetch_failed"; rec["note"] = log_error(ngo["id"], ngo["name"], "fetch", ferr)
-                checkpoint(rec); continue
-            keep, why = is_about_children(text)
-            if not keep:
-                rec["status"] = "dropped_not_children"; rec["note"] = why
-                checkpoint(rec); continue
-            rec["status"] = "ready_for_ai"; rec["site_text"] = text; rec["note"] = why
-            checkpoint(rec)
-            write_status("ready_for_ai", "Official site fetched and kept for AI profiling", current_item=ngo["name"], current_url=url, total=len(ngos), done=processed_so_far + 1)
-            staged.append({**ngo, "site_text": text, "socials": socials, "website": url})
-        except Exception as e:
-            # absolutely never let one NGO stop the run
-            rec["status"] = "skipped_error"
-            rec["note"] = log_error(ngo["id"], ngo["name"], "loop", traceback.format_exc().splitlines()[-1])
-            checkpoint(rec)
+    completed_search_rows = 0
+    workers = min(max(1, BULK_SEARCH_CONCURRENCY), max(1, len(todo)))
+    write_status(
+        "search_fetch_parallel_start",
+        f"Running search/fetch with {workers} concurrent workers",
+        total=len(ngos), done=settled,
+        extra={"bulk_search_concurrency": workers, "serper_key_stats": _serper_key_stats()},
+    )
+    if todo:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_search_fetch_one, ngo, len(ngos), settled + idx): ngo
+                for idx, ngo in enumerate(todo)
+            }
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Search + fetch", unit="ngo"):
+                ngo = futures[fut]
+                try:
+                    rec, staged_item = fut.result()
+                except ProviderPauseRequested:
+                    raise
+                except Exception:
+                    rec = {"id": ngo["id"], "name": ngo["name"], "district": ngo["district"],
+                           "state": ngo["state"], "status": "skipped_error", "website": "",
+                           "site_text": "", "socials": [],
+                           "note": log_error(ngo["id"], ngo["name"], "future", traceback.format_exc().splitlines()[-1])}
+                    staged_item = None
+                checkpoint(rec)
+                if staged_item:
+                    staged.append(staged_item)
+                completed_search_rows += 1
+                write_status(
+                    "search_fetch_parallel",
+                    "Concurrent search/fetch in progress",
+                    current_item=ngo["name"], current_url=rec.get("website", ""),
+                    total=len(ngos), done=settled + completed_search_rows,
+                    extra={"bulk_search_concurrency": workers, "serper_key_stats": _serper_key_stats()},
+                )
 
     # ---- AI profiling in batches. This is now actually resumable. ----
     latest_done = load_done_ids()
@@ -1790,6 +1997,23 @@ if __name__ == "__main__":
     else:
         try:
             run()
+        except ProviderPauseRequested as e:
+            write_status(
+                "provider_credit_exhausted",
+                "Paused because a required provider key/account has no usable capacity. Add credits or replace/fix the key, then Resume the parent recovery run.",
+                ok=True,
+                run_status="paused",
+                error=str(e),
+                extra={
+                    "pause_reason": e.reason,
+                    "paused_provider": e.provider,
+                    "paused_key": e.key_label,
+                    "provider_status_code": e.status_code,
+                    "provider_error_detail": e.detail,
+                },
+            )
+            print(f"Paused safely: {e}")
+            sys.exit(75)
         except Exception as e:
             # Last-resort guard: even catastrophic failures write valid JSON status.
             err = traceback.format_exc().splitlines()[-1]
