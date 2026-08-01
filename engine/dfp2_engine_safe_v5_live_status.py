@@ -57,8 +57,8 @@ from tqdm.auto import tqdm
 # ============================================================================
 # 1. CONFIG  —  the only part you edit
 # ============================================================================
-SERPER_API_KEY    = os.environ.get("SERPER_API_KEY", "").strip()      # from serper.dev / Render env
-SERPER_API_KEYS_RAW = os.environ.get("SERPER_API_KEYS", "").strip()   # optional: comma/newline-separated legitimate keys
+SERPER_API_KEY    = os.environ.get("SERPER_API_KEY", "").strip()      # the one funded serper.dev account
+SERPER_API_KEYS_RAW = os.environ.get("SERPER_API_KEYS", "").strip()   # legacy variable; deliberately ignored
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()   # from console.anthropic.com / Render env
 
 
@@ -137,15 +137,9 @@ def _raise_if_anthropic_capacity_error(err):
 
 
 def _serper_keys():
-    parts = re.split(r"[,\n\s]+", SERPER_API_KEYS_RAW.strip()) if SERPER_API_KEYS_RAW.strip() else []
-    if SERPER_API_KEY:
-        parts.append(SERPER_API_KEY)
-    out, seen = [], set()
-    for k in parts:
-        k = (k or "").strip()
-        if k and k not in seen:
-            out.append(k); seen.add(k)
-    return out
+    # v73/v85 uses one transparent funded account. Old SERPER_API_KEYS pools
+    # are ignored so an expired key cannot silently receive part of a run.
+    return [SERPER_API_KEY] if SERPER_API_KEY else []
 
 _SERPER_KEY_INDEX = 0
 _SERPER_DISABLED_KEYS = set()
@@ -160,7 +154,12 @@ def _mask_key(key):
 
 
 def _serper_per_key_concurrency():
-    return max(1, int(os.environ.get("SERPER_CONCURRENCY_PER_KEY", "3")))
+    raw = os.environ.get("SERPER_CONCURRENCY", os.environ.get("SERPER_CONCURRENCY_PER_KEY", "4"))
+    try:
+        value = int(raw)
+    except Exception:
+        value = 4
+    return max(1, min(value, 8))
 
 
 def _serper_429_cooldown_seconds(response=None):
@@ -740,11 +739,10 @@ def _owned_site_score(name, url, title="", snippet="", source="organic"):
     return -50, "name/domain/title match too weak"
 
 def serper_search(query):
-    """Serper search with concurrent, key-aware rotation and safe failover.
+    """Serper search against the one funded account with bounded retries.
 
-    Keys are leased round-robin, capped per key, and tracked independently.
-    Exhausted/invalid keys are disabled for the run. HTTP 429 cools down only
-    that key and does not incorrectly treat its remaining credits as zero.
+    HTTP 429 cools the account down; permanent credit/key errors pause safely.
+    A provider attempt is separate from the NGO's logical search decision.
     """
     delay = 1.0
     last_err = None
@@ -752,7 +750,7 @@ def serper_search(query):
     for attempt in range(attempts):
         key = _lease_serper_key(wait_timeout=max(SEARCH_TIMEOUT, 30))
         if not key:
-            return None, "all configured Serper keys are exhausted, invalid, cooling down, or busy"
+            return None, "the configured Serper account is exhausted, invalid, cooling down, or busy"
         try:
             r = requests.post(
                 "https://google.serper.dev/search",
@@ -2329,7 +2327,7 @@ def write_donor_lite_output(ngos, done, profiles):
 # ============================================================================
 if __name__ == "__main__":
     if not _has_serper_keys() or not ANTHROPIC_API_KEY:
-        msg = "SERPER_API_KEY or SERPER_API_KEYS, plus ANTHROPIC_API_KEY, must be set in Render environment variables."
+        msg = "SERPER_API_KEY and ANTHROPIC_API_KEY must be set in Railway environment variables."
         write_status("missing_api_keys", msg, ok=False, run_status="blocked", error=msg)
         print("⚠ " + msg)
     else:

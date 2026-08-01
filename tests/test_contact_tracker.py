@@ -35,6 +35,7 @@ def test_final_output_can_send_to_contact_tracker(tmp_path, monkeypatch):
     assert len(rows) == 1
     assert rows[0]["ngo_name"] == "Tracker Test NGO"
     assert rows[0]["contact_status"] == "not_started"
+    assert rows[0]["ngo_id"].startswith("DFP-NGO-")
 
     res2 = main.contact_tracker_update({"region": "Karnataka", "tracker_id": rows[0]["tracker_id"], "contact_status": "connected", "meeting_notes": "Call done."})
     assert res2.status_code == 200

@@ -339,7 +339,7 @@ class DeepEnrichmentRuntime:
                 error="FIRECRAWL_API_KEYS or FIRECRAWL_API_KEY is not configured on the Railway worker",
             )
         if not self.has_serper_keys():
-            return self._json(False, status_code=503, stage="missing_serper_key", error="SERPER_API_KEY or SERPER_API_KEYS is not configured on the Railway worker")
+            return self._json(False, status_code=503, stage="missing_serper_key", error="SERPER_API_KEY is not configured on the Railway worker")
 
         options = self._options(payload.get("options") or {})
         run_id = f"enrich_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"

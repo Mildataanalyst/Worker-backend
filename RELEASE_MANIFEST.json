@@ -1,0 +1,21 @@
+{
+  "service": "DFP 2.0 search worker",
+  "version": "v73",
+  "release_date": "2026-08-01",
+  "railway_ready": true,
+  "features": [
+    "one SERPER_API_KEY only",
+    "Karnataka Recovery",
+    "zero-query recovery",
+    "permanent NGO IDs",
+    "resumable concurrency",
+    "optional selective Firecrawl"
+  ],
+  "tests": {
+    "pytest": "68 passed",
+    "python_compile": "passed"
+  },
+  "notes": [
+    "Set SERPER_CONCURRENCY=4 initially. SERPER_API_KEYS is ignored."
+  ]
+}

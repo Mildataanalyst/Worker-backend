@@ -15,7 +15,7 @@ import io
 import socket
 import tempfile
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, urljoin
@@ -125,7 +125,7 @@ _ANTHROPIC_IMPORT_FAILED = False
 def _get_anthropic():
     """Lazy import Anthropic only when an AI route actually needs it.
 
-    Keeping this out of process startup helps the 512MB Render instance stay alive
+    Keeping this out of process startup helps the 512MB Railway instance stay alive
     for normal lead-pool / PM-review UI actions.
     """
     global anthropic, _ANTHROPIC_IMPORT_FAILED
@@ -144,6 +144,7 @@ def _get_anthropic():
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from ngo_identity import ensure_ngo_id, existing_ngo_id, get_ngo_id
 
 APP_NAME = "DFP 2.0 Backend"
 RUNS_DIR = Path(os.environ.get("RUNS_DIR", "runs")).resolve()
@@ -361,8 +362,8 @@ def _provider_pause_payload(exc: ProviderPauseRequested) -> dict:
 # -----------------------------------------------------------------------------
 # Serper key management
 # -----------------------------------------------------------------------------
-# Multiple keys are rotated concurrently. Exhausted/invalid keys are disabled
-# for the run; HTTP 429 only cools down that one key temporarily.
+# One funded Serper account is used. Exhaustion/invalid credentials pause the
+# run safely; HTTP 429 cools the account down without consuming the NGO query.
 _SERPER_KEY_INDEX = 0
 _SERPER_DISABLED_KEYS: set[str] = set()
 _SERPER_KEY_COOLDOWNS: dict[str, float] = {}
@@ -385,19 +386,14 @@ def _reset_provider_runtime_state(run_id: str) -> None:
 
 
 def _serper_keys() -> list[str]:
-    raw_multi = os.environ.get("SERPER_API_KEYS", "") or ""
-    raw_single = os.environ.get("SERPER_API_KEY", "") or ""
-    parts = re.split(r"[,\n\s]+", raw_multi.strip()) if raw_multi.strip() else []
-    if raw_single.strip():
-        parts.append(raw_single.strip())
-    keys: list[str] = []
-    seen: set[str] = set()
-    for k in parts:
-        k = (k or "").strip()
-        if k and k not in seen:
-            keys.append(k)
-            seen.add(k)
-    return keys
+    """Return the single funded Serper account configured for this deployment.
+
+    SERPER_API_KEYS is deliberately ignored in v73/v85. This prevents an old or
+    unfunded key from silently receiving a share of requests.
+    """
+    key = str(os.environ.get("SERPER_API_KEY", "") or "").strip()
+    return [key] if key else []
+
 
 
 def _has_serper_keys() -> bool:
@@ -410,7 +406,13 @@ def _mask_key(key: str) -> str:
 
 
 def _serper_per_key_concurrency() -> int:
-    return max(1, int(os.environ.get("SERPER_CONCURRENCY_PER_KEY", "3")))
+    """Concurrent requests allowed against the one configured Serper account."""
+    raw = os.environ.get("SERPER_CONCURRENCY", os.environ.get("SERPER_CONCURRENCY_PER_KEY", "4"))
+    try:
+        value = int(raw)
+    except Exception:
+        value = 4
+    return max(1, min(value, 8))
 
 
 def _serper_is_permanent_key_error(status_code: int, body: str) -> bool:
@@ -418,9 +420,9 @@ def _serper_is_permanent_key_error(status_code: int, body: str) -> bool:
     if status_code in {401, 402, 403}:
         return True
     markers = [
-        "insufficient credit", "insufficient credits", "credits exhausted",
-        "credit balance", "billing", "payment required", "invalid api key",
-        "unauthorized", "forbidden",
+        "not enough credit", "not enough credits", "insufficient credit", "insufficient credits",
+        "credits exhausted", "credit balance", "billing", "payment required", "invalid api key",
+        "unauthorized", "forbidden", "quota exceeded", "quota exhausted", "usage limit reached",
     ]
     return any(x in low for x in markers)
 
@@ -506,12 +508,17 @@ def _serper_key_stats() -> list[dict]:
 
 
 def _serper_post(payload: dict, timeout: int = 25) -> dict:
-    """POST to Serper with pooled keys and hard-pause credit safeguards."""
+    """POST to the single Serper account with safe retry semantics.
+
+    A failed provider attempt never consumes the NGO's logical-query budget.
+    Permanent exhaustion pauses the run and preserves all checkpoints.
+    """
     _raise_if_provider_paused()
     if not _has_serper_keys():
-        raise RuntimeError("SERPER_API_KEY or SERPER_API_KEYS must be set")
+        raise RuntimeError("SERPER_API_KEY must be set")
     errors: list[str] = []
-    attempts = max(4, len(_serper_keys()) * 2)
+    attempts = 3
+    last_permanent = None
     for _ in range(attempts):
         _raise_if_provider_paused()
         key = _lease_serper_key(wait_timeout=max(timeout, 30))
@@ -532,14 +539,10 @@ def _serper_post(payload: dict, timeout: int = 25) -> dict:
                 _cooldown_serper_key(key, _serper_429_cooldown(r))
                 continue
             if _serper_is_permanent_key_error(r.status_code, body):
+                last_permanent = (key, r.status_code, body)
                 _disable_serper_key(key)
-                _trigger_provider_pause(
-                    "serper",
-                    _provider_error_reason(r.status_code, body),
-                    key_label=_mask_key(key),
-                    status_code=r.status_code,
-                    detail=body,
-                )
+                # Mark the single account unusable; the run will pause safely after this attempt.
+                continue
             if r.status_code >= 500:
                 time.sleep(min(2.0, float(r.headers.get("Retry-After", 1) or 1)))
                 continue
@@ -551,11 +554,25 @@ def _serper_post(payload: dict, timeout: int = 25) -> dict:
             time.sleep(0.5)
         finally:
             _release_serper_key(key)
+
     _raise_if_provider_paused()
-    raise RuntimeError("Serper keys are temporarily cooling down, busy, or unavailable: " + " | ".join(errors[-6:]))
+    healthy_or_cooling = [
+        stat for stat in _serper_key_stats()
+        if not stat.get("disabled")
+    ]
+    if not healthy_or_cooling and last_permanent:
+        key, status_code, body = last_permanent
+        _trigger_provider_pause(
+            "serper",
+            _provider_error_reason(status_code, body),
+            key_label=_mask_key(key),
+            status_code=status_code,
+            detail=body,
+        )
+    raise RuntimeError("The Serper account is cooling down, busy, or unavailable: " + " | ".join(errors[-8:]))
 
 # CORS: default to local development only. In production, set FRONTEND_ORIGIN
-# or FRONTEND_ORIGINS explicitly, e.g. https://your-vercel-app.vercel.app.
+# or FRONTEND_ORIGINS explicitly, e.g. https://your-frontend.up.railway.app.
 def _cors_origins() -> list[str]:
     raw = os.environ.get("FRONTEND_ORIGINS") or os.environ.get("FRONTEND_ORIGIN") or ""
     if not raw.strip():
@@ -1097,7 +1114,7 @@ def _count_csv_rows(path: Path) -> int:
 
 
 def _save_upload_with_limit(upload: UploadFile, dst: Path, max_bytes: int = MAX_UPLOAD_BYTES) -> int:
-    """Stream upload to disk with a hard byte cap to avoid filling Render disk."""
+    """Stream upload to disk with a hard byte cap to avoid filling Railway disk."""
     total = 0
     with dst.open("wb") as f:
         while True:
@@ -1313,7 +1330,7 @@ def dashboard_get():
 @app.post("/dashboard/update")
 def dashboard_update(payload: dict):
     if not os.environ.get("ADMIN_PASSWORD"):
-        return _json(False, status_code=500, stage="missing_admin_password", error="ADMIN_PASSWORD must be set on Render before publishing progress data")
+        return _json(False, status_code=500, stage="missing_admin_password", error="ADMIN_PASSWORD must be set in Railway Variables before publishing progress data")
     password = str((payload or {}).get("password") or "")
     if password != os.environ.get("ADMIN_PASSWORD"):
         return _json(False, status_code=401, stage="wrong_password", error="Wrong password")
@@ -1335,7 +1352,7 @@ async def start_repository(file: UploadFile = File(...), mode: str = "rapid", ru
     Backward-compatible aliases: test -> rapid, full -> bulk.
     """
     if not _has_serper_keys() or not os.environ.get("ANTHROPIC_API_KEY"):
-        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY or SERPER_API_KEYS, plus ANTHROPIC_API_KEY, must be set on Render")
+        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY, plus ANTHROPIC_API_KEY, must be set in Railway Variables")
 
     active = _active_run_ids()
     if active:
@@ -1453,7 +1470,7 @@ async def start_repository(file: UploadFile = File(...), mode: str = "rapid", ru
     env["DFP_RUN_MODE"] = mode
     env["DFP_RUN_TYPE"] = run_type
     # Rapid Mode should avoid Claude Batch queue time; Bulk Mode keeps Batch API
-    # for cost/rate-limit safety. These can still be overridden in Render env.
+    # for cost/rate-limit safety. These can still be overridden in Railway env.
     if mode == "rapid":
         env.setdefault("AI_PROFILE_MODE", "direct")
     else:
@@ -1883,54 +1900,6 @@ SMART_RECHECK_MAX_ROW_SECONDS = max(0.0, float(os.environ.get("SMART_RECHECK_MAX
 SMART_RECHECK_FETCH_RETRY_ATTEMPTS = max(1, int(os.environ.get("SMART_RECHECK_FETCH_RETRY_ATTEMPTS", "2")))
 SMART_RECHECK_FETCH_RETRY_BACKOFF_SEC = max(0.0, float(os.environ.get("SMART_RECHECK_FETCH_RETRY_BACKOFF_SEC", "0.75")))
 SMART_RECHECK_VERIFY_MAX_PAGES = int(os.environ.get("SMART_RECHECK_VERIFY_MAX_PAGES", "7"))
-
-# Fast Recovery is intentionally shallower than Deep Recovery. The Avika stage
-# performs the programme-fit judgement later, so Fast only needs a bounded
-# official-site identity check rather than multi-page deep verification.
-FAST_RECOVERY_MAX_VERIFY_PER_ROW = max(1, int(os.environ.get("FAST_RECOVERY_MAX_VERIFY_PER_ROW", "1")))
-FAST_RECOVERY_VERIFY_MAX_PAGES = max(1, int(os.environ.get("FAST_RECOVERY_VERIFY_MAX_PAGES", "2")))
-FAST_RECOVERY_FETCH_TIMEOUT = max(3, int(os.environ.get("FAST_RECOVERY_FETCH_TIMEOUT", "8")))
-FAST_RECOVERY_HARD_FETCH_DEADLINE_SEC = max(3.0, float(os.environ.get("FAST_RECOVERY_HARD_FETCH_DEADLINE_SEC", "12")))
-FAST_RECOVERY_MAX_ROW_SECONDS = max(10.0, float(os.environ.get("FAST_RECOVERY_MAX_ROW_SECONDS", "45")))
-FAST_RECOVERY_FETCH_RETRY_ATTEMPTS = max(1, int(os.environ.get("FAST_RECOVERY_FETCH_RETRY_ATTEMPTS", "1")))
-_RECOVERY_STRATEGY_STATE = threading.local()
-
-@contextmanager
-def _smart_recovery_strategy(strategy_name: str):
-    previous = getattr(_RECOVERY_STRATEGY_STATE, "strategy", None)
-    _RECOVERY_STRATEGY_STATE.strategy = str(strategy_name or "")
-    try:
-        yield
-    finally:
-        _RECOVERY_STRATEGY_STATE.strategy = previous
-
-
-def _is_fast_recovery_strategy() -> bool:
-    return getattr(_RECOVERY_STRATEGY_STATE, "strategy", "") == "fast"
-
-
-def _strategy_row_deadline(strategy_name: str) -> float:
-    return FAST_RECOVERY_MAX_ROW_SECONDS if str(strategy_name or "") == "fast" else SMART_RECHECK_MAX_ROW_SECONDS
-
-
-def _active_verify_max_pages() -> int:
-    return FAST_RECOVERY_VERIFY_MAX_PAGES if _is_fast_recovery_strategy() else SMART_RECHECK_VERIFY_MAX_PAGES
-
-
-def _active_max_verify_per_row() -> int:
-    return FAST_RECOVERY_MAX_VERIFY_PER_ROW if _is_fast_recovery_strategy() else SMART_RECHECK_MAX_VERIFY_PER_ROW
-
-
-def _active_fetch_timeout() -> int:
-    return FAST_RECOVERY_FETCH_TIMEOUT if _is_fast_recovery_strategy() else SMART_RECHECK_FETCH_TIMEOUT
-
-
-def _active_fetch_hard_deadline() -> float:
-    return FAST_RECOVERY_HARD_FETCH_DEADLINE_SEC if _is_fast_recovery_strategy() else SMART_RECHECK_HARD_FETCH_DEADLINE_SEC
-
-
-def _active_fetch_retry_attempts() -> int:
-    return FAST_RECOVERY_FETCH_RETRY_ATTEMPTS if _is_fast_recovery_strategy() else SMART_RECHECK_FETCH_RETRY_ATTEMPTS
 # Paid fallbacks are opt-in. The production default is Darpan-first Serper-only.
 SMART_RECHECK_USE_BRAVE = os.environ.get("SMART_RECHECK_USE_BRAVE", "false").lower() not in {"0", "false", "no"}
 SMART_RECHECK_USE_FIRECRAWL = os.environ.get("SMART_RECHECK_USE_FIRECRAWL", "false").lower() not in {"0", "false", "no"}
@@ -2761,9 +2730,8 @@ def _smart_process_row_concurrent(row: dict, rd: Path, counter: dict, strategy_n
     try:
         with _provider_run_context(rd.name):
             _raise_if_provider_paused()
-            with _smart_recovery_strategy(strategy_name):
-                with _smart_recheck_row_deadline(_strategy_row_deadline(strategy_name)):
-                    result = _smart_process_firecrawl_row(row, rd, row_audit, counter) if strategy_name == "firecrawl" else _smart_process_row(row, rd, row_audit, counter)
+            with _smart_recheck_row_deadline(SMART_RECHECK_MAX_ROW_SECONDS):
+                result = _smart_process_firecrawl_row(row, rd, row_audit, counter) if strategy_name == "firecrawl" else _smart_process_row(row, rd, row_audit, counter)
         return result, row_audit, 0, 0, ""
     except ProviderPauseRequested:
         raise
@@ -2771,7 +2739,7 @@ def _smart_process_row_concurrent(row: dict, rd: Path, counter: dict, strategy_n
         row_audit.append(_smart_audit(row, {"provider": strategy_name, "pass": "row_watchdog", "query": ""}, decision="row_timeout", note=str(e)[:250]))
         result = _smart_result(
             row, "", "row_timeout", "low", strategy_name, "",
-            f"NGO exceeded the {_strategy_row_deadline(strategy_name):g}s processing deadline; saved as retryable and continued.",
+            f"NGO exceeded the {SMART_RECHECK_MAX_ROW_SECONDS:g}s processing deadline; saved as retryable and continued.",
             "row_watchdog", searched="yes", queries_used=0,
         )
         return result, row_audit, 1, 1, str(e)
@@ -3398,7 +3366,7 @@ def _smart_fetch_page(url: str, allow_firecrawl: bool = True, counter: dict | No
     errors = []
     variants = _smart_fetch_variants(url) or [url]
     for variant_index, candidate in enumerate(variants):
-        attempts = _active_fetch_retry_attempts() if variant_index == 0 else 1
+        attempts = SMART_RECHECK_FETCH_RETRY_ATTEMPTS if variant_index == 0 else 1
         for attempt in range(attempts):
             try:
                 if urlparse(candidate).path.lower().endswith(".pdf"):
@@ -3407,9 +3375,9 @@ def _smart_fetch_page(url: str, allow_firecrawl: bool = True, counter: dict | No
                 final_url, raw = _safe_fetch_text(
                     candidate,
                     headers={"User-Agent": "Mozilla/5.0 DFP2SmartRecovery/4.0"},
-                    timeout=_active_fetch_timeout(),
+                    timeout=SMART_RECHECK_FETCH_TIMEOUT,
                     max_bytes=2_500_000,
-                    hard_deadline_sec=_active_fetch_hard_deadline(),
+                    hard_deadline_sec=SMART_RECHECK_HARD_FETCH_DEADLINE_SEC,
                 )
                 visible = _smart_html_to_text(raw)
                 if visible and not _smart_is_challenge_text(visible):
@@ -3540,8 +3508,7 @@ def _smart_verify_candidate(url: str, row: dict, route: str, evidence_urls: list
             queue.append(u)
 
     raw_by_url = {}
-    verify_max_pages = _active_verify_max_pages()
-    while queue and len(page_texts) < min(2, verify_max_pages):
+    while queue and len(page_texts) < min(2, SMART_RECHECK_VERIFY_MAX_PAGES):
         u = queue.pop(0)
         attempted_urls.append(u)
         final_url, text, raw, err = _smart_fetch_page(u, allow_firecrawl=firecrawl_recovery, counter=counter)
@@ -3589,7 +3556,7 @@ def _smart_verify_candidate(url: str, row: dict, route: str, evidence_urls: list
                 seen_targets.add(candidate); target_urls.append((candidate, False))
 
         for u, discovered in target_urls:
-            if len(page_texts) >= verify_max_pages:
+            if len(page_texts) >= SMART_RECHECK_VERIFY_MAX_PAGES:
                 break
             if any(existing == u for existing, _ in page_texts):
                 continue
@@ -3737,11 +3704,6 @@ def _smart_write_summary(rd: Path, result_rows: list[dict], audit_rows: list[dic
             "SMART_RECHECK_FETCH_RETRY_ATTEMPTS": SMART_RECHECK_FETCH_RETRY_ATTEMPTS,
             "SMART_RECHECK_HARD_FETCH_DEADLINE_SEC": SMART_RECHECK_HARD_FETCH_DEADLINE_SEC,
             "SMART_RECHECK_MAX_ROW_SECONDS": SMART_RECHECK_MAX_ROW_SECONDS,
-            "FAST_RECOVERY_MAX_ROW_SECONDS": FAST_RECOVERY_MAX_ROW_SECONDS,
-            "FAST_RECOVERY_MAX_VERIFY_PER_ROW": FAST_RECOVERY_MAX_VERIFY_PER_ROW,
-            "FAST_RECOVERY_VERIFY_MAX_PAGES": FAST_RECOVERY_VERIFY_MAX_PAGES,
-            "FAST_RECOVERY_FETCH_TIMEOUT": FAST_RECOVERY_FETCH_TIMEOUT,
-            "FAST_RECOVERY_HARD_FETCH_DEADLINE_SEC": FAST_RECOVERY_HARD_FETCH_DEADLINE_SEC,
             "SMART_RECHECK_FUZZY_THRESHOLD": SMART_RECHECK_FUZZY_THRESHOLD,
             "use_brave": SMART_RECHECK_USE_BRAVE, "use_firecrawl": SMART_RECHECK_USE_FIRECRAWL,
             "rename_recovery_enabled": SMART_RECHECK_ENABLE_RENAME_RECOVERY,
@@ -3976,7 +3938,7 @@ def _smart_rename_recovery(row: dict, audit_rows: list[dict], counter: dict) -> 
             else:
                 audit_rows.append(_smart_audit(row, target_qinfo, cand, decision="rejected_bad_domain" if score == -999 else "rejected_weak_match", reject=reject, note=note))
         nominees.sort(key=lambda x: x.get("score", 0), reverse=True)
-        for cand in nominees[:_active_max_verify_per_row()]:
+        for cand in nominees[:SMART_RECHECK_MAX_VERIFY_PER_ROW]:
             verify = _smart_verify_rename_nominee(cand.get("url", ""), row)
             audit_rows.append(_smart_audit(row, target_qinfo, cand, decision="accepted" if verify.get("grade") in {"A","B+"} else "nominated_not_verified", verify=verify))
             if verify.get("grade") in {"A", "B+"}:
@@ -4075,7 +4037,7 @@ def _smart_process_row(row: dict, rd: Path, audit_rows: list[dict], counter: dic
 
             nominees.sort(key=lambda x: x.get("score", 0), reverse=True)
             nominees = _smart_dedupe_nominees(nominees)
-            for cand in nominees[:_active_max_verify_per_row()]:
+            for cand in nominees[:SMART_RECHECK_MAX_VERIFY_PER_ROW]:
                 verify = _smart_verify_candidate(cand.get("url", ""), row, cand.get("route", "direct"), cand.get("evidence_urls"), counter=counter)
                 grade = verify.get("grade", "D")
                 decision = "accepted" if _smart_accepts_automatically(grade) else ("probable" if grade == "B" else "nominated_not_verified")
@@ -4324,49 +4286,60 @@ def _run_smart_recheck_job(run_id: str, cancel_event: threading.Event, strategy_
         )
 
         cursor = 0
-        inflight: dict = {}
-        requested_action: str | None = None
-        provider_pause_exc: ProviderPauseRequested | None = None
+        while cursor < len(search_rows):
+            action = _recheck_control_action(rd, run_id, cancel_event)
+            if action:
+                active_elapsed = active_elapsed_before + (time.time() - session_start)
+                progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+                summary = _smart_write_summary(rd, result_rows, audit_count, int(counter.get("queries", 0)), first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
+                summary["serper_key_stats"] = _serper_key_stats()
+                run_status = "paused" if action == "pause" else "stopped"
+                stage = "paused" if action == "pause" else "stopped_partial"
+                _write_recheck_status(
+                    rd, ok=True, run_status=run_status, stage=stage,
+                    current_item="Paused safely after the last completed parallel batch." if action == "pause" else "Search ended safely. Partial raw recovery outputs are ready; Avika filtering runs on completion.",
+                    strategy=strategy_name, summary=summary, queries_used=int(counter.get("queries", 0)),
+                    firecrawl_credits_used=counter.get("firecrawl_credits", 0),
+                    downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()},
+                    row_timeouts=row_timeouts, current_item_started_at_epoch=None,
+                    last_progress_at_epoch=last_progress_epoch, concurrency=workers,
+                    serper_key_stats=_serper_key_stats(), **progress,
+                )
+                _job_update(run_id, status=run_status, stage=stage)
+                return
 
-        def submit_available(executor: ThreadPoolExecutor) -> None:
-            nonlocal cursor
-            while (
-                cursor < len(search_rows)
-                and len(inflight) < workers
-                and requested_action is None
-                and provider_pause_exc is None
-            ):
-                row = search_rows[cursor]
-                cursor += 1
-                fut = executor.submit(_smart_process_row_concurrent, row, rd, counter, strategy_name)
-                inflight[fut] = row
+            if strategy_name != "firecrawl" and SMART_RECHECK_MAX_TOTAL_QUERIES and int(counter.get("queries", 0)) >= SMART_RECHECK_MAX_TOTAL_QUERIES:
+                cap_hit = True
+                for rem in search_rows[cursor:]:
+                    if _recheck_identity_key(rem) in processed_keys:
+                        continue
+                    skipped_rows.append(rem)
+                    result = _smart_result(rem, "", "skipped_query_cap", "low", "serper", "", f"run query cap reached at {counter.get('queries', 0)} queries", "", searched="no", queries_used=0)
+                    result_rows.append(result)
+                    processed_keys.add(_recheck_identity_key(result, result_row=True))
+                    _recheck_append_checkpoint(rd, result, [])
+                _smart_write_skipped(rd, skipped_rows)
+                break
 
-        continuous_started_at = time.time()
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            submit_available(executor)
-            while inflight:
-                if requested_action is None and provider_pause_exc is None:
-                    action = _recheck_control_action(rd, run_id, cancel_event)
-                    if action:
-                        requested_action = action
+            chunk = search_rows[cursor:cursor + workers]
+            cursor += len(chunk)
+            active_elapsed = active_elapsed_before + (time.time() - session_start)
+            progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+            _write_recheck_status(
+                rd, stage="firecrawl_recovery" if strategy_name == "firecrawl" else "fast_recovery",
+                current_item=f"Processing {len(chunk)} NGOs in parallel", current_search="",
+                queries_used=int(counter.get("queries", 0)), current_item_started_at_epoch=time.time(),
+                row_deadline_seconds=SMART_RECHECK_MAX_ROW_SECONDS, last_progress_at_epoch=last_progress_epoch,
+                row_timeouts=row_timeouts, firecrawl_credits_used=counter.get("firecrawl_credits", 0),
+                strategy=strategy_name, concurrency=workers, serper_key_stats=_serper_key_stats(), **progress,
+            )
 
-                done, _pending = wait(list(inflight.keys()), timeout=1.0, return_when=FIRST_COMPLETED)
-                if not done:
-                    active_elapsed = active_elapsed_before + (time.time() - session_start)
-                    progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
-                    _write_recheck_status(
-                        rd, stage="firecrawl_recovery" if strategy_name == "firecrawl" else "fast_recovery",
-                        current_item=f"Processing {len(inflight)} NGOs continuously in parallel", current_search="",
-                        queries_used=int(counter.get("queries", 0)), current_item_started_at_epoch=continuous_started_at,
-                        row_deadline_seconds=_strategy_row_deadline(strategy_name), last_progress_at_epoch=last_progress_epoch,
-                        row_timeouts=row_timeouts, firecrawl_credits_used=counter.get("firecrawl_credits", 0),
-                        strategy=strategy_name, concurrency=workers, serper_key_stats=_serper_key_stats(), **progress,
-                    )
-                    continue
-
+            with ThreadPoolExecutor(max_workers=len(chunk)) as executor:
+                futures = {executor.submit(_smart_process_row_concurrent, row, rd, counter, strategy_name): row for row in chunk}
                 completed_batch = []
-                for fut in done:
-                    row = inflight.pop(fut)
+                provider_pause_exc: ProviderPauseRequested | None = None
+                for fut in as_completed(futures):
+                    row = futures[fut]
                     try:
                         result, row_audit, error_inc, timeout_inc, error_message = fut.result()
                         completed_batch.append((row, result, row_audit, error_inc, timeout_inc, error_message))
@@ -4374,87 +4347,43 @@ def _run_smart_recheck_job(run_id: str, cancel_event: threading.Event, strategy_
                         if provider_pause_exc is None:
                             provider_pause_exc = exc
 
-                for row, result, row_audit, error_inc, timeout_inc, error_message in completed_batch:
-                    errors += error_inc
-                    row_timeouts += timeout_inc
-                    if error_message:
-                        _append_recheck_error(rd, f"{row.get('name','')} :: {error_message}")
-                    if result.get("Website Status") == "skipped_query_cap":
-                        cap_hit = True
-                        skipped_rows.append(row)
-                    result_rows.append(result)
-                    processed_keys.add(_recheck_identity_key(result, result_row=True))
-                    audit_count += len(row_audit)
-                    _recheck_append_checkpoint(rd, result, row_audit)
-
-                _smart_write_skipped(rd, skipped_rows)
-                active_elapsed = active_elapsed_before + (time.time() - session_start)
-                progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
-                summary = _smart_write_summary(rd, result_rows, audit_count, int(counter.get("queries", 0)), first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
-                summary["serper_key_stats"] = _serper_key_stats()
-                last_progress_epoch = time.time()
-                _write_recheck_status(
-                    rd, run_status="running", queries_used=int(counter.get("queries", 0)), cap_hit=cap_hit,
-                    summary=summary, errors=errors, row_timeouts=row_timeouts,
-                    current_item=f"Processing {len(inflight)} NGOs continuously in parallel" if inflight else "",
-                    current_item_started_at_epoch=continuous_started_at if inflight else None,
-                    last_completed_item=completed_batch[-1][0].get("name", "") if completed_batch else "",
-                    last_progress_at_epoch=last_progress_epoch, firecrawl_credits_used=counter.get("firecrawl_credits", 0),
-                    strategy=strategy_name, concurrency=workers, serper_key_stats=_serper_key_stats(), **progress,
-                )
-
-                if provider_pause_exc is None and requested_action is None:
-                    if strategy_name != "firecrawl" and SMART_RECHECK_MAX_TOTAL_QUERIES and int(counter.get("queries", 0)) >= SMART_RECHECK_MAX_TOTAL_QUERIES:
-                        cap_hit = True
-                        requested_action = "query_cap"
-                    else:
-                        submit_available(executor)
-
-            # All requests that were already in flight have now settled safely.
-
-        if provider_pause_exc is not None:
-            active_elapsed = active_elapsed_before + (time.time() - session_start)
-            progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
-            summary = _smart_write_summary(rd, result_rows, audit_count, int(counter.get("queries", 0)), first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
-            summary["serper_key_stats"] = _serper_key_stats()
-            _pause_recheck_for_provider(
-                rd, run_id, provider_pause_exc, strategy_name=strategy_name, result_rows=result_rows,
-                total=total, active_elapsed=active_elapsed, summary=summary, counter=counter,
-                errors=errors, row_timeouts=row_timeouts, workers=workers,
-                last_progress_epoch=time.time(),
-            )
-            return
-
-        if requested_action in {"pause", "stop"}:
-            active_elapsed = active_elapsed_before + (time.time() - session_start)
-            progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
-            summary = _smart_write_summary(rd, result_rows, audit_count, int(counter.get("queries", 0)), first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
-            summary["serper_key_stats"] = _serper_key_stats()
-            run_status = "paused" if requested_action == "pause" else "stopped"
-            stage = "paused" if requested_action == "pause" else "stopped_partial"
-            _write_recheck_status(
-                rd, ok=True, run_status=run_status, stage=stage,
-                current_item="Paused safely after active requests settled." if requested_action == "pause" else "Search ended safely. Partial raw recovery outputs are ready; Avika filtering runs on completion.",
-                strategy=strategy_name, summary=summary, queries_used=int(counter.get("queries", 0)),
-                firecrawl_credits_used=counter.get("firecrawl_credits", 0),
-                downloads={kind: (rd / filename).exists() for kind, filename in RECHECK_OUTPUTS.items()},
-                row_timeouts=row_timeouts, current_item_started_at_epoch=None,
-                last_progress_at_epoch=time.time(), concurrency=workers,
-                serper_key_stats=_serper_key_stats(), **progress,
-            )
-            _job_update(run_id, status=run_status, stage=stage)
-            return
-
-        if requested_action == "query_cap":
-            for rem in search_rows[cursor:]:
-                if _recheck_identity_key(rem) in processed_keys:
-                    continue
-                skipped_rows.append(rem)
-                result = _smart_result(rem, "", "skipped_query_cap", "low", "serper", "", f"run query cap reached at {counter.get('queries', 0)} queries", "", searched="no", queries_used=0)
+            for row, result, row_audit, error_inc, timeout_inc, error_message in completed_batch:
+                errors += error_inc
+                row_timeouts += timeout_inc
+                if error_message:
+                    _append_recheck_error(rd, f"{row.get('name','')} :: {error_message}")
+                if result.get("Website Status") == "skipped_query_cap":
+                    cap_hit = True
+                    skipped_rows.append(row)
                 result_rows.append(result)
                 processed_keys.add(_recheck_identity_key(result, result_row=True))
-                _recheck_append_checkpoint(rd, result, [])
+                audit_count += len(row_audit)
+                _recheck_append_checkpoint(rd, result, row_audit)
+
             _smart_write_skipped(rd, skipped_rows)
+            active_elapsed = active_elapsed_before + (time.time() - session_start)
+            progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
+            summary = _smart_write_summary(rd, result_rows, audit_count, int(counter.get("queries", 0)), first_start_ts, cap_hit, prepass, entity_sha, errors, counter)
+            summary["serper_key_stats"] = _serper_key_stats()
+            last_progress_epoch = time.time()
+            _write_recheck_status(
+                rd, run_status="running", queries_used=int(counter.get("queries", 0)), cap_hit=cap_hit,
+                summary=summary, errors=errors, row_timeouts=row_timeouts,
+                current_item="", current_item_started_at_epoch=None,
+                last_completed_item=completed_batch[-1][0].get("name", "") if completed_batch else "",
+                last_progress_at_epoch=last_progress_epoch, firecrawl_credits_used=counter.get("firecrawl_credits", 0),
+                strategy=strategy_name, concurrency=workers, serper_key_stats=_serper_key_stats(), **progress,
+            )
+            if provider_pause_exc is not None:
+                _pause_recheck_for_provider(
+                    rd, run_id, provider_pause_exc, strategy_name=strategy_name, result_rows=result_rows,
+                    total=total, active_elapsed=active_elapsed, summary=summary, counter=counter,
+                    errors=errors, row_timeouts=row_timeouts, workers=workers,
+                    last_progress_epoch=last_progress_epoch,
+                )
+                return
+            if RECHECK_PACE_SEC > 0:
+                time.sleep(min(RECHECK_PACE_SEC, 0.5))
 
         active_elapsed = active_elapsed_before + (time.time() - session_start)
         progress = _recheck_progress_payload(len(result_rows), total, active_elapsed)
@@ -4554,9 +4483,9 @@ async def recheck_start(file: UploadFile = File(...), strategy: str = "smart"):
     if strategy not in {"classic", "smart", "fast", "deep", "firecrawl"}:
         return _json(False, status_code=400, stage="bad_strategy", error="strategy must be classic, smart, fast, deep or firecrawl")
     if strategy == "classic" and not _has_serper_keys():
-        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY or SERPER_API_KEYS must be set")
+        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY must be set")
     if strategy in {"smart", "fast", "deep"} and not (_has_serper_keys() or (_has_brave_key() and SMART_RECHECK_USE_BRAVE)):
-        return _json(False, status_code=500, stage="missing_env", error="Configure SERPER_API_KEY(S). Brave is optional and disabled by default.")
+        return _json(False, status_code=500, stage="missing_env", error="Configure SERPER_API_KEY. Brave is optional and disabled by default.")
     if strategy == "firecrawl" and (not SMART_RECHECK_USE_FIRECRAWL or not _smart_firecrawl_keys()):
         return _json(False, status_code=503, stage="firecrawl_not_configured", error="Firecrawl recovery requires SMART_RECHECK_USE_FIRECRAWL=true and FIRECRAWL_API_KEY(S)")
     active = [rid for rid, th in list(recheck_threads.items()) if th.is_alive()]
@@ -5332,7 +5261,7 @@ def _run_presence_job(run_id: str, cancel_event: threading.Event):
 @app.post("/repository/presence/start")
 async def presence_start(file: UploadFile = File(...)):
     if not _has_serper_keys():
-        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY or SERPER_API_KEYS must be set on Render")
+        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY must be set in Railway Variables")
     active = [rid for rid, th in list(presence_threads.items()) if th.is_alive()]
     if active:
         return _json(False, status_code=409, stage="another_presence_check_active", error="Another NGO presence check is already active", active_runs=active)
@@ -5768,7 +5697,7 @@ def story_start(state: str, district: str):
     if not state.strip() or not district.strip():
         return _json(False, status_code=400, stage="missing_location", error="State and district are required")
     if not _has_serper_keys():
-        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY or SERPER_API_KEYS must be set on Render")
+        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY must be set in Railway Variables")
     # Anthropic is preferred. If missing, the module still runs with lower-quality fallback rows.
     active_story = [rid for rid, th in list(story_threads.items()) if th.is_alive()]
     if active_story:
@@ -6140,7 +6069,7 @@ WEAK_SOURCE_DOMAINS = [
 
 # Search-level garbage blocking. This prevents Serper credits being wasted on
 # predictable source noise that we already know should not enter the main output.
-# Can be overridden from Render if needed. Keep as a single Google-compatible
+# Can be overridden from Railway if needed. Keep as a single Google-compatible
 # string so the query preview shows exactly what will be searched.
 DISCOVERY_QUERY_NEGATIVE_FILTERS = os.environ.get(
     "DISCOVERY_QUERY_NEGATIVE_FILTERS",
@@ -7667,7 +7596,7 @@ def discovery_start(state: str, pathways: str = "", budget: int = DISCOVERY_DEFA
     if not state.strip():
         return _json(False, status_code=400, stage="missing_state", error="State is required")
     if not _has_serper_keys():
-        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY or SERPER_API_KEYS must be set on Render")
+        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY must be set in Railway Variables")
     active_story = [rid for rid, th in list(story_threads.items()) if th.is_alive()]
     if active_story:
         return _json(False, status_code=409, stage="another_discovery_run_active", error="Another discovery run is already active", active_runs=active_story)
@@ -7765,7 +7694,7 @@ def story_state_start(state: str, categories: str = "", budget: int = STORY_STAT
     if not state.strip():
         return _json(False, status_code=400, stage="missing_state", error="State is required")
     if not _has_serper_keys():
-        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY or SERPER_API_KEYS must be set on Render")
+        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY must be set in Railway Variables")
     active_story = [rid for rid, th in list(story_threads.items()) if th.is_alive()]
     if active_story:
         return _json(False, status_code=409, stage="another_story_run_active", error="Another Story Discovery run is already active", active_runs=active_story)
@@ -7835,9 +7764,28 @@ def _default_workstream_payload():
     }
 
 
+def _ensure_workstream_ngo_ids(data: dict) -> tuple[bool, int]:
+    changed = False
+    count = 0
+    for pm_name, pm in (data.get("pms") or {}).items():
+        tasks = pm.get("tasks") if isinstance(pm, dict) else None
+        if not isinstance(tasks, list):
+            continue
+        for idx, task in enumerate(tasks):
+            if not isinstance(task, dict):
+                continue
+            ngo_id = get_ngo_id(task, context=f"workstream:{pm_name}:{idx}")
+            if str(task.get("ngo_id") or "").strip() != ngo_id:
+                task["ngo_id"] = ngo_id
+                changed = True
+            count += 1
+    return changed, count
+
+
 def _read_workstream_payload():
     if not WORKSTREAM_DATA_FILE.exists():
         data = _default_workstream_payload()
+        _ensure_workstream_ngo_ids(data)
         _atomic_write_text(WORKSTREAM_DATA_FILE, json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return data
     try:
@@ -7865,10 +7813,14 @@ def _read_workstream_payload():
             cur["tasks"] = default_pm["tasks"]
         if not isinstance(cur.get("responses"), dict):
             cur["responses"] = {}
+    ngo_ids_changed, _ = _ensure_workstream_ngo_ids(data)
+    if ngo_ids_changed:
+        _atomic_write_text(WORKSTREAM_DATA_FILE, json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return data
 
 
 def _write_workstream_payload(data: dict):
+    _ensure_workstream_ngo_ids(data)
     data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     _atomic_write_text(WORKSTREAM_DATA_FILE, json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return data
@@ -7876,7 +7828,7 @@ def _write_workstream_payload(data: dict):
 
 def _workstream_check_admin(payload: dict):
     if not os.environ.get("ADMIN_PASSWORD"):
-        raise HTTPException(status_code=500, detail="ADMIN_PASSWORD must be set on Render")
+        raise HTTPException(status_code=500, detail="ADMIN_PASSWORD must be set in Railway Variables")
     password = str((payload or {}).get("password") or "")
     if password != os.environ.get("ADMIN_PASSWORD"):
         raise HTTPException(status_code=401, detail="Wrong password")
@@ -8129,6 +8081,7 @@ def _workstream_rows(data: dict, only_global: bool = False):
                 "pm": pm_name,
                 "task_type": pm.get("task_type", "shortlisting"),
                 "task_index": i,
+                "ngo_id": task.get("ngo_id") or get_ngo_id(task, context=f"workstream-row:{pm_name}:{i}"),
                 "ngo_name": task.get("ngo_name") or task.get("name") or "",
                 "website": task.get("website") or "",
                 "background": task.get("background") or "",
@@ -8590,7 +8543,7 @@ def workstream_ai_review(payload: dict):
 def workstream_export_csv(global_only: bool = False):
     data = _read_workstream_payload()
     rows = _workstream_rows(data, only_global=global_only)
-    headers = ["pm", "task_type", "task_index", "ngo_name", "website", "background", "decision", "rank", "rank_label", "reason", "ngo_description", "contact_number", "referral_source", "referral_poc", "submitted_at", "global_saved", "global_saved_at", "deadline"]
+    headers = ["pm", "task_type", "task_index", "ngo_id", "ngo_name", "website", "background", "decision", "rank", "rank_label", "reason", "ngo_description", "contact_number", "referral_source", "referral_poc", "submitted_at", "global_saved", "global_saved_at", "deadline"]
     import io
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
@@ -8611,7 +8564,8 @@ WORKSPACES_DIR = RUNS_DIR / "workspaces"
 WORKSPACES_DIR.mkdir(parents=True, exist_ok=True)
 
 LEAD_POOL_HEADERS = [
-    "lead_id", "region", "district", "ngo_name", "normalized_name", "website",
+    "lead_id", "ngo_id", "source_record_id", "darpan_id", "registration_reference",
+    "registered_address", "pincode", "region", "district", "ngo_name", "normalized_name", "website",
     "phone", "email", "source_type", "source_mix", "source_run", "source_run_date",
     "referred_by", "contact_number", "notes", "one_line_understanding",
     "background_summary", "evidence_summary", "confidence", "status", "information_status",
@@ -8660,6 +8614,13 @@ def _normalise_lead_name(value: str) -> str:
 
 
 def _lead_key(row: dict) -> str:
+    ngo_id = existing_ngo_id(row) or str(row.get("ngo_id") or "").strip().upper()
+    if ngo_id:
+        return f"ngo:{ngo_id}"
+    for field, prefix in (("darpan_id", "darpan"), ("registration_reference", "registration"), ("source_record_id", "source")):
+        value = str(row.get(field) or "").strip().lower()
+        if value:
+            return f"{prefix}:{value}"
     name = _normalise_lead_name(row.get("ngo_name") or row.get("name") or row.get("Organisation") or row.get("NGO Name") or "")
     district = str(row.get("district") or row.get("District") or row.get("Location") or "").strip().lower()
     website = str(row.get("website") or row.get("Website") or row.get("url") or "").strip().lower()
@@ -8673,13 +8634,24 @@ def _lead_key(row: dict) -> str:
     return f"name:{name}|district:{district}"
 
 
+
 def _read_lead_pool(region: str) -> list[dict]:
     path = _lead_pool_path(region)
     if not path.exists():
         return []
     with _LEAD_POOL_LOCK:
         with path.open("r", encoding="utf-8-sig", newline="") as f:
-            return list(csv.DictReader(f))
+            rows = list(csv.DictReader(f))
+    changed = False
+    for idx, row in enumerate(rows):
+        ngo_id = get_ngo_id(row, context=f"lead-pool:{region}:{idx}")
+        if str(row.get("ngo_id") or "").strip() != ngo_id:
+            row["ngo_id"] = ngo_id
+            changed = True
+    if changed:
+        _write_lead_pool(region, rows)
+    return rows
+
 
 
 def _write_lead_pool(region: str, rows: list[dict]) -> None:
@@ -8805,8 +8777,15 @@ def _lead_from_any(row: dict, region: str, source_type: str = "") -> dict:
     if curation_status not in LEAD_POOL_CURATION_STATUSES:
         curation_status = "pending_review"
     contact_number = _coalesce(row.get("contact_number"), row.get("Contact Number"), row.get("phone"), row.get("Phone"), "")
-    return {
-        "lead_id": str(row.get("lead_id") or uuid.uuid4().hex[:12]),
+    incoming_lead_id = str(row.get("lead_id") or "").strip()
+    lead_id = incoming_lead_id or uuid.uuid4().hex[:12]
+    payload = {
+        "lead_id": lead_id,
+        "source_record_id": _coalesce(row.get("source_record_id"), row.get("Source Record ID"), ""),
+        "darpan_id": _coalesce(row.get("darpan_id"), row.get("Darpan ID"), row.get("NGO Darpan ID"), ""),
+        "registration_reference": _coalesce(row.get("registration_reference"), row.get("Registration Reference"), row.get("Registration Number"), ""),
+        "registered_address": _coalesce(row.get("registered_address"), row.get("Registered Address"), row.get("Address"), ""),
+        "pincode": _coalesce(row.get("pincode"), row.get("Pincode"), row.get("PIN Code"), ""),
         "region": _coalesce(row.get("region"), row.get("State"), row.get("state"), region),
         "district": district,
         "ngo_name": name,
@@ -8844,6 +8823,13 @@ def _lead_from_any(row: dict, region: str, source_type: str = "") -> dict:
         "created_at": _coalesce(row.get("created_at"), now_s),
         "updated_at": now_s,
     }
+    # Existing IDs are preserved; a new random lead_id is not used as the NGO seed.
+    identity_payload = {**row, **payload}
+    if not incoming_lead_id:
+        identity_payload.pop("lead_id", None)
+    payload["ngo_id"] = get_ngo_id(identity_payload, context=f"lead:{region}:{name}:{district}")
+    return payload
+
 
 
 def _merge_source(existing: str, incoming: str) -> str:
@@ -8881,6 +8867,7 @@ def _merge_lead(existing: dict, incoming: dict) -> dict:
         out["curation_status"] = incoming.get("curation_status") or "pending_review"
     if not out.get("ranking_status"):
         out["ranking_status"] = incoming.get("ranking_status") or "Not Sent"
+    out["ngo_id"] = existing_ngo_id(out) or existing_ngo_id(incoming) or get_ngo_id(out, context=f"merged-lead:{out.get('lead_id', '')}")
     return out
 
 
@@ -9385,10 +9372,14 @@ def workspace_send_to_ranking(region: str, payload: dict | None = None):
             f"Shortlisting comment: {shortlist_comment}" if shortlist_comment else "",
         ]
         return {
+            "ngo_id": row.get("ngo_id") or get_ngo_id(row, context=f"ranking-task:{row.get('lead_id', '')}"),
             "ngo_name": row.get("ngo_name") or "Untitled NGO",
             "website": row.get("website") or "",
             "background": " | ".join([p for p in background_parts if p]),
             "lead_id": row.get("lead_id") or "",
+            "source_record_id": row.get("source_record_id") or "",
+            "darpan_id": row.get("darpan_id") or "",
+            "registration_reference": row.get("registration_reference") or "",
             "source_mix": row.get("source_mix") or row.get("source_type") or source,
             "source_tag": source,
             "shortlisting_comment": shortlist_comment,
@@ -9533,7 +9524,7 @@ def ranking_final_summary():
 # -----------------------------------------------------------------------------
 
 CONTACT_TRACKER_HEADERS = [
-    "tracker_id", "region", "ngo_ref", "lead_id", "ngo_name", "district", "final_rank",
+    "tracker_id", "region", "ngo_ref", "ngo_id", "lead_id", "ngo_name", "district", "final_rank",
     "final_bucket", "website", "source_mix", "poc_name", "contact_number", "referred_by",
     "contact_status", "outreach_owner", "meeting_date", "meeting_time", "meeting_notes",
     "next_follow_up_date", "tracker_comment", "pm_reviewer", "pm_rating", "pm_comment",
@@ -9566,7 +9557,17 @@ def _read_contact_tracker(region: str) -> list[dict]:
         return []
     with _CONTACT_TRACKER_LOCK:
         with path.open("r", encoding="utf-8-sig", newline="") as f:
-            return list(csv.DictReader(f))
+            rows = list(csv.DictReader(f))
+    changed = False
+    for idx, row in enumerate(rows):
+        ngo_id = get_ngo_id(row, context=f"contact-tracker:{region}:{idx}")
+        if str(row.get("ngo_id") or "").strip() != ngo_id:
+            row["ngo_id"] = ngo_id
+            changed = True
+    if changed:
+        _write_contact_tracker(region, rows)
+    return rows
+
 
 
 def _write_contact_tracker(region: str, rows: list[dict]) -> None:
@@ -9651,6 +9652,7 @@ def _final_rows_for_tracker(region: str = "Karnataka") -> list[dict]:
         rank_by_bucket[bkey] = rank_by_bucket.get(bkey, 0) + 1
         out.append({
             "ngo_ref": _row_ngo_ref(row),
+            "ngo_id": row.get("ngo_id") or lead.get("ngo_id") or get_ngo_id({**lead, **row}, context=f"contact-source:{_row_ngo_ref(row)}"),
             "lead_id": row.get("lead_id") or lead.get("lead_id") or "",
             "ngo_name": row.get("ngo_name") or lead.get("ngo_name") or "",
             "district": lead.get("district") or "",
@@ -9671,6 +9673,9 @@ def _final_rows_for_tracker(region: str = "Karnataka") -> list[dict]:
 
 
 def _contact_tracker_key(row: dict) -> str:
+    ngo_id = existing_ngo_id(row) or str(row.get("ngo_id") or "").strip().upper()
+    if ngo_id:
+        return f"ngo:{ngo_id}"
     ref = str(row.get("ngo_ref") or "").strip()
     if ref:
         return f"ref:{ref}"
@@ -9973,7 +9978,7 @@ Search evidence:
 
 def _discover_public_contacts(row: dict, region: str, query_mode: str) -> dict:
     if not _has_serper_keys():
-        raise RuntimeError("SERPER_API_KEY or SERPER_API_KEYS must be set")
+        raise RuntimeError("SERPER_API_KEY must be set")
     ngo_name = str(row.get("ngo_name") or "").strip()
     if not ngo_name:
         raise ValueError("NGO name is missing")
@@ -10238,7 +10243,7 @@ def contact_tracker_generate_outreach(payload: dict | None = None):
     if not all_rows and not tracker_ids:
         return _json(False, status_code=400, error="tracker_id, tracker_ids, or all=true is required")
     if not _has_serper_keys():
-        return _json(False, status_code=500, error="SERPER_API_KEY or SERPER_API_KEYS must be set before contact discovery can run")
+        return _json(False, status_code=500, error="SERPER_API_KEY must be set before contact discovery can run")
 
     max_rows = int(payload.get("limit") or os.environ.get("CONTACT_GENERATE_MAX_ROWS", "25") or 25)
     max_rows = max(1, min(max_rows, 100))
@@ -10492,8 +10497,10 @@ def ranking_final_output():
     rows = _workstream_rows(data, only_global=False)
     grouped: dict[str, dict] = {}
     for row in rows:
-        key = _normalise_lead_name(row.get("ngo_name") or "") or str(row.get("ngo_name") or "")
+        ngo_id = row.get("ngo_id") or get_ngo_id(row, context=f"final-output:{row.get('ngo_name', '')}")
+        key = ngo_id or _normalise_lead_name(row.get("ngo_name") or "") or str(row.get("ngo_name") or "")
         item = grouped.setdefault(key, {
+            "ngo_id": ngo_id,
             "ngo_name": row.get("ngo_name") or "",
             "website": row.get("website") or "",
             "background": row.get("background") or "",
@@ -10952,3 +10959,17 @@ def repository_disk_usage():
         )
     except Exception as e:
         return _json(False, status_code=500, error=str(e))
+
+# -----------------------------------------------------------------------------
+# Karnataka Darpan source-record recovery
+# -----------------------------------------------------------------------------
+# Kept as a separate module so the legacy Fast/Deep Recovery workflow remains
+# available while the source-ledger recovery queues use stricter invariants.
+from karnataka_recovery import build_karnataka_recovery_router as _build_karnataka_recovery_router
+
+app.include_router(_build_karnataka_recovery_router(
+    runs_dir=RUNS_DIR,
+    max_upload_bytes=MAX_UPLOAD_BYTES,
+    avika_callback=_run_avika_filter_for_recheck,
+))
+

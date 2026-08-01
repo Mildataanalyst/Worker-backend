@@ -18,24 +18,50 @@ class FakeResponse:
         return self._payload
 
 
-def test_serper_credit_exhaustion_hard_pauses_before_next_key(monkeypatch):
-    monkeypatch.setenv("SERPER_API_KEYS", "key-one,key-two")
+def test_serper_transient_failure_retries_same_funded_account(monkeypatch):
+    monkeypatch.setenv("SERPER_API_KEY", "single-funded-key")
+    monkeypatch.setenv("SERPER_API_KEYS", "legacy-dead-key,legacy-second-key")
     main._reset_provider_runtime_state("recheck_credit_test")
     calls = []
 
     def fake_post(*args, **kwargs):
-        calls.append(kwargs["headers"]["X-API-KEY"])
-        return FakeResponse(402, "credits exhausted")
+        key = kwargs["headers"]["X-API-KEY"]
+        calls.append(key)
+        if len(calls) == 1:
+            return FakeResponse(500, "temporary provider error")
+        return FakeResponse(200, payload={"organic": []})
 
     monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.time, "sleep", lambda *_args, **_kwargs: None)
     with main._provider_run_context("recheck_credit_test"):
+        result = main._serper_post({"q": "test"})
+
+    assert result == {"organic": []}
+    assert calls == ["single-funded-key", "single-funded-key"]
+    assert main._serper_keys() == ["single-funded-key"]
+    assert main._provider_pause_for_run("recheck_credit_test") is None
+
+
+def test_serper_pauses_when_single_account_is_exhausted(monkeypatch):
+    monkeypatch.setenv("SERPER_API_KEY", "single-funded-key")
+    monkeypatch.setenv("SERPER_API_KEYS", "legacy-key-must-be-ignored")
+    main._reset_provider_runtime_state("recheck_credit_test_all")
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs["headers"]["X-API-KEY"])
+        return FakeResponse(400, "Not enough credits")
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    with main._provider_run_context("recheck_credit_test_all"):
         with pytest.raises(main.ProviderPauseRequested) as caught:
             main._serper_post({"q": "test"})
 
     assert caught.value.provider == "serper"
     assert caught.value.reason == "credits_exhausted"
-    assert len(calls) == 1, "must pause on the first exhausted key, not fail over"
-    details = main._provider_pause_for_run("recheck_credit_test")
+    assert calls == ["single-funded-key"]
+    assert main._serper_keys() == ["single-funded-key"]
+    details = main._provider_pause_for_run("recheck_credit_test_all")
     assert details["provider"] == "serper"
 
 
