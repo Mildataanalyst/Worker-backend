@@ -1,4 +1,4 @@
-# Search Worker v76 — Railway deployment
+# Search Worker v77 — Railway deployment
 
 1. Extract this ZIP into the root of the Git repository connected to the existing Railway search-worker service.
 2. Keep or attach a persistent volume at `/data`.

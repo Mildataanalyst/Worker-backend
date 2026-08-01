@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from ngo_identity import ensure_ngo_id, get_ngo_id
 
 
-MODULE_VERSION = "karnataka_recovery_v5_final_ownership_guard"
+MODULE_VERSION = "karnataka_recovery_v5_1_status_hotfix"
 
 MODE_SPECS: dict[str, dict[str, Any]] = {
     "regression_test": {
@@ -3523,6 +3523,12 @@ class KarnatakaRecoveryService:
                 payload["run_status"] = "interrupted"
                 payload["stage"] = "interrupted_restart"
                 payload["can_resume"] = True
+            # Status files intentionally persist an `ok` field. Passing it through
+            # **payload together with the positional `ok` argument raises
+            # `TypeError: got multiple values for argument ok`, which previously
+            # surfaced as a 500 during frontend polling. Strip the persisted field
+            # and let the response wrapper add one canonical `ok` value.
+            payload.pop("ok", None)
             return self._json(True, **payload)
 
         @router.post("/pause/{run_id}")

@@ -1,4 +1,4 @@
-# DFP 2.0 Search Worker v76 — Final Ownership Guard
+# DFP 2.0 Search Worker v77 — Final Ownership Guard
 
 Complete Railway-deployable search worker for NGO Discovery and Karnataka Recovery.
 

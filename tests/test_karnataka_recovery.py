@@ -207,3 +207,33 @@ def test_capacity_route_reports_effective_single_account_concurrency(monkeypatch
     assert payload['healthy_serper_accounts'] == 1
     assert payload['recommended_max_concurrency'] == 2
     assert payload['configuration_warning'].startswith('SERPER_API_KEYS is ignored')
+
+
+def test_status_route_handles_persisted_ok_field_without_500(tmp_path):
+    import json
+
+    service = kr.KarnatakaRecoveryService(tmp_path, 1_000_000)
+    run_id = "karnataka_test_status"
+    rd = service._run_dir(run_id)
+    rd.mkdir(parents=True, exist_ok=True)
+    service._write_json(
+        rd / kr.RESULT_FILES["status"],
+        {
+            "ok": True,
+            "run_id": run_id,
+            "run_status": "completed",
+            "stage": "results_ready",
+            "processed": 44,
+            "total": 44,
+        },
+    )
+    route = next(
+        route for route in service.router.routes
+        if getattr(route, "path", "") == "/karnataka-recovery/status/{run_id}"
+    )
+    response = route.endpoint(run_id)
+    payload = json.loads(response.body)
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["run_id"] == run_id
+    assert payload["run_status"] == "completed"
