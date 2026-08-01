@@ -151,8 +151,9 @@ APP_NAME = "DFP 2.0 Backend"
 RUNS_DIR = Path(os.environ.get("RUNS_DIR", "runs")).resolve()
 ENGINE_FILE = Path(__file__).resolve().parent / "engine" / "dfp2_engine_safe_v5_live_status.py"
 MAX_ROWS_PER_RUN = int(os.environ.get("MAX_ROWS_PER_RUN", "1000"))
+AVIKA_MAX_ROWS_PER_RUN = int(os.environ.get("AVIKA_MAX_ROWS_PER_RUN", "20000"))
 RAPID_ROWS_LIMIT = int(os.environ.get("RAPID_ROWS_LIMIT", "20"))
-MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", "8000000"))  # 25 MB default; enough for 10,000 NGO rows
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", "100000000"))  # 100 MB safety cap; supports 15k+ recovery/Avika batches
 CSV_NAME_HEADERS = {"name", "ngo_name", "ngo name", "organisation", "organization"}
 
 OUTPUTS = {
@@ -1366,8 +1367,12 @@ async def start_repository(file: UploadFile = File(...), mode: str = "rapid", ru
     mode=bulk is for CSV batch runs, max MAX_ROWS_PER_RUN rows.
     Backward-compatible aliases: test -> rapid, full -> bulk.
     """
-    if not _has_serper_keys() or not os.environ.get("ANTHROPIC_API_KEY"):
-        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY, plus ANTHROPIC_API_KEY, must be set in Railway Variables")
+    requested_mode = (mode or "rapid").strip().lower()
+    avika_only = requested_mode == "avika" or str(run_type or "").strip().lower().replace("-", "_") == "avika_filter"
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return _json(False, status_code=500, stage="missing_env", error="ANTHROPIC_API_KEY must be set in Railway Variables")
+    if not avika_only and not _has_serper_keys():
+        return _json(False, status_code=500, stage="missing_env", error="SERPER_API_KEY must be set for discovery runs")
 
     active = _active_run_ids()
     if active:
@@ -1400,7 +1405,7 @@ async def start_repository(file: UploadFile = File(...), mode: str = "rapid", ru
         if k and k.strip().lower() == "state":
             state_key = k
             break
-    if not state_key and run_type == "repository":
+    if not state_key and run_type == "repository" and not avika_only:
         msg = "CSV must contain a state column. Required format: name,state. District is optional."
         _write_repo_status(rd, ok=False, run_id=run_id, run_status="blocked", stage="missing_state_column", error=msg, fieldnames=fieldnames)
         return _json(False, status_code=400, run_id=run_id, stage="missing_state_column", error=msg, fieldnames=fieldnames)
@@ -1419,12 +1424,14 @@ async def start_repository(file: UploadFile = File(...), mode: str = "rapid", ru
     if mode == "full":
         mode = "bulk"
 
-    if mode not in {"rapid", "bulk"}:
-        return _json(False, status_code=400, run_id=run_id, stage="bad_mode", error="mode must be rapid or bulk")
+    if mode not in {"rapid", "bulk", "avika"}:
+        return _json(False, status_code=400, run_id=run_id, stage="bad_mode", error="mode must be rapid, bulk or avika")
 
     run_type = (run_type or "repository").strip().lower().replace("-", "_")
-    if run_type not in {"repository", "dedupe_recheck"}:
-        return _json(False, status_code=400, run_id=run_id, stage="bad_run_type", error="run_type must be repository or dedupe_recheck")
+    if mode == "avika":
+        run_type = "avika_filter"
+    if run_type not in {"repository", "dedupe_recheck", "avika_filter"}:
+        return _json(False, status_code=400, run_id=run_id, stage="bad_run_type", error="run_type must be repository, dedupe_recheck or avika_filter")
 
     if mode == "rapid":
         if row_count > RAPID_ROWS_LIMIT:
@@ -1439,15 +1446,17 @@ async def start_repository(file: UploadFile = File(...), mode: str = "rapid", ru
             )
         rows_to_run = row_count
     else:
-        if row_count > MAX_ROWS_PER_RUN:
+        row_limit = AVIKA_MAX_ROWS_PER_RUN if (mode == "avika" or run_type == "avika_filter") else MAX_ROWS_PER_RUN
+        if row_count > row_limit:
+            label = "Avika Fit Review" if (mode == "avika" or run_type == "avika_filter") else "Bulk mode"
             return _json(
                 False,
                 status_code=400,
                 run_id=run_id,
-                stage="too_many_rows_bulk",
-                error=f"Bulk mode allows up to {MAX_ROWS_PER_RUN} NGOs per run. For 10k runs, keep this as an overnight/checkpointed run.",
+                stage="too_many_rows_avika" if label.startswith("Avika") else "too_many_rows_bulk",
+                error=f"{label} allows up to {row_limit} NGOs per run. Split larger files into source batches.",
                 row_count=row_count,
-                limit=MAX_ROWS_PER_RUN,
+                limit=row_limit,
             )
         rows_to_run = row_count
 
@@ -1479,14 +1488,22 @@ async def start_repository(file: UploadFile = File(...), mode: str = "rapid", ru
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     _atomic_write_text((rd / "dfp2_status.json"), json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
-    _job_create(run_id, run_type, rd, **status)
+    _job_create(run_id, run_type, rd, **{key: value for key, value in status.items() if key != "run_id"})
 
     env = os.environ.copy()
     env["DFP_RUN_MODE"] = mode
     env["DFP_RUN_TYPE"] = run_type
-    # Rapid Mode should avoid Claude Batch queue time; Bulk Mode keeps Batch API
-    # for cost/rate-limit safety. These can still be overridden in Railway env.
-    if mode == "rapid":
+    if mode == "avika" or run_type == "avika_filter":
+        # Explicit no-search, low-cost DFP-fit classification. The uploaded CSV
+        # must carry websites; missing websites are reported, never searched.
+        env["SERPER_QUERIES_PER_NGO"] = "0"
+        env["AVIKA_RULE_PREFILTER"] = "true"
+        env["AVIKA_CLASSIFICATION_ONLY"] = "true"
+        env.setdefault("AVIKA_SITE_TEXT_CHARS", "1800")
+        env.setdefault("AVIKA_MAX_TOKENS", "120")
+        env["DFP_FILTER_VERSION"] = "avika_fit_v4_brief_review"
+        env.setdefault("AI_PROFILE_MODE", "batch")
+    elif mode == "rapid":
         env.setdefault("AI_PROFILE_MODE", "direct")
     else:
         env.setdefault("AI_PROFILE_MODE", "batch")
@@ -1802,7 +1819,7 @@ def repository_archive(limit: int = 30):
         items.append({
             "run_id": run_id,
             "module": module,
-            "label": ("Deduped NGO re-check" if data.get("run_type") == "dedupe_recheck" else ("NGO Discovery" if module == "repository" else ("NGO Presence Check" if module == "ngo_presence_check" else "No website re-check"))),
+            "label": ("Avika Fit Review" if data.get("run_type") == "avika_filter" else ("Deduped NGO re-check" if data.get("run_type") == "dedupe_recheck" else ("NGO Discovery" if module == "repository" else ("NGO Presence Check" if module == "ngo_presence_check" else "No website re-check")))),
             "run_type": data.get("run_type", ""),
             "updated_at": updated,
             "run_status": data.get("run_status", ""),
@@ -1856,7 +1873,16 @@ def repository_resume(run_id: str):
         except Exception:
             pass
     env["DFP_RUN_MODE"] = mode
-    if mode == "rapid":
+    if mode == "avika":
+        env["DFP_RUN_TYPE"] = "avika_filter"
+        env["SERPER_QUERIES_PER_NGO"] = "0"
+        env["AVIKA_RULE_PREFILTER"] = "true"
+        env["AVIKA_CLASSIFICATION_ONLY"] = "true"
+        env.setdefault("AVIKA_SITE_TEXT_CHARS", "1800")
+        env.setdefault("AVIKA_MAX_TOKENS", "120")
+        env["DFP_FILTER_VERSION"] = "avika_fit_v4_brief_review"
+        env.setdefault("AI_PROFILE_MODE", "batch")
+    elif mode == "rapid":
         env.setdefault("AI_PROFILE_MODE", "direct")
     else:
         env.setdefault("AI_PROFILE_MODE", "batch")

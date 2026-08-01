@@ -610,48 +610,91 @@ def _write_duplicate_candidates(rows):
     os.replace(tmp, DUPLICATE_CANDIDATES_CSV)
 
 
+def _safe_item_id(value, fallback):
+    """Return a stable Anthropic/checkpoint-safe row identifier.
+
+    Source-record IDs are preferred so same-name rows are never collapsed. The
+    original NGO/source IDs remain in the row metadata and exports.
+    """
+    raw = str(value or "").strip()
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_")
+    if cleaned:
+        return cleaned[:72]
+    return fallback
+
+
 def clean_and_load():
     rows, seen, duplicates = [], {}, []
     with open(INPUT_CSV, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
-        # be forgiving about the header name for the NGO name
         name_key = None
         for k in (reader.fieldnames or []):
             if k and k.strip().lower() in ("name", "ngo_name", "ngo name", "organisation", "organization"):
-                name_key = k; break
+                name_key = k
+                break
         if name_key is None:
-            raise ValueError("Your CSV needs a column called 'name'. Found: "
-                             + str(reader.fieldnames))
-        for r in reader:
+            raise ValueError("Your CSV needs a column called 'name'. Found: " + str(reader.fieldnames))
+
+        for index, r in enumerate(reader, start=1):
             raw = (r.get(name_key) or "").strip()
             if not raw:
                 continue
             name = re.sub(r"\s+", " ", raw).strip()
-            district = (r.get("district") or r.get("District") or "").strip()
+            district = (r.get("district") or r.get("District") or r.get("Location") or "").strip()
             state = (r.get("state") or r.get("State") or "").strip()
-            key = _dedupe_key(name, district, state)
-            if key in seen:
-                kept = seen[key]
+            supplied_website = (r.get("website") or r.get("Website") or r.get("url") or r.get("URL") or "").strip()
+            darpan_id = (r.get("darpan_id") or r.get("Darpan ID") or r.get("NGO Darpan ID") or "").strip()
+            provided_ngo_id = (r.get("ngo_id") or r.get("NGO ID") or r.get("DFP NGO ID") or r.get("dfp_ngo_id") or "").strip()
+            source_record_id = (r.get("source_record_id") or r.get("Source Record ID") or "").strip()
+            batch_id = (r.get("batch_id") or r.get("Batch ID") or "").strip()
+            batch_label = (r.get("batch_label") or r.get("Batch Label") or "").strip()
+            source_type = (r.get("source_type") or r.get("Source Type") or r.get("Source") or "").strip()
+            source_run_id = (r.get("source_run_id") or r.get("source_run") or r.get("Run ID") or "").strip()
+            website_recovery_status = (r.get("website_recovery_status") or r.get("Website Recovery Status") or r.get("discovery_status") or "").strip()
+
+            # Preserve source rows. Only rows carrying the exact same source ID
+            # (or, when absent, the exact same NGO ID) are treated as duplicates.
+            if source_record_id:
+                dedupe_key = "source:" + source_record_id.lower()
+            elif provided_ngo_id:
+                dedupe_key = "ngo:" + provided_ngo_id.lower()
+            else:
+                dedupe_key = "legacy:" + _dedupe_key(name, district, state)
+
+            if dedupe_key in seen:
+                kept = seen[dedupe_key]
                 duplicates.append({
                     "NGO Name": name,
                     "State": state,
                     "District": district,
-                    "Duplicate Key": key,
+                    "Duplicate Key": dedupe_key,
                     "Kept NGO Name": kept.get("name", name),
-                    "Reason": "Exact duplicate of NGO name + district + state. Same NGO names in different districts/states are preserved.",
+                    "Reason": "Exact repeated source/NGO identifier. Same-name rows with different source IDs are preserved.",
                 })
                 continue
-            supplied_website = (r.get("website") or r.get("Website") or r.get("url") or r.get("URL") or "").strip()
-            darpan_id = (r.get("darpan_id") or r.get("Darpan ID") or r.get("NGO Darpan ID") or "").strip()
+
+            fallback_id = ngo_id_for(name, district, state)
+            item_id = _safe_item_id(source_record_id or provided_ngo_id, fallback_id)
+            # Guard against repeated/blank custom IDs after sanitisation.
+            if any(existing.get("id") == item_id for existing in rows):
+                item_id = _safe_item_id(f"{source_record_id or provided_ngo_id or fallback_id}_{index}", f"{fallback_id}_{index}")
+
             row = {
-                "id": ngo_id_for(name, district, state),
-                "name": name,   # display name (suffix preserved)
+                "id": item_id,
+                "ngo_id": provided_ngo_id,
+                "source_record_id": source_record_id,
+                "batch_id": batch_id,
+                "batch_label": batch_label,
+                "source_type": source_type,
+                "source_run_id": source_run_id,
+                "website_recovery_status": website_recovery_status,
+                "name": name,
                 "district": district,
                 "state": state,
                 "website": supplied_website,
                 "darpan_id": darpan_id,
             }
-            seen[key] = row
+            seen[dedupe_key] = row
             rows.append(row)
     _write_duplicate_candidates(duplicates)
     return rows
@@ -1270,8 +1313,9 @@ YES: vulnerable/underserved children are a core group in an ongoing education, c
 MAYBE: plausibly relevant but access, fees, programme depth, or evidence is unclear. Thin but plausible child evidence stays maybe.
 NO: private/premium school; higher education/coaching-only; health-only; elderly; adult livelihood/SHG/farmers/women-only skilling; religious/community body; scholarship-only; broad charity with children peripheral; wrong/non-owned source; unrelated/unfinished site.
 
-Return exactly: {{"m":"yes|maybe|no","d":"yes|maybe|no","c":"high|medium|low","r":"code"}}
-m=official-site match; d=Avika decision. r must be one of: child_fit, child_unclear, fees_unclear, private_school, higher_ed, health, elderly, adult_livelihood, religious_community, scholarship_only, broad_peripheral, bad_source, unrelated.
+Return exactly: {{"m":"yes|maybe|no","d":"yes|maybe|no","c":"high|medium|low","r":"code","x":"20-35 word plain-English description"}}
+m=official-site match; d=DFP-fit decision. r must be one of: child_fit, child_unclear, fees_unclear, private_school, higher_ed, health, elderly, adult_livelihood, religious_community, scholarship_only, broad_peripheral, bad_source, unrelated.
+x must describe the organisation/programme, not repeat the decision and not invent evidence.
 
 NGO: {name}
 Location: {geo}
@@ -1319,15 +1363,17 @@ def normalize_avika_profile(profile):
     if not reason_code:
         reason_code = "child_program_unclear" if decision == "maybe" else ("unrelated" if decision == "no" else "thin_impact_detail")
     normalized = dict(profile)
+    brief = str(profile.get("summary") or profile.get("x") or "").strip()
     normalized.update({
         "official_website_match": website_match,
         "decision": decision,
         "confidence": confidence,
         "reason_code": reason_code,
         "internal_reason": str(profile.get("internal_reason") or _compact_reason_text(reason_code)),
+        "summary": brief,
     })
     for key, default in {
-        "serves": "", "summary": "", "story": "", "location": "",
+        "serves": "", "story": "", "location": "",
         "digital_presence": "", "partners_found": [], "cause_tags": [],
     }.items():
         normalized.setdefault(key, default)
@@ -1598,7 +1644,11 @@ def _search_fetch_one(ngo, total, processed_hint):
         supplied_url = str(ngo.get("website") or "").strip()
         if supplied_url:
             url, serr = supplied_url, None
-            rec["note"] = "using verified website supplied by recovery; Serper search skipped"
+            rec["note"] = "using supplied website; Serper search skipped"
+        elif SERPER_QUERIES_PER_NGO <= 0:
+            rec["status"] = "missing_supplied_website"
+            rec["note"] = "Avika classification requires a supplied website; no Serper search was allowed"
+            return rec, None
         else:
             url, _organic, serr = find_official_site(ngo, total=total, done=processed_hint)
         if serr:
@@ -1921,11 +1971,23 @@ def _safe_csv_dict(d):
 # ============================================================================
 # 9. WRITE THE CSV  (exactly the columns the website expects)
 # ============================================================================
-COLUMNS = ["NGO Name", "Location", "Serves", "Story", "Digital Presence",
-           "Website", "Social Presence", "Partners", "Media Stories", "Confidence", "Official Website Match", "Notes"]
-REJECTED_COLUMNS = ["NGO Name", "State", "District", "Website", "Final Action", "Internal Reason Code",
-                    "Internal Reason", "Original Status", "AI Confidence", "Official Website Match"]
-AUDIT_COLUMNS = ["NGO Name", "State", "District", "Status", "Website", "Final Action", "Internal Reason Code", "Note"]
+COLUMNS = [
+    "NGO ID", "Source Record ID", "Batch ID", "Batch Label", "Source Type", "Source Run ID",
+    "NGO Name", "Location", "State", "Website", "Avika Decision", "DFP Fit",
+    "Avika Confidence", "Official Website Match", "Avika Reason Code", "Brief Description",
+    "Serves", "Story", "Digital Presence", "Social Presence", "Partners", "Media Stories", "Notes",
+]
+REJECTED_COLUMNS = [
+    "NGO ID", "Source Record ID", "Batch ID", "Batch Label", "Source Type", "Source Run ID",
+    "NGO Name", "State", "District", "Website", "Avika Decision", "DFP Fit", "Brief Description",
+    "Final Action", "Internal Reason Code", "Internal Reason", "Original Status",
+    "AI Confidence", "Official Website Match",
+]
+AUDIT_COLUMNS = [
+    "NGO ID", "Source Record ID", "Batch ID", "Batch Label", "Source Type", "Source Run ID",
+    "NGO Name", "State", "District", "Status", "Website", "Avika Decision", "DFP Fit",
+    "Brief Description", "Final Action", "Internal Reason Code", "Note",
+]
 
 
 def _run_id_from_cwd():
@@ -1986,12 +2048,23 @@ def write_audit(ngos, done, profiles):
         for ngo in ngos:
             rec = done.get(ngo["id"], {})
             action, code, reason, profile = _final_decision_for(ngo, rec, profiles)
+            decision = str((profile or {}).get("decision") or ("yes" if action == "shortlisted" else "maybe" if action == "maybe" else "no"))
+            brief = str((profile or {}).get("summary") or reason or rec.get("note", ""))[:500]
             w.writerow(_safe_csv_dict({
+                "NGO ID": ngo.get("ngo_id", ""),
+                "Source Record ID": ngo.get("source_record_id", ""),
+                "Batch ID": ngo.get("batch_id", ""),
+                "Batch Label": ngo.get("batch_label", ""),
+                "Source Type": ngo.get("source_type", ""),
+                "Source Run ID": ngo.get("source_run_id", ""),
                 "NGO Name": ngo["name"],
                 "State": ngo.get("state", ""),
                 "District": ngo.get("district", ""),
                 "Status": rec.get("status", "not_processed"),
                 "Website": rec.get("website", ""),
+                "Avika Decision": decision,
+                "DFP Fit": "Strong fit" if decision == "yes" else "Needs review" if decision == "maybe" else "Not fit",
+                "Brief Description": brief,
                 "Final Action": action,
                 "Internal Reason Code": code,
                 "Note": reason or rec.get("note", ""),
@@ -2000,7 +2073,7 @@ def write_audit(ngos, done, profiles):
 
 
 def write_output(ngos, done, profiles):
-    """Write only reviewable rows: Yes/shortlisted + Maybe. No rows are moved to rejected audit."""
+    """Write reviewable Avika rows: Yes/shortlisted + Maybe."""
     counts = {"shortlisted": 0, "maybe": 0, "rejected": 0, "history_appended": 0}
     history_rows = []
     tmp = OUTPUT_CSV + ".tmp"
@@ -2010,20 +2083,33 @@ def write_output(ngos, done, profiles):
         for ngo in ngos:
             rec = done.get(ngo["id"], {})
             action, code, reason, p = _final_decision_for(ngo, rec, profiles)
+            decision = str(p.get("decision") or ("yes" if action == "shortlisted" else "maybe" if action == "maybe" else "no"))
             if action in {"shortlisted", "maybe"}:
                 counts[action] += 1
+                brief = str(p.get("summary") or reason or "").strip()
                 w.writerow(_safe_csv_row([
+                    ngo.get("ngo_id", ""),
+                    ngo.get("source_record_id", ""),
+                    ngo.get("batch_id", ""),
+                    ngo.get("batch_label", ""),
+                    ngo.get("source_type", ""),
+                    ngo.get("source_run_id", ""),
                     ngo["name"],
                     p.get("location") or ngo.get("district") or "",
+                    ngo.get("state", ""),
+                    rec.get("website", ""),
+                    decision,
+                    "Strong fit" if decision == "yes" else "Needs review",
+                    p.get("confidence", ""),
+                    p.get("official_website_match", ""),
+                    code,
+                    brief,
                     p.get("serves", ""),
                     p.get("story", ""),
                     (p.get("digital_presence", "") or "").upper(),
-                    rec.get("website", ""),
                     "; ".join(rec.get("socials", [])),
                     _partners_text(p),
                     "",
-                    p.get("confidence", ""),
-                    p.get("official_website_match", ""),
                     _note_for_reviewable(action, code, reason, rec, p),
                 ]))
             else:
@@ -2062,11 +2148,22 @@ def write_rejected_output(ngos, done, profiles):
             if action in {"shortlisted", "maybe"}:
                 continue
             rows += 1
+            decision = str((p or {}).get("decision") or "no")
+            brief = str((p or {}).get("summary") or reason or rec.get("note", ""))[:500]
             w.writerow(_safe_csv_dict({
+                "NGO ID": ngo.get("ngo_id", ""),
+                "Source Record ID": ngo.get("source_record_id", ""),
+                "Batch ID": ngo.get("batch_id", ""),
+                "Batch Label": ngo.get("batch_label", ""),
+                "Source Type": ngo.get("source_type", ""),
+                "Source Run ID": ngo.get("source_run_id", ""),
                 "NGO Name": ngo["name"],
                 "State": ngo.get("state", ""),
                 "District": ngo.get("district", ""),
                 "Website": rec.get("website", ""),
+                "Avika Decision": decision,
+                "DFP Fit": "Not fit",
+                "Brief Description": brief,
                 "Final Action": action,
                 "Internal Reason Code": code,
                 "Internal Reason": reason,
@@ -2076,6 +2173,7 @@ def write_rejected_output(ngos, done, profiles):
             }))
     os.replace(tmp, REJECTED_CSV)
     return rows
+
 
 
 # ============================================================================

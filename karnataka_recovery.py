@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from ngo_identity import ensure_ngo_id, get_ngo_id
 
 
-MODULE_VERSION = "karnataka_recovery_v5_2_password_free_routes"
+MODULE_VERSION = "karnataka_recovery_v6_0_large_batch_auto_resume"
 
 MODE_SPECS: dict[str, dict[str, Any]] = {
     "regression_test": {
@@ -140,6 +140,7 @@ TERMINAL_DISCOVERY_STATUSES = {
     "plausible_site_identity_review",
     "no_owned_site_after_enhanced_recovery",
     "no_candidate_in_uploaded_row",
+    "enhanced_search_required",
     "candidate_fetch_pending",
     "search_partial",
     "skipped_query_cap",
@@ -153,7 +154,7 @@ VERIFIED_STATUSES = {
 }
 
 MANUAL_STATUSES = {"plausible_site_identity_review", "collision_identity_review"}
-RETRY_STATUSES = {"candidate_fetch_pending", "search_partial", "skipped_query_cap", "provider_blocked", "no_candidate_in_uploaded_row"}
+RETRY_STATUSES = {"candidate_fetch_pending", "search_partial", "skipped_query_cap", "provider_blocked", "no_candidate_in_uploaded_row", "enhanced_search_required"}
 
 LEGAL_SUFFIXES = {
     "trust", "foundation", "society", "samsthe", "samiti", "samithi", "sanstha", "sangha", "mission",
@@ -176,6 +177,10 @@ DIRECTORY_DOMAINS = {
     "companydetails.in", "thecompanycheck.com", "tofler.in", "indiankanoon.org", "supremetoday.ai",
     "milaap.org", "helpyourngo.com", "myngos.in", "ivolunteer.in", "divyangsathi.com", "tatanexarc.com",
     "trip.com", "ixigo.com", "wypages.com", "aurumproptech.in", "tradeindia.com", "studyriserr.com",
+    "housing.com", "nobroker.in", "tripadvisor.com", "tripadvisor.in", "99acres.com", "mappls.com",
+    "commonfloor.com", "squareyards.com", "magicbricks.com", "makaan.com", "proptiger.com",
+    "roofandfloor.com", "realestateindia.com", "indiaproperty.com", "idbf.in", "ngoportal.org",
+    "ngodetails.com", "asklaila.com", "bharatibiz.com", "practo.com", "urbanpro.com",
     "play.google.com", "scribd.com", "slideshare.net", "academia.edu", "researchgate.net",
     "ketto.org", "impactguru.com", "fundrazr.com", "gofundme.com", "giveindia.org", "benevity.com",
     "wikipedia.org", "wikidata.org", "wikimapia.org", "mapcarta.com", "zoominfo.com", "dnb.com",
@@ -198,6 +203,29 @@ REFERENCE_DOMAINS = {
     "sciencedirect.com", "jstor.org", "semanticscholar.org", "core.ac.uk", "worldcat.org",
 }
 FOREIGN_CONFLICT_TLDS = {"pk", "bd", "lk", "np"}
+FOREIGN_REVIEW_TLDS = {"uk", "ca", "nz", "au", "za"}
+COMMERCIAL_OR_INSTITUTIONAL_TERMS = {
+    "realty", "properties", "property", "construction", "builders", "developer", "developers",
+    "enterprises", "systems", "technology", "technologies", "software", "solutions", "manufacturer",
+    "banquet", "party hall", "auditorium", "electronics", "repair", "matrimony", "estate", "apartments",
+    "clinic", "hospital", "nethralaya", "school", "college", "academy", "institute", "nursing",
+    "e learning", "restaurant", "delights", "basket", "lifecare",
+    "consulting", "corporate", "business", "company", "global capability",
+}
+CRITICAL_SOURCE_IDENTITY_RISK_FLAGS = {
+    "generic_without_source_specific_identity",
+    "commercial_or_institutional_domain_without_source_link",
+    "foreign_domain_without_source_specific_identity",
+    "brand_only_domain_without_source_specific_identity",
+    "programme_or_csr_page_without_supplied_parent",
+}
+PREFETCH_COMMERCIAL_TERMS = {
+    "real estate", "realty", "properties", "property developer", "property investment",
+    "residential project", "residential development", "apartments", "villas", "villa plots",
+    "builders", "construction company", "sales office", "hotel", "resort", "travel guide",
+    "spa", "pubs bars", "restaurant", "matrimony", "software company", "technology company",
+    "financial services", "investment advisory", "manufacturer", "commercial project",
+}
 CARRIER_PATH_MARKERS = (
     "/fundraiser", "/fundraisers", "/ngo-details/", "/company/", "/client", "/travel-guide/",
     "/attraction/", "/document/", "/documents/", "/article/", "/articles/", "/blog/", "/post/",
@@ -284,6 +312,13 @@ class RowDeadlineReached(TimeoutError):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def norm(value: Any) -> str:
@@ -714,6 +749,23 @@ def obvious_carrier_reason(url: str, title: str = "", snippet: str = "", row: di
             return "anniversary/article URL slug on a non-identity domain"
         if any(term in blob for term in CARRIER_TITLE_TERMS):
             return "search title indicates a directory, article, client list or reference page"
+
+    # A generic NGO/public-brand token can collide with a commercial entity even
+    # when the commercial domain happens to contain that token. Reject the search
+    # result before any fetch unless the title/snippet carries the full supplied
+    # legal identity, a registration reference, or an explicitly supplied
+    # project/parent identity.
+    legal = norm((row or {}).get("name"))
+    registration = compact((row or {}).get("registration_reference"))
+    relation_values = [
+        norm((row or {}).get("project_name")), norm((row or {}).get("parent_organisation")),
+        norm((row or {}).get("public_name")), norm((row or {}).get("referral_name")),
+    ]
+    legal_exact = bool(legal and legal in blob)
+    registration_exact = bool(registration and len(registration) >= 5 and registration in compact(blob))
+    supplied_relation_exact = any(value and len(value) >= 5 and value in blob for value in relation_values)
+    if any(term in blob for term in PREFETCH_COMMERCIAL_TERMS) and not (legal_exact or registration_exact or supplied_relation_exact):
+        return "commercial or institutional same-name result without source-record identity"
     return ""
 
 
@@ -1879,7 +1931,16 @@ def identity_verification(
     if state and state not in normal_text and district and district not in normal_text and hard == 0 and strong == 0:
         conflicts.append("no supplied location signal")
 
-    generic_name = len(distinctive_tokens(row.get("name"))) <= 1
+    identity_names_for_distinctiveness = [
+        row.get("name"), row.get("referral_name"), row.get("public_name"), row.get("project_name")
+    ]
+    identity_distinctive_tokens = {
+        token
+        for identity_name in identity_names_for_distinctiveness
+        for token in distinctive_tokens(identity_name)
+        if len(token) >= 4 and token not in GENERIC_TOKENS
+    }
+    generic_name = not bool(identity_distinctive_tokens)
     if generic_name:
         risk_flags.append("generic_or_low_distinctiveness_name")
     if weak_domain and not strong_domain:
@@ -1888,6 +1949,53 @@ def identity_verification(
         risk_flags.append("article_metadata_present")
     if is_historical_mismatch(row):
         risk_flags.append("historically_mismatched_url_rechecked_not_trusted")
+
+    source_specific_identity = bool(hard > 0 or (pin_match and address_match))
+    host_tld = final_host.rsplit(".", 1)[-1] if "." in final_host else ""
+    foreign_review_domain = host_tld in FOREIGN_REVIEW_TLDS
+    commercial_blob = norm(" ".join([final_host.replace("-", " ").replace(".", " "), merged_title, meta_description]))
+    commercial_or_institutional = any(term in commercial_blob for term in COMMERCIAL_OR_INSTITUTIONAL_TERMS)
+    legal_form_domain = any("name plus legal form" in item for item in strong_domain)
+    public_brand_domain = any("public brand/acronym" in item for item in strong_domain)
+    domain_full_identity = any(
+        marker in item
+        for item in strong_domain
+        for marker in ["domain carries full identity", "domain carries name plus legal form", "domain carries organisation acronym"]
+    )
+    brand_only_domain = bool(strong_domain and not domain_full_identity and not legal_form_domain)
+    distinct_project_identity = any(value != legal for value in project_identities)
+    relation_scan = norm(" ".join([merged_title, merged_snippet, text[:8000]]))
+    relation_targets = re.findall(
+        r"\b(?:project|initiative|programme|program|unit|part) of ([a-z0-9&'-]+(?: [a-z0-9&'-]+){0,5})",
+        relation_scan,
+    )
+    known_identity_blob = " ".join(norm(value) for value in [legal, *aliases, parent_identity] if value)
+    external_relation_target = any(
+        target and target not in known_identity_blob and not any(norm(alias) in target for alias in aliases if norm(alias))
+        for target in relation_targets
+    )
+    programme_or_csr_without_parent = bool(
+        (explicit_relation and not parent_identity and (distinct_project_identity or external_relation_target))
+        or (any(term in normal_text for term in ["csr initiative", "corporate social responsibility initiative"]) and not parent_identity)
+    )
+    if generic_name and not source_specific_identity and not (legal_form_domain and legal_exact and district_match):
+        risk_flags.append("generic_without_source_specific_identity")
+    commercial_exact_legal_control = bool(
+        legal_exact and page_self_marker and (domain_full_identity or legal_form_domain)
+    )
+    # Matching a pincode/address can merely show that a commercial group and a
+    # foundation share premises. It does not make the commercial domain the
+    # NGO's owned website. Commercial/institutional sites therefore require the
+    # exact legal identity or an explicit supplied parent/project relation.
+    if commercial_or_institutional and not relation_identity_match and not commercial_exact_legal_control:
+        risk_flags.append("commercial_or_institutional_domain_without_source_link")
+    if foreign_review_domain and not source_specific_identity and not relation_identity_match:
+        risk_flags.append("foreign_domain_without_source_specific_identity")
+    if brand_only_domain and not source_specific_identity and not (legal_exact and district_match and (legal_form_domain or not generic_name)):
+        risk_flags.append("brand_only_domain_without_source_specific_identity")
+    if programme_or_csr_without_parent:
+        risk_flags.append("programme_or_csr_page_without_supplied_parent")
+    critical_source_identity_risk = any(flag in CRITICAL_SOURCE_IDENTITY_RISK_FLAGS for flag in risk_flags)
 
     identity_points = hard * 5 + strong * 2 + supporting
     location_support = hard > 0 or pin_match or address_match or district_match
@@ -1922,7 +2030,7 @@ def identity_verification(
         confidence = "high" if hard or domain_control else "medium"
         ownership_gate = "explicit_parent_project_relation"
     elif hosted:
-        if hosted_named_slug and (legal_exact or alias_hits or overlap >= 0.75) and self_control and (location_support or hard > 0 or not generic_name):
+        if hosted_named_slug and (legal_exact or alias_hits or overlap >= 0.75) and self_control and (source_specific_identity or (district_match and legal_exact) or not generic_name) and not programme_or_csr_without_parent:
             verified = True
             status = "verified_controlled_microsite"
             page_type = "controlled_hosted_microsite"
@@ -1941,7 +2049,7 @@ def identity_verification(
         # a page-level self-identification marker are both required.  For generic
         # names, the domain must carry the legal form or the page must also match
         # a supplied location/contact identifier.
-        if domain_control and self_control and identity_points >= 5:
+        if domain_control and self_control and identity_points >= 5 and not critical_source_identity_risk:
             if (
                 not generic_name
                 or legal_form_domain
@@ -1955,7 +2063,7 @@ def identity_verification(
                 ownership = "owned_organisation_site"
                 confidence = "high" if hard or len(strong_domain) >= 2 else "medium"
                 ownership_gate = "domain_control_plus_page_self_identity"
-        if not verified and hard_control and legal_exact and self_control and identity_points >= 7:
+        if not verified and hard_control and legal_exact and self_control and identity_points >= 7 and not critical_source_identity_risk:
             verified = True
             status = "verified_owned_site"
             page_type = "owned_organisation_site"
@@ -2052,6 +2160,10 @@ def verification_safety_failure(row: dict[str, Any], url: str, verification: dic
         return f"invalid or missing ownership gate: {gate or 'blank'}"
     if not ownership_evidence:
         return "verified result has no independent ownership evidence"
+    risk_blob = norm(verification.get("risk_flags"))
+    for critical_flag in CRITICAL_SOURCE_IDENTITY_RISK_FLAGS:
+        if norm(critical_flag) in risk_blob:
+            return f"source-record identity guard: {critical_flag}"
     if gate == "explicit_parent_project_relation" and page_type != "verified_parent_or_project_page":
         return "parent/project relationship gate was not classified as a parent/project page"
     if gate.startswith("hosted_") and page_type != "controlled_hosted_microsite":
@@ -2079,6 +2191,8 @@ def result_export_safety_failure(row: dict[str, Any], result: dict[str, Any]) ->
         "ownership": result.get("Ownership Class", ""),
         "ownership_evidence": result.get("Ownership Evidence", ""),
         "ownership_gate": result.get("Ownership Gate", ""),
+        "risk_flags": result.get("Risk Flags", ""),
+        "evidence": result.get("Identity Evidence", ""),
     }
     failure = verification_safety_failure(row, url, verification)
     if failure:
@@ -2419,6 +2533,7 @@ class KarnatakaRecoveryService:
         self.runs_dir = Path(runs_dir)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.max_upload_bytes = max_upload_bytes
+        self.max_rows_per_run = max(1, int(os.environ.get("KARNATAKA_MAX_ROWS_PER_RUN", "20000")))
         self.avika_callback = avika_callback
         self.router = APIRouter(prefix="/karnataka-recovery", tags=["Karnataka Recovery"])
         self.threads: dict[str, threading.Thread] = {}
@@ -2427,7 +2542,19 @@ class KarnatakaRecoveryService:
         self.serper_preflight_cache: dict[str, dict[str, Any]] = {}
         self.firecrawl_preflight_cache: dict[str, dict[str, Any]] = {}
         self.ownership_self_test = run_ownership_self_test()
+        self.auto_resume_enabled = env_flag("KARNATAKA_AUTO_RESUME_ENABLED", True)
+        self.auto_resume_interval_seconds = max(5, int(os.environ.get("KARNATAKA_AUTO_RESUME_INTERVAL_SECONDS", "20")))
+        self.auto_resume_base_delay_seconds = max(5, int(os.environ.get("KARNATAKA_AUTO_RESUME_BASE_DELAY_SECONDS", "30")))
+        self.auto_resume_max_delay_seconds = max(self.auto_resume_base_delay_seconds, int(os.environ.get("KARNATAKA_AUTO_RESUME_MAX_DELAY_SECONDS", "300")))
+        self.auto_resume_max_attempts = max(1, int(os.environ.get("KARNATAKA_AUTO_RESUME_MAX_ATTEMPTS", "50")))
+        self._supervisor_stop = threading.Event()
         self._register_routes()
+        self._supervisor_thread: threading.Thread | None = None
+        if self.auto_resume_enabled:
+            self._supervisor_thread = threading.Thread(
+                target=self._auto_resume_supervisor, daemon=True, name="karnataka-auto-resume-supervisor"
+            )
+            self._supervisor_thread.start()
 
     def _run_dir(self, run_id: str) -> Path:
         safe = re.sub(r"[^a-zA-Z0-9_-]", "", run_id)
@@ -2458,6 +2585,169 @@ class KarnatakaRecoveryService:
         current["downloads"] = {kind: (rd / filename).exists() for kind, filename in RESULT_FILES.items() if kind not in {"status", "settings"}}
         self._write_json(rd / RESULT_FILES["status"], current)
         return current
+
+    def _thread_alive(self, run_id: str) -> bool:
+        thread = self.threads.get(run_id)
+        return bool(thread and thread.is_alive())
+
+    def _auto_resume_eligible(self, rd: Path, status: dict[str, Any] | None = None, settings: dict[str, Any] | None = None) -> bool:
+        status = status or self._status(rd)
+        settings = settings or self._read_json(rd / RESULT_FILES["settings"])
+        if not self.auto_resume_enabled or not bool(settings.get("auto_resume", True)):
+            return False
+        if not (rd / RESULT_FILES["input"]).exists():
+            return False
+        total = safe_int(settings.get("total_rows") or status.get("total"), 0)
+        processed = len(self._processed_source_ids(rd))
+        if total and processed >= total:
+            return False
+        run_status = str(status.get("run_status") or "").lower()
+        stage = str(status.get("stage") or "").lower()
+        if run_status in {"complete", "completed", "cancelled", "canceled"}:
+            return False
+        if stage in {"results_ready", "cancelled_partial_results_saved", "cancel_requested", "user_paused", "pause_requested"}:
+            return False
+        if run_status in {"interrupted", "error"}:
+            return True
+        if stage in {"interrupted_restart", "provider_capacity_unavailable", "firecrawl_capacity_unavailable", "error"}:
+            return True
+        # After a Railway/container restart the durable status may still say that
+        # the run is live even though its in-process thread disappeared.
+        return run_status in {"starting", "running", "resuming"} and not self._thread_alive(rd.name)
+
+    def _schedule_auto_resume(self, rd: Path, reason: str, delay_seconds: int | None = None) -> None:
+        settings = self._read_json(rd / RESULT_FILES["settings"])
+        if not self.auto_resume_enabled or not bool(settings.get("auto_resume", True)):
+            self._write_status(rd, auto_resume_enabled=False, auto_resume_scheduled=False)
+            return
+        attempts = safe_int(settings.get("auto_resume_attempts"), 0)
+        if attempts >= safe_int(settings.get("auto_resume_max_attempts"), self.auto_resume_max_attempts):
+            self._write_status(
+                rd, auto_resume_enabled=True, auto_resume_scheduled=False, can_resume=True,
+                auto_resume_exhausted=True,
+                message="Automatic resume reached its safety limit. The run is checkpointed and can still be resumed manually.",
+            )
+            return
+        if delay_seconds is None:
+            delay_seconds = min(
+                self.auto_resume_max_delay_seconds,
+                self.auto_resume_base_delay_seconds * (2 ** min(attempts, 4)),
+            )
+        next_epoch = time.time() + max(1, int(delay_seconds))
+        settings.update({
+            "auto_resume": True,
+            "auto_resume_next_epoch": next_epoch,
+            "auto_resume_last_reason": reason,
+            "auto_resume_max_attempts": safe_int(settings.get("auto_resume_max_attempts"), self.auto_resume_max_attempts),
+        })
+        self._write_json(rd / RESULT_FILES["settings"], settings)
+        self._write_status(
+            rd, auto_resume_enabled=True, auto_resume_scheduled=True,
+            auto_resume_next_epoch=next_epoch, auto_resume_next_in_seconds=max(1, int(delay_seconds)),
+            auto_resume_attempts=attempts, auto_resume_max_attempts=settings["auto_resume_max_attempts"],
+            auto_resume_last_reason=reason, can_resume=True,
+        )
+
+    def _clear_auto_resume_schedule(self, rd: Path) -> None:
+        settings = self._read_json(rd / RESULT_FILES["settings"])
+        settings["auto_resume_next_epoch"] = 0
+        self._write_json(rd / RESULT_FILES["settings"], settings)
+        self._write_status(rd, auto_resume_scheduled=False, auto_resume_next_epoch=0, auto_resume_next_in_seconds=0)
+
+    def _resume_saved_run(self, run_id: str, *, automatic: bool, reason: str = "") -> tuple[bool, str]:
+        rd = self._run_dir(run_id)
+        if not rd.exists() or not (rd / RESULT_FILES["input"]).exists():
+            return False, "Saved input for this run is missing"
+        if self._thread_alive(run_id):
+            return False, "Run is already active"
+        with self.lock:
+            active = [rid for rid, th in self.threads.items() if rid != run_id and th.is_alive()]
+        if active:
+            return False, "Another Karnataka Recovery run is active"
+        old = self._status(rd)
+        settings = self._read_json(rd / RESULT_FILES["settings"])
+        if automatic and not self._auto_resume_eligible(rd, old, settings):
+            return False, "Run is not eligible for automatic resume"
+        settings["logical_queries_before_resume"] = safe_int(old.get("queries_used"), 0)
+        settings["resume_count"] = safe_int(settings.get("resume_count"), 0) + 1
+        if automatic:
+            settings["auto_resume_attempts"] = safe_int(settings.get("auto_resume_attempts"), 0) + 1
+            settings["auto_resume_last_at"] = utc_now()
+            settings["auto_resume_last_reason"] = reason or str(old.get("stage") or old.get("run_status") or "interrupted")
+        else:
+            # A manual resume restarts the automatic-recovery budget as a fresh operator decision.
+            settings["auto_resume_attempts"] = 0
+        settings["auto_resume_next_epoch"] = 0
+        self._write_json(rd / RESULT_FILES["settings"], settings)
+        # A topped-up or replaced key must be re-checked immediately; stale
+        # exhausted/invalid preflight cache entries would otherwise hold an
+        # overnight run for up to 30 minutes after capacity returned.
+        self.serper_preflight_cache.clear()
+        self.firecrawl_preflight_cache.clear()
+        self.controls[run_id] = {"pause": threading.Event(), "cancel": threading.Event()}
+        self._write_status(
+            rd, run_status="resuming", stage="resume_started", can_resume=False, can_pause=True, can_cancel=True,
+            auto_resume_enabled=bool(settings.get("auto_resume", True)), auto_resume_scheduled=False,
+            auto_resume_attempts=safe_int(settings.get("auto_resume_attempts"), 0),
+            auto_resume_last_reason=settings.get("auto_resume_last_reason", ""),
+            message=("Automatically resuming from source-record checkpoints." if automatic else "Resuming from source-record checkpoints."),
+        )
+        thread = threading.Thread(target=self._run_job, args=(run_id,), daemon=True, name=f"karnataka-{run_id[-6:]}")
+        with self.lock:
+            self.threads[run_id] = thread
+        thread.start()
+        return True, "resumed"
+
+    def _auto_resume_once(self) -> None:
+        with self.lock:
+            if any(thread.is_alive() for thread in self.threads.values()):
+                return
+        now = time.time()
+        candidates = sorted(
+            (rd for rd in self.runs_dir.glob("karnataka_*") if rd.is_dir()),
+            key=lambda path: path.stat().st_mtime, reverse=True,
+        )
+        for rd in candidates:
+            status = self._status(rd)
+            settings = self._read_json(rd / RESULT_FILES["settings"])
+            if not self._auto_resume_eligible(rd, status, settings):
+                continue
+            run_status = str(status.get("run_status") or "").lower()
+            stage = str(status.get("stage") or "").lower()
+            if run_status in {"starting", "running", "resuming"} and not self._thread_alive(rd.name):
+                self._write_status(
+                    rd, run_status="interrupted", stage="interrupted_restart", can_resume=True,
+                    message="Worker process restarted. The run is checkpointed and will resume automatically.",
+                )
+                status = self._status(rd)
+                if not safe_int(settings.get("auto_resume_next_epoch"), 0):
+                    self._schedule_auto_resume(rd, "worker_restart", delay_seconds=5)
+                    settings = self._read_json(rd / RESULT_FILES["settings"])
+            next_epoch = float(settings.get("auto_resume_next_epoch") or 0)
+            if not next_epoch:
+                self._schedule_auto_resume(rd, stage or run_status or "interrupted", delay_seconds=5)
+                settings = self._read_json(rd / RESULT_FILES["settings"])
+                next_epoch = float(settings.get("auto_resume_next_epoch") or 0)
+            remaining = max(0, int(next_epoch - now))
+            if next_epoch > now:
+                self._write_status(rd, auto_resume_next_in_seconds=remaining, auto_resume_scheduled=True)
+                continue
+            ok, _ = self._resume_saved_run(rd.name, automatic=True, reason=str(settings.get("auto_resume_last_reason") or stage or run_status))
+            if ok:
+                return
+
+    def _auto_resume_supervisor(self) -> None:
+        # Give FastAPI/Uvicorn a moment to finish importing before touching durable runs.
+        if self._supervisor_stop.wait(3):
+            return
+        while not self._supervisor_stop.is_set():
+            try:
+                self._auto_resume_once()
+            except Exception:
+                # The supervisor must never take down the API process. A later pass
+                # can still recover the same checkpointed run.
+                pass
+            self._supervisor_stop.wait(self.auto_resume_interval_seconds)
 
     @staticmethod
     def _append_csv(path: Path, fields: list[str], rows: list[dict[str, Any]]) -> None:
@@ -3024,6 +3314,27 @@ class KarnatakaRecoveryService:
                 hint = carrier_hints[0]
                 plans[query_index] = {"pass": "carrier_alias_recovery", "query": f'"{hint}" {row.get("district") or row.get("state")} official website'}
 
+        # The missing-query stage is a handoff stage, not a terminal decision
+        # stage. If its one logical query does not produce a safely verified
+        # website, preserve the best candidate (manual or unreachable) and move
+        # the source record to enhanced recovery. This prevents manual/fetch
+        # buckets from being mistaken for a completed search and avoids sending
+        # noisy carrier URLs directly to Firecrawl.
+        if mode == "missing_query_only" and (best_manual or best_unreachable):
+            verification, candidate, qinfo = best_manual or best_unreachable  # type: ignore[misc]
+            handoff = self._result_from_verification(
+                ctx, verification, candidate, qinfo,
+                "The missing logical query completed without a safely verified website. Preserve the candidate as evidence and continue through enhanced recovery.",
+            )
+            handoff.update({
+                "Discovery Status": "enhanced_search_required",
+                "Website Status": "enhanced_search_required",
+                "Retry Required": "yes",
+                "Retry Reason": "missing_query_completed_no_verified_site",
+                "Note": "The previously missing query completed, but this stage cannot make a final no-site, manual-review, or Firecrawl decision. Continue this source record through enhanced recovery.",
+            })
+            return handoff, ctx.audit
+
         if best_manual:
             verification, candidate, qinfo = best_manual
             status = "collision_identity_review" if mode == "identity_collision" else "plausible_site_identity_review"
@@ -3040,20 +3351,65 @@ class KarnatakaRecoveryService:
         elif ctx.failed_searches > 0:
             status = "search_partial"
             note = "At least one required logical search failed. Rerun the missing stage before making a no-site conclusion."
+        elif mode == "missing_query_only":
+            status = "enhanced_search_required"
+            note = "The previously missing logical query completed, but no owned or controlled website was verified. Continue this source record through enhanced recovery; this is not a no-site conclusion."
         else:
             status = "no_owned_site_after_enhanced_recovery"
             note = "No owned, controlled, parent or project page was verified after the mode's completed staged search. Directory/article/donor pages were not accepted as official websites."
+        retry_required = status in {"search_partial", "enhanced_search_required"}
+        retry_reason = (
+            "failed_logical_search" if status == "search_partial"
+            else "missing_query_completed_no_verified_site" if status == "enhanced_search_required"
+            else ""
+        )
         result.update({
             "Discovery Status": status, "Website Status": status, "Searched": "yes", "Logical Queries Used": ctx.logical_queries_used,
             "Provider Attempts": ctx.provider_attempts, "Successful Searches": ctx.successful_searches, "Failed Searches": ctx.failed_searches,
             "Candidate Count": ctx.candidate_count, "Candidates Verified": ctx.candidates_verified, "Carrier Pages Seen": ctx.carrier_pages_seen,
-            "Firecrawl Credits Used": ctx.firecrawl_credits_used, "Retry Required": "yes" if status == "search_partial" else "no",
-            "Retry Reason": "failed_logical_search" if status == "search_partial" else "", "Note": note,
+            "Firecrawl Credits Used": ctx.firecrawl_credits_used, "Retry Required": "yes" if retry_required else "no",
+            "Retry Reason": retry_reason, "Note": note,
         })
         return result, ctx.audit
 
     def _write_derived_exports(self, rd: Path) -> dict[str, int]:
         results = self._load_results(rd)
+
+        # Batch-level entity safety: one domain claimed by multiple independent
+        # source records cannot be auto-exported as the owned website of every
+        # record. Preserve every source row, but send the competing claims to
+        # manual identity resolution. This prevents same-brand organisations,
+        # parent sites and historical duplicates from silently entering Avika.
+        verified_domain_claims: dict[str, list[dict[str, Any]]] = {}
+        for result in results:
+            if result.get("Website") and result.get("Discovery Status") in VERIFIED_STATUSES:
+                host = hostname(str(result.get("Website") or ""))
+                if host:
+                    verified_domain_claims.setdefault(host, []).append(result)
+        batch_guard_changed = False
+        for host, claims in verified_domain_claims.items():
+            source_ids = {str(item.get("Source Record ID") or "") for item in claims if str(item.get("Source Record ID") or "")}
+            if len(source_ids) <= 1:
+                continue
+            for result in claims:
+                original_status = str(result.get("Discovery Status") or "verified")
+                result.update({
+                    "Discovery Status": "plausible_site_identity_review",
+                    "Website Status": "plausible_site_identity_review",
+                    "Page Type": "identity_collision_review",
+                    "Ownership Class": "multiple_source_records_claim_same_domain",
+                    "Confidence": "low",
+                    "Ownership Gate": "batch_domain_collision_fail_closed",
+                    "Risk Flags": "; ".join(x for x in [str(result.get("Risk Flags") or ""), "domain_claimed_by_multiple_source_records"] if x),
+                    "Identity Conflicts": "; ".join(x for x in [str(result.get("Identity Conflicts") or ""), f"domain {host} is claimed by {len(source_ids)} source records"] if x),
+                    "Retry Required": "no",
+                    "Retry Reason": "",
+                    "Note": (str(result.get("Note") or "") + f" Batch ownership guard downgraded {original_status}: domain {host} is claimed by multiple source records.").strip(),
+                })
+                batch_guard_changed = True
+        if batch_guard_changed:
+            self._rewrite_csv(rd / RESULT_FILES["results"], RESULT_FIELDS, results)
+
         manual = [row for row in results if row.get("Discovery Status") in MANUAL_STATUSES]
         no_site = [row for row in results if row.get("Discovery Status") == "no_owned_site_after_enhanced_recovery"]
         retry = [row for row in results if row.get("Discovery Status") in RETRY_STATUSES or str(row.get("Retry Required")).lower() == "yes"]
@@ -3076,7 +3432,7 @@ class KarnatakaRecoveryService:
             "recovery_mode_override": (
                 "firecrawl_retry" if row.get("Discovery Status") == "candidate_fetch_pending"
                 else "missing_query_only" if row.get("Discovery Status") == "search_partial"
-                else "enhanced_search" if row.get("Discovery Status") == "no_candidate_in_uploaded_row"
+                else "enhanced_search" if row.get("Discovery Status") in {"no_candidate_in_uploaded_row", "enhanced_search_required"}
                 else row.get("Recovery Mode", "")
             ),
         } for row in retry]
@@ -3104,12 +3460,12 @@ class KarnatakaRecoveryService:
         return {"manual_review": len(manual), "no_site": len(no_site), "retry": len(retry), "safe_verified": len(safe_verified)}
 
     def _summarise(self, rd: Path, settings: dict[str, Any], shared: dict[str, Any], serper_pool: SerperPool | None, firecrawl_pool: FirecrawlPool | None, started_at: float) -> dict[str, Any]:
+        derived = self._write_derived_exports(rd)
         results = self._load_results(rd)
         by_status: dict[str, int] = {}
         for row in results:
             status = str(row.get("Discovery Status") or "unknown")
             by_status[status] = by_status.get(status, 0) + 1
-        derived = self._write_derived_exports(rd)
         regression_counts: dict[str, int] = {}
         for row in results:
             check = str(row.get("Regression Check") or "not_applicable")
@@ -3175,7 +3531,8 @@ class KarnatakaRecoveryService:
                 serper_pool = SerperPool(serper_keys, safe_int(settings.get("serper_concurrency") or settings.get("serper_per_key_concurrency"), 4), self.serper_preflight_cache)
                 stats = serper_pool.preflight(bool(settings.get("preflight", True)))
                 if serper_pool.healthy_count() <= 0:
-                    self._write_status(rd, run_status="paused", stage="provider_capacity_unavailable", message="The configured Serper account did not pass preflight. Add credits or replace SERPER_API_KEY, then resume.", serper_key_stats=stats, can_resume=True, can_pause=False, can_cancel=False)
+                    self._write_status(rd, run_status="paused", stage="provider_capacity_unavailable", message="The configured Serper account did not pass preflight. The run is checkpointed and automatic resume will retry safely.", serper_key_stats=stats, can_resume=True, can_pause=False, can_cancel=False)
+                    self._schedule_auto_resume(rd, "serper_preflight_unavailable")
                     return
             firecrawl_enabled = bool(settings.get("use_firecrawl")) or selected_mode == "firecrawl_retry"
             if firecrawl_enabled:
@@ -3186,7 +3543,8 @@ class KarnatakaRecoveryService:
                 )
                 firecrawl_stats = firecrawl_pool.preflight()
                 if selected_mode == "firecrawl_retry" and not any(s.get("state") == "healthy" for s in firecrawl_stats):
-                    self._write_status(rd, run_status="paused", stage="firecrawl_capacity_unavailable", message="Firecrawl retry was selected but no healthy funded Firecrawl key is available.", firecrawl_key_stats=firecrawl_stats, can_resume=True, can_pause=False, can_cancel=False)
+                    self._write_status(rd, run_status="paused", stage="firecrawl_capacity_unavailable", message="Firecrawl retry was selected but no healthy funded Firecrawl key is available. Automatic resume will retry safely.", firecrawl_key_stats=firecrawl_stats, can_resume=True, can_pause=False, can_cancel=False)
+                    self._schedule_auto_resume(rd, "firecrawl_preflight_unavailable")
                     return
 
             requested = max(1, safe_int(settings.get("requested_concurrency"), MODE_SPECS[selected_mode]["default_concurrency"]))
@@ -3206,6 +3564,8 @@ class KarnatakaRecoveryService:
                 rd, run_status="running", stage="processing", processed=already, total=total, remaining=max(0, total - already),
                 progress_pct=round(already / total * 100, 2) if total else 100.0, requested_concurrency=requested,
                 effective_concurrency=effective, current_item="Starting queue", can_pause=True, can_cancel=True, can_resume=False,
+                auto_resume_enabled=bool(settings.get("auto_resume", True)), auto_resume_scheduled=False,
+                auto_resume_attempts=safe_int(settings.get("auto_resume_attempts"), 0),
                 serper_key_stats=serper_pool.stats() if serper_pool else [], firecrawl_key_stats=firecrawl_pool.stats() if firecrawl_pool else [],
                 query_cap=query_cap, queries_used=int(shared.get("logical_queries") or 0), firecrawl_credits_used=firecrawl_pool.used if firecrawl_pool else 0,
             )
@@ -3354,11 +3714,17 @@ class KarnatakaRecoveryService:
                 queries_used=summary.get("logical_queries_used", 0), provider_attempts=summary.get("provider_attempts", 0),
                 firecrawl_credits_used=summary.get("firecrawl_credits_used", 0), can_pause=False, can_cancel=False, can_resume=can_resume,
                 current_item="", avika_filter=avika_info, filtered_repository_rows=safe_int(avika_info.get("repository_rows")),
+                auto_resume_enabled=bool(settings.get("auto_resume", True)),
             )
+            if provider_pause:
+                self._schedule_auto_resume(rd, f"{provider_pause.provider}:{provider_pause.reason}")
+            elif final_status in {"complete", "cancelled"} or stage == "user_paused":
+                self._clear_auto_resume_schedule(rd)
         except Exception as exc:
             with (rd / RESULT_FILES["errors"]).open("a", encoding="utf-8") as handle:
                 handle.write(f"{utc_now()} fatal :: {type(exc).__name__}: {exc}\n")
-            self._write_status(rd, run_status="error", stage="error", error=str(exc)[:500], message="Karnataka recovery stopped because of an unexpected error.", can_resume=True, can_pause=False, can_cancel=False)
+            self._write_status(rd, run_status="error", stage="error", error=str(exc)[:500], message="Karnataka recovery stopped because of an unexpected error. The checkpoint supervisor will retry automatically.", can_resume=True, can_pause=False, can_cancel=False)
+            self._schedule_auto_resume(rd, f"unexpected_error:{type(exc).__name__}")
 
     def _register_routes(self) -> None:
         router = self.router
@@ -3413,6 +3779,11 @@ class KarnatakaRecoveryService:
                 healthy_firecrawl_keys=healthy_firecrawl,
                 firecrawl_key_stats=firecrawl_stats,
                 ownership_self_test=self.ownership_self_test,
+                max_upload_bytes=self.max_upload_bytes,
+                max_rows_per_run=self.max_rows_per_run,
+                auto_resume_enabled=self.auto_resume_enabled,
+                auto_resume_interval_seconds=self.auto_resume_interval_seconds,
+                auto_resume_max_attempts=self.auto_resume_max_attempts,
             )
 
         @router.post("/start")
@@ -3430,6 +3801,7 @@ class KarnatakaRecoveryService:
             firecrawl_proxy: str = "basic",
             run_avika: bool = False,
             row_deadline_seconds: int = 90,
+            auto_resume: bool = True,
         ) -> JSONResponse:
             mode = str(mode or "").strip().lower()
             if not self.ownership_self_test.get("passed"):
@@ -3440,21 +3812,41 @@ class KarnatakaRecoveryService:
                 active = [run_id for run_id, thread in self.threads.items() if thread.is_alive()]
             if active:
                 return self._json(False, 409, error="Another Karnataka Recovery run is active", active_runs=active)
-            data = await file.read(self.max_upload_bytes + 1)
-            if len(data) > self.max_upload_bytes:
-                return self._json(False, 413, error=f"CSV exceeds the {self.max_upload_bytes:,}-byte upload limit")
             run_id = f"karnataka_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
             rd = self._run_dir(run_id)
             rd.mkdir(parents=True, exist_ok=True)
-            (rd / RESULT_FILES["input"]).write_bytes(data)
+            uploaded_path = rd / RESULT_FILES["input"]
+            uploaded_bytes = 0
             try:
-                rows = read_input_csv(rd / RESULT_FILES["input"], mode)
+                with uploaded_path.open("wb") as handle:
+                    while True:
+                        chunk = await file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        uploaded_bytes += len(chunk)
+                        if uploaded_bytes > self.max_upload_bytes:
+                            handle.close()
+                            uploaded_path.unlink(missing_ok=True)
+                            rd.rmdir()
+                            return self._json(False, 413, error=f"CSV exceeds the {self.max_upload_bytes:,}-byte safety limit")
+                        handle.write(chunk)
+                rows = read_input_csv(uploaded_path, mode)
             except Exception as exc:
+                uploaded_path.unlink(missing_ok=True)
+                try:
+                    rd.rmdir()
+                except OSError:
+                    pass
                 return self._json(False, 400, error=f"Could not read CSV: {exc}")
             if not rows:
                 return self._json(False, 400, error="CSV contains no NGO rows. Include a name/ngo_name column.")
-            if len(rows) > 30000:
-                return self._json(False, 400, error="A single Karnataka Recovery upload is capped at 30,000 rows. Use the prepared split files.")
+            if len(rows) > self.max_rows_per_run:
+                uploaded_path.unlink(missing_ok=True)
+                try:
+                    rd.rmdir()
+                except OSError:
+                    pass
+                return self._json(False, 400, error=f"A single Karnataka Recovery upload is capped at {self.max_rows_per_run:,} rows. This release supports a 15,000-row batch.")
             serper_keys = parse_env_keys("SERPER_API_KEYS", "SERPER_API_KEY")
             needs_serper = any(MODE_SPECS[row.get("recovery_mode", mode)]["requires_serper"] for row in rows)
             if needs_serper and not serper_keys:
@@ -3489,6 +3881,11 @@ class KarnatakaRecoveryService:
                 "firecrawl_proxy": firecrawl_proxy if firecrawl_proxy in {"basic", "auto", "enhanced"} else "basic",
                 "run_avika": bool(run_avika),
                 "row_deadline_seconds": max(20, min(int(row_deadline_seconds), 240)),
+                "auto_resume": bool(auto_resume),
+                "auto_resume_attempts": 0,
+                "auto_resume_max_attempts": self.auto_resume_max_attempts,
+                "auto_resume_next_epoch": 0,
+                "upload_bytes": uploaded_bytes,
                 "created_at": utc_now(),
             }
             self._write_json(rd / RESULT_FILES["settings"], settings)
@@ -3503,6 +3900,9 @@ class KarnatakaRecoveryService:
                 serper_credit_budget=settings["serper_credit_budget"], serper_concurrency=settings["serper_concurrency"],
                 serper_account_configured=bool(serper_keys), configuration_warning=serper_account_warning(),
                 can_pause=True, can_cancel=True, can_resume=False, message="Queued Karnataka Recovery",
+                auto_resume_enabled=bool(settings.get("auto_resume", True)), auto_resume_scheduled=False,
+                auto_resume_attempts=0, auto_resume_max_attempts=self.auto_resume_max_attempts,
+                max_upload_bytes=self.max_upload_bytes, max_rows_per_run=self.max_rows_per_run, upload_bytes=uploaded_bytes,
             )
             self.controls[run_id] = {"pause": threading.Event(), "cancel": threading.Event()}
             thread = threading.Thread(target=self._run_job, args=(run_id,), daemon=True, name=f"karnataka-{run_id[-6:]}")
@@ -3519,10 +3919,17 @@ class KarnatakaRecoveryService:
             payload = self._status(rd)
             thread = self.threads.get(run_id)
             payload["thread_alive"] = bool(thread and thread.is_alive())
-            if payload.get("run_status") in {"starting", "running"} and not payload["thread_alive"]:
+            if payload.get("run_status") in {"starting", "running", "resuming"} and not payload["thread_alive"]:
                 payload["run_status"] = "interrupted"
                 payload["stage"] = "interrupted_restart"
                 payload["can_resume"] = True
+                payload["message"] = "Worker process restarted. Checkpoints are intact; automatic resume is scheduled."
+                self._write_status(rd, **{k: payload[k] for k in ("run_status", "stage", "can_resume", "message")})
+                settings = self._read_json(rd / RESULT_FILES["settings"])
+                if bool(settings.get("auto_resume", True)) and not float(settings.get("auto_resume_next_epoch") or 0):
+                    self._schedule_auto_resume(rd, "worker_restart", delay_seconds=5)
+                payload = self._status(rd)
+                payload["thread_alive"] = False
             # Status files intentionally persist an `ok` field. Passing it through
             # **payload together with the positional `ok` argument raises
             # `TypeError: got multiple values for argument ok`, which previously
@@ -3538,7 +3945,7 @@ class KarnatakaRecoveryService:
             if not controls or not thread or not thread.is_alive():
                 return self._json(False, 409, error="Run is not active")
             controls["pause"].set()
-            self._write_status(self._run_dir(run_id), run_status="pause_requested", stage="pause_requested", message="Finishing and checkpointing already-started source records before pausing.")
+            self._write_status(self._run_dir(run_id), run_status="pause_requested", stage="pause_requested", auto_resume_scheduled=False, message="Finishing and checkpointing already-started source records before pausing. Explicit user pauses are not automatically resumed.")
             return self._json(True, run_id=run_id, stage="pause_requested")
 
         @router.post("/cancel/{run_id}")
@@ -3563,18 +3970,11 @@ class KarnatakaRecoveryService:
                 active = [rid for rid, th in self.threads.items() if rid != run_id and th.is_alive()]
             if active:
                 return self._json(False, 409, error="Another Karnataka Recovery run is active", active_runs=active)
-            old = self._status(rd)
-            settings = self._read_json(rd / RESULT_FILES["settings"])
-            settings["logical_queries_before_resume"] = safe_int(old.get("queries_used"), 0)
-            settings["resume_count"] = safe_int(settings.get("resume_count"), 0) + 1
-            self._write_json(rd / RESULT_FILES["settings"], settings)
-            self.controls[run_id] = {"pause": threading.Event(), "cancel": threading.Event()}
-            self._write_status(rd, run_status="resuming", stage="resume_started", can_resume=False, can_pause=True, can_cancel=True, message="Resuming from source-record checkpoints.")
-            thread = threading.Thread(target=self._run_job, args=(run_id,), daemon=True, name=f"karnataka-{run_id[-6:]}")
-            with self.lock:
-                self.threads[run_id] = thread
-            thread.start()
-            return self._json(True, run_id=run_id, stage="resumed")
+            ok, detail = self._resume_saved_run(run_id, automatic=False, reason="manual_resume")
+            if not ok:
+                status_code = 409 if detail in {"Run is already active", "Another Karnataka Recovery run is active"} else 400
+                return self._json(False, status_code, error=detail)
+            return self._json(True, run_id=run_id, stage="resumed", auto_resume_enabled=True)
 
         @router.get("/runs")
         def runs(limit: int = 50) -> JSONResponse:

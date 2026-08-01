@@ -10,7 +10,7 @@ def _load_engine(monkeypatch):
     monkeypatch.setenv("AVIKA_RULE_PREFILTER", "true")
     monkeypatch.setenv("AVIKA_CLASSIFICATION_ONLY", "true")
     monkeypatch.setenv("AVIKA_SITE_TEXT_CHARS", "1500")
-    monkeypatch.setenv("AVIKA_MAX_TOKENS", "80")
+    monkeypatch.setenv("AVIKA_MAX_TOKENS", "120")
 
     fake = types.ModuleType("anthropic")
 
@@ -94,12 +94,14 @@ def test_compact_prompt_and_response(monkeypatch):
     }
     prompt = engine._ai_prompt_for_item(item)
     assert len(prompt) < 3000
-    assert engine._ai_max_tokens() == 80
-    assert "summary" not in prompt.lower()
+    assert engine._ai_max_tokens() == 120
+    assert "20-35 word plain-english description" in prompt.lower()
+    assert len(prompt) < 3000
     profile = engine.normalize_avika_profile(
-        {"m": "yes", "d": "maybe", "c": "medium", "r": "fees_unclear"}
+        {"m": "yes", "d": "maybe", "c": "medium", "r": "fees_unclear", "x": "Provides free learning and nutrition support to underserved children, though the website does not clearly explain programme scale or access criteria."}
     )
     assert profile["official_website_match"] == "yes"
     assert profile["decision"] == "maybe"
     assert profile["reason_code"] == "fees_unclear"
+    assert profile["summary"].startswith("Provides free learning")
     assert profile["partners_found"] == []

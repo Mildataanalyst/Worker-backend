@@ -1,32 +1,34 @@
 {
   "service": "DFP 2.0 search worker",
-  "version": "v78",
+  "version": "v83",
   "release_date": "2026-08-01",
   "railway_ready": true,
-  "module_version": "karnataka_recovery_v5_2_password_free_routes",
+  "module_version": "karnataka_recovery_v6_0_large_batch_auto_resume",
   "features": [
-    "fail-closed NGO website ownership verification",
-    "hard carrier, directory, fundraiser, vendor, article, travel, social and reference rejection",
-    "independent site-root ownership crosscheck for every deep or query URL",
-    "current-rule revalidation of every retained or historical URL regardless of its old label",
-    "known official fetch failure preservation instead of directory replacement",
-    "explicit parent/project and controlled hosted-microsite verification",
-    "three-layer safety enforcement: candidate verifier, final result guard and deterministic Avika-export rebuild",
-    "one SERPER_API_KEY only",
-    "permanent NGO IDs and immutable source-record IDs",
-    "resumable checkpoints and optional selective Firecrawl",
-    "status endpoint hotfix: persisted ok field no longer causes duplicate-keyword 500",
-    "Karnataka Recovery start, pause, cancel and resume are password-free"
+    "all Worker v82 strict source-identity, missing-query handoff and prefetch carrier protections retained",
+    "100 MB streamed upload safety cap; old 8 MB limit removed",
+    "up to 20000 Karnataka Recovery rows per run, supporting a 15000-row enhanced batch",
+    "up to 20000 compact Avika rows per run",
+    "durable automatic checkpoint resume after Railway restarts or worker interruption",
+    "automatic backoff and retry for transient provider-capacity pauses and unexpected errors",
+    "explicit user pause and cancellation remain manual and are never auto-resumed",
+    "single funded SERPER_API_KEY and checkpoint-per-source-record behaviour retained"
   ],
   "tests": {
-    "pytest": "98 passed",
-    "python_compile": "passed",
-    "built_in_ownership_guard": "18 deterministic cases passed"
+    "pytest": "124 passed",
+    "large_batch_15000": "passed",
+    "automatic_resume": "passed",
+    "strict_identity": "passed",
+    "python_compile": "passed"
   },
+  "compatible_with": [
+    "Core Backend v92",
+    "Frontend v163"
+  ],
+  "release": "DFP2 Worker v83",
   "notes": [
-    "Karnataka Recovery does not require ADMIN_PASSWORD. The frontend proxy may call it without credentials.",
-    "Unrelated consequential legacy endpoints remain protected when ADMIN_PASSWORD is configured.",
-    "Use SERPER_CONCURRENCY=4 initially. SERPER_API_KEYS is ignored.",
-    "Use Frontend v160 or newer; no frontend redeployment is required for this worker-only hotfix."
+    "Auto-resume is enabled by default and persists in each run settings file.",
+    "The supervisor restarts only the newest eligible incomplete run and never duplicates completed source records.",
+    "Uploads are streamed to disk before parsing to reduce memory pressure on 15000-row jobs."
   ]
 }

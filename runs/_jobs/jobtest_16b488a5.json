@@ -1,0 +1,13 @@
+{
+  "run_id": "jobtest_16b488a5",
+  "job_type": "unit_test",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "run_dir": "/tmp/v82/runs/jobtest_16b488a5",
+  "owner_pid": 5377,
+  "cancel_requested": false,
+  "created_at": "2026-08-01T15:45:50Z",
+  "updated_at": "2026-08-01T15:45:50Z",
+  "interrupted_at": "2026-08-01T15:45:50Z",
+  "live_state": "not_running"
+}

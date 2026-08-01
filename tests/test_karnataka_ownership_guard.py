@@ -497,3 +497,132 @@ def test_checkpoint_requires_site_root_confirmation_for_deep_verified_url(tmp_pa
     rows = service._load_results(run_dir)
     assert rows[0]["Discovery Status"] == "plausible_site_identity_review"
     assert "site-root" in rows[0]["Identity Conflicts"]
+
+
+def test_commercial_same_brand_domain_is_not_auto_verified_for_ngo():
+    source = row("PUSHPAM FOUNDATION", district="Bengaluru Urban")
+    body = "Pushpam Realty is a real estate developer building residential projects in Bengaluru. Pushpam Foundation supports community initiatives."
+    result = kr.identity_verification(
+        source,
+        "https://pushpamrealty.com/",
+        body,
+        "owned_site_candidate",
+        fetch_meta=fetch("https://pushpamrealty.com/", "Pushpam Realty", body, org_names=["Pushpam Realty"]),
+    )
+    assert result["status"] not in kr.VERIFIED_STATUSES
+
+
+def test_foreign_same_name_domain_requires_source_specific_identity():
+    source = row("SAHANA FOUNDATION", district="Koppal", state="Karnataka")
+    body = "Welcome to Sahana Foundation. Sahana Foundation supports communities in the United Kingdom."
+    result = kr.identity_verification(
+        source,
+        "https://sahanafoundation.org.uk/",
+        body,
+        "owned_site_candidate",
+        fetch_meta=fetch("https://sahanafoundation.org.uk/", "Sahana Foundation", body),
+    )
+    assert result["status"] not in kr.VERIFIED_STATUSES
+    assert "foreign_domain_without_source_specific_identity" in result["risk_flags"]
+
+
+def test_csr_page_without_supplied_parent_is_not_owned_ngo_site():
+    source = row("VATSALYA SEVA FOUNDATION", district="Mysuru")
+    body = "Vatsalya Seva Foundation is a CSR initiative of Chittara Media Networks."
+    result = kr.identity_verification(
+        source,
+        "https://chittaramedia.in/vatsalya-seva-foundation/",
+        body,
+        "owned_site_candidate",
+        fetch_meta=fetch("https://chittaramedia.in/vatsalya-seva-foundation/", "Vatsalya Seva Foundation", body, org_names=["Chittara Media Networks"]),
+    )
+    assert result["status"] not in kr.VERIFIED_STATUSES
+
+
+def test_generic_similar_ngo_domain_requires_source_specific_match():
+    source = row("SNEHA EDUCATION TRUST", district="Bengaluru Urban")
+    body = "Welcome to Sneha Charitable Trust. Sneha Charitable Trust works for children in Bengaluru."
+    result = kr.identity_verification(
+        source,
+        "https://snehacharitabletrust.org/",
+        body,
+        "owned_site_candidate",
+        fetch_meta=fetch("https://snehacharitabletrust.org/", "Sneha Charitable Trust", body, org_names=["Sneha Charitable Trust"]),
+    )
+    assert result["status"] not in kr.VERIFIED_STATUSES
+
+
+def test_batch_guard_downgrades_multiple_source_records_claiming_same_domain(tmp_path):
+    service = kr.KarnatakaRecoveryService(tmp_path, 1_000_000)
+    run_dir = tmp_path / "run-domain-collision"
+    run_dir.mkdir()
+    service._init_outputs(run_dir)
+    source_one = row("PUSHPAM FOUNDATION", source_record_id="SRC-P1")
+    source_two = row("PUSHPAM TRUST", source_record_id="SRC-P2")
+    for source in [source_one, source_two]:
+        result = kr.blank_result(source, "missing_query_only")
+        result.update({
+            "Website": "https://pushpamrealty.com/",
+            "Discovery Status": "verified_owned_site",
+            "Website Status": "verified_owned_site",
+            "Page Type": "owned_organisation_site",
+            "Ownership Class": "owned_organisation_site",
+            "Ownership Gate": "domain_control_plus_page_self_identity",
+            "Ownership Evidence": "domain carries public brand/acronym: PUSHPAM; page self-identifies as PUSHPAM",
+        })
+        service._append_csv(run_dir / kr.RESULT_FILES["results"], kr.RESULT_FIELDS, [result])
+    derived = service._write_derived_exports(run_dir)
+    results = service._load_results(run_dir)
+    assert derived["safe_verified"] == 0
+    assert derived["manual_review"] == 2
+    assert {item["Discovery Status"] for item in results} == {"plausible_site_identity_review"}
+    assert all("domain_claimed_by_multiple_source_records" in item["Risk Flags"] for item in results)
+
+@pytest.mark.parametrize("url", [
+    "https://housing.com/in/buy/projects/page/1-example",
+    "https://www.nobroker.in/locality-iq/example-bangalore",
+    "https://www.tripadvisor.com/Hotel_Review-example",
+    "https://www.99acres.com/example-project-npxid-r1",
+    "https://www.mappls.com/place-spas-near-example",
+    "https://www.commonfloor.com/example-project",
+    "https://www.squareyards.com/bangalore-residential-property/example",
+])
+def test_property_travel_map_domains_are_carriers_before_fetch(url):
+    source = row("EXAMPLE CHARITABLE TRUST")
+    assert kr.page_type_for_candidate(url, row=source) == "directory_or_registry"
+
+
+def test_prefetch_commercial_same_name_result_is_rejected_before_fetch():
+    source = row("HEBRON CHARITABLE TRUST", pincode="560076")
+    candidate_type = kr.page_type_for_candidate(
+        "https://www.hebronproperties.com/",
+        "Hebron Properties - Luxury Real Estate Developers",
+        "Luxury villas, plots and residential projects in Bangalore 560076.",
+        source,
+    )
+    assert candidate_type == "third_party_mention_candidate"
+
+
+def test_commercial_domain_not_verified_even_when_address_and_pincode_overlap():
+    source = row(
+        "PUSHPAM FOUNDATION",
+        registered_address="No 191 1st Block Byrasandra Jayanagar East Bengaluru 560011",
+        pincode="560011",
+    )
+    body = (
+        "Pushpam Realty is a real estate developer. Address #191 1st Block "
+        "Byrasandra Jayanagar East Bengaluru Karnataka 560011. Residential property sales."
+    )
+    result = kr.identity_verification(
+        source,
+        "https://pushpamrealty.com/",
+        body,
+        "owned_site_candidate",
+        fetch_meta=fetch(
+            "https://pushpamrealty.com/",
+            "Pushpam Realty",
+            body,
+            org_names=["Pushpam Realty"],
+        ),
+    )
+    assert result["status"] not in kr.VERIFIED_STATUSES

@@ -1,33 +1,33 @@
-# Search Worker v78 — Railway deployment
+# Search Worker v80 — Railway deployment
 
-1. Extract this ZIP into the root of the Git repository connected to the existing Railway search-worker service.
-2. Keep or attach a persistent volume at `/data`.
-3. Set the variables below:
+Deploy this repository to the existing worker Railway service. Keep a persistent volume mounted at `/data`.
+
+## Variables
 
 ```text
 RUNS_DIR=/data/runs
-ADMIN_PASSWORD=<your existing password>
+ADMIN_PASSWORD=<existing password>
 DFP2_PRODUCTION=true
 DFP2_SERVICE_ROLE=full
 FRONTEND_ORIGIN=https://<frontend>.up.railway.app
-SERPER_API_KEY=<single funded key>
+SERPER_API_KEY=<single funded Serper key>
 SERPER_CONCURRENCY=4
-ANTHROPIC_API_KEY=<existing key>
+ANTHROPIC_API_KEY=<existing Anthropic key>
+AVIKA_MAX_ROWS_PER_RUN=10000
+AVIKA_SITE_TEXT_CHARS=1800
+AVIKA_MAX_TOKENS=120
 ```
 
-4. Delete `SERPER_API_KEYS`, `DFP2_ADMIN_TOKEN` and `DFP2_REQUIRE_MUTATION_AUTH` if they remain from older releases.
-5. Leave `FIRECRAWL_API_KEY` unset until a generated fetch-retry queue actually requires it.
-6. Deploy and confirm:
+Do not configure `SERPER_API_KEYS`. Avika mode does not spend Serper credits; the Serper key remains necessary for ordinary discovery and recovery runs.
+
+Firecrawl remains optional:
 
 ```text
-GET /health
-GET /karnataka-recovery/ownership-self-test
-GET /karnataka-recovery/capacity?serper_concurrency=4
+FIRECRAWL_API_KEY=<only when required>
 ```
 
-7. Begin production with `RUN_01_zero_query_known_urls_6091.csv`; then follow the numbered recovery stages in the frontend.
+Health check:
 
-The service uses `ADMIN_PASSWORD` only. There is no separate mutation token.
-
-
-Karnataka Recovery routes do not require ADMIN_PASSWORD. CSV start, pause, cancel, resume, status and exports are password-free.
+```text
+/health
+```

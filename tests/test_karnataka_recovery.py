@@ -274,3 +274,153 @@ def test_karnataka_recovery_start_is_not_blocked_by_auth_middleware(monkeypatch,
     protected = client.post('/repository/delete')
     assert protected.status_code == 401
     assert protected.json()['error'] == 'Admin password required'
+
+
+def test_missing_query_without_verified_site_routes_to_enhanced_search(tmp_path):
+    service = kr.KarnatakaRecoveryService(tmp_path, 1_000_000)
+    source = base_row(
+        recovery_mode="missing_query_only",
+        failed_query_passes="public_brand_geo",
+        public_name="Example Learning Home",
+    )
+    shared = {"lock": __import__("threading").RLock(), "logical_queries": 0, "query_cap": 10}
+    result, _ = service._process_row(
+        source,
+        "missing_query_only",
+        FakeSerperPool({"organic": []}),
+        None,
+        shared,
+        False,
+        60,
+    )
+    assert result["Discovery Status"] == "enhanced_search_required"
+    assert result["Retry Required"] == "yes"
+    assert result["Retry Reason"] == "missing_query_completed_no_verified_site"
+    assert result["Logical Queries Used"] == 1
+    assert "not a no-site conclusion" in result["Note"]
+
+
+def test_missing_query_handoff_is_exported_as_enhanced_search_retry(tmp_path):
+    service = kr.KarnatakaRecoveryService(tmp_path, 1_000_000)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    service._init_outputs(run_dir)
+    source = base_row(
+        recovery_mode="missing_query_only",
+        failed_query_passes="public_brand_geo",
+        public_name="Example Learning Home",
+    )
+    shared = {"lock": __import__("threading").RLock(), "logical_queries": 0, "query_cap": 10}
+    result, events = service._process_row(
+        source,
+        "missing_query_only",
+        FakeSerperPool({"organic": []}),
+        None,
+        shared,
+        False,
+        60,
+    )
+    service._checkpoint(run_dir, source, "missing_query_only", result, events)
+    derived = service._write_derived_exports(run_dir)
+    assert derived["no_site"] == 0
+    assert derived["retry"] == 1
+    with (run_dir / kr.RESULT_FILES["retry"]).open(encoding="utf-8-sig", newline="") as handle:
+        retry = next(csv.DictReader(handle))
+    assert retry["previous_discovery_status"] == "enhanced_search_required"
+    assert retry["recovery_mode_override"] == "enhanced_search"
+
+
+def test_enhanced_search_without_verified_site_remains_terminal_no_site(tmp_path):
+    service = kr.KarnatakaRecoveryService(tmp_path, 1_000_000)
+    source = base_row(recovery_mode="enhanced_search")
+    shared = {"lock": __import__("threading").RLock(), "logical_queries": 0, "query_cap": 10}
+    result, _ = service._process_row(
+        source,
+        "enhanced_search",
+        FakeSerperPool({"organic": []}),
+        None,
+        shared,
+        False,
+        60,
+    )
+    assert result["Discovery Status"] == "no_owned_site_after_enhanced_recovery"
+    assert result["Retry Required"] == "no"
+
+
+def test_missing_query_manual_candidate_hands_off_to_enhanced_search(monkeypatch, tmp_path):
+    service = kr.KarnatakaRecoveryService(tmp_path, 1_000_000)
+    source = base_row(
+        name="Generic Hope Trust",
+        registration_reference="",
+        registered_address="",
+        pincode="",
+        recovery_mode="missing_query_only",
+        failed_query_passes="public_brand_geo",
+        public_name="Hope",
+    )
+    payload = {"organic": [{
+        "position": 1,
+        "title": "Hope",
+        "link": "https://hopeexample.org/",
+        "snippet": "Hope works with children in Bengaluru.",
+    }]}
+    monkeypatch.setattr(service, "_verify_one_candidate", lambda *args, **kwargs: {
+        "url": "https://hopeexample.org/",
+        "fetch_ok": True,
+        "fetch_status": "direct_ok",
+        "fetch_error": "",
+        "verified": False,
+        "status": "plausible_site_identity_review",
+        "page_type": "owned_organisation_site",
+        "ownership": "identity_review_required",
+        "confidence": "low",
+        "evidence": "name overlap",
+        "ownership_evidence": "brand-only domain",
+        "ownership_gate": "manual_ownership_insufficient",
+        "risk_flags": "generic_without_source_specific_identity",
+        "conflicts": "",
+        "evidence_score": 6,
+        "firecrawl_action": "",
+        "firecrawl_credits": 0,
+    })
+    result, _ = service._process_row(
+        source, "missing_query_only", FakeSerperPool(payload), None,
+        {"lock": __import__("threading").RLock(), "logical_queries": 0, "query_cap": 10},
+        False, 60,
+    )
+    assert result["Discovery Status"] == "enhanced_search_required"
+    assert result["Retry Required"] == "yes"
+    assert result["Website"] == "https://hopeexample.org/"
+
+
+def test_missing_query_unreachable_candidate_hands_off_to_enhanced_search(monkeypatch, tmp_path):
+    service = kr.KarnatakaRecoveryService(tmp_path, 1_000_000)
+    source = base_row(
+        recovery_mode="missing_query_only",
+        failed_query_passes="public_brand_geo",
+        public_name="Example Learning Home",
+    )
+    payload = {"organic": [{
+        "position": 1,
+        "title": "Example Learning Home",
+        "link": "https://examplechildren.org/",
+        "snippet": "Example Children Foundation Bengaluru Urban 560068.",
+    }]}
+    monkeypatch.setattr(kr, "fetch_direct", lambda url, remaining: {
+        "ok": False,
+        "text": "",
+        "url": url,
+        "status": 403,
+        "fetch_status": "blocked",
+        "error": "HTTP 403",
+        "firecrawl_recommended": True,
+    })
+    result, _ = service._process_row(
+        source, "missing_query_only", FakeSerperPool(payload), None,
+        {"lock": __import__("threading").RLock(), "logical_queries": 0, "query_cap": 10},
+        False, 60,
+    )
+    assert result["Discovery Status"] == "enhanced_search_required"
+    assert result["Retry Required"] == "yes"
+    assert result["Website"] == "https://examplechildren.org/"
+    assert result["Retry Reason"] == "missing_query_completed_no_verified_site"
