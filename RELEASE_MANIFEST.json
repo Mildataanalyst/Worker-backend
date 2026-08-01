@@ -1,9 +1,9 @@
 {
   "service": "DFP 2.0 search worker",
-  "version": "v77",
+  "version": "v78",
   "release_date": "2026-08-01",
   "railway_ready": true,
-  "module_version": "karnataka_recovery_v5_1_status_hotfix",
+  "module_version": "karnataka_recovery_v5_2_password_free_routes",
   "features": [
     "fail-closed NGO website ownership verification",
     "hard carrier, directory, fundraiser, vendor, article, travel, social and reference rejection",
@@ -15,17 +15,18 @@
     "one SERPER_API_KEY only",
     "permanent NGO IDs and immutable source-record IDs",
     "resumable checkpoints and optional selective Firecrawl",
-    "status endpoint hotfix: persisted ok field no longer causes duplicate-keyword 500"
+    "status endpoint hotfix: persisted ok field no longer causes duplicate-keyword 500",
+    "Karnataka Recovery start, pause, cancel and resume are password-free"
   ],
   "tests": {
-    "pytest": "96 passed",
+    "pytest": "98 passed",
     "python_compile": "passed",
     "built_in_ownership_guard": "18 deterministic cases passed"
   },
   "notes": [
-    "Production starts directly with RUN_01; the external 44-NGO test is not a gate.",
+    "Karnataka Recovery does not require ADMIN_PASSWORD. The frontend proxy may call it without credentials.",
+    "Unrelated consequential legacy endpoints remain protected when ADMIN_PASSWORD is configured.",
     "Use SERPER_CONCURRENCY=4 initially. SERPER_API_KEYS is ignored.",
-    "No separate mutation token is used; ADMIN_PASSWORD is the only credential.",
-    "Use Frontend v159 so browser polling and exports go through the same-origin proxy."
+    "Use Frontend v160 or newer; no frontend redeployment is required for this worker-only hotfix."
   ]
 }

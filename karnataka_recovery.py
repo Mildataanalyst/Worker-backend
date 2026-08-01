@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from ngo_identity import ensure_ngo_id, get_ngo_id
 
 
-MODULE_VERSION = "karnataka_recovery_v5_1_status_hotfix"
+MODULE_VERSION = "karnataka_recovery_v5_2_password_free_routes"
 
 MODE_SPECS: dict[str, dict[str, Any]] = {
     "regression_test": {

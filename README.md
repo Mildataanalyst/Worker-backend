@@ -1,4 +1,4 @@
-# DFP 2.0 Search Worker v77 — Final Ownership Guard
+# DFP 2.0 Search Worker v78 — Final Ownership Guard
 
 Complete Railway-deployable search worker for NGO Discovery and Karnataka Recovery.
 
@@ -43,3 +43,6 @@ GET /health
 GET /karnataka-recovery/ownership-self-test
 GET /karnataka-recovery/capacity?serper_concurrency=4
 ```
+
+
+Karnataka Recovery routes do not require ADMIN_PASSWORD. CSV start, pause, cancel, resume, status and exports are password-free.

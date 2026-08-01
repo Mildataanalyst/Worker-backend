@@ -654,13 +654,25 @@ async def service_role_middleware(request, call_next):
         })
     return await call_next(request)
 
+def _mutation_auth_exempt_path(path: str) -> bool:
+    """Routes intentionally available without an admin password.
+
+    Karnataka Recovery is an operator workflow, not a destructive admin
+    mutation. Requiring a password here caused every CSV upload, pause, cancel
+    and resume request to fail with HTTP 401 whenever the frontend proxy did not
+    carry a server-side password. Keep the legacy password guard for unrelated
+    consequential endpoints, but never gate the recovery module.
+    """
+    clean = (path or "/").rstrip("/") or "/"
+    return clean == "/karnataka-recovery" or clean.startswith("/karnataka-recovery/")
+
+
 @app.middleware("http")
 async def mutation_auth_middleware(request, call_next):
-    # Password-only mutation guard.  There is no second mutation token.
-    # The Next.js server proxy adds X-Admin-Password using the server-only
-    # ADMIN_PASSWORD variable. Bearer is accepted only as a transport alias
-    # for that same password; no second token variable exists.
-    if _is_mutating_method(request.method):
+    # Password-only mutation guard for unrelated consequential endpoints.
+    # Karnataka Recovery is explicitly password-free.
+    path = request.url.path or "/"
+    if _is_mutating_method(request.method) and not _mutation_auth_exempt_path(path):
         secret = _admin_secret()
         if secret:
             supplied = (request.headers.get("x-admin-password") or "").strip()

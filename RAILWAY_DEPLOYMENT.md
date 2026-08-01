@@ -1,4 +1,4 @@
-# Search Worker v77 — Railway deployment
+# Search Worker v78 — Railway deployment
 
 1. Extract this ZIP into the root of the Git repository connected to the existing Railway search-worker service.
 2. Keep or attach a persistent volume at `/data`.
@@ -28,3 +28,6 @@ GET /karnataka-recovery/capacity?serper_concurrency=4
 7. Begin production with `RUN_01_zero_query_known_urls_6091.csv`; then follow the numbered recovery stages in the frontend.
 
 The service uses `ADMIN_PASSWORD` only. There is no separate mutation token.
+
+
+Karnataka Recovery routes do not require ADMIN_PASSWORD. CSV start, pause, cancel, resume, status and exports are password-free.

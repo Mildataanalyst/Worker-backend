@@ -237,3 +237,40 @@ def test_status_route_handles_persisted_ok_field_without_500(tmp_path):
     assert payload["ok"] is True
     assert payload["run_id"] == run_id
     assert payload["run_status"] == "completed"
+
+
+def test_karnataka_recovery_paths_are_exempt_from_admin_password():
+    import main
+
+    assert main._mutation_auth_exempt_path('/karnataka-recovery/start') is True
+    assert main._mutation_auth_exempt_path('/karnataka-recovery/pause/run-1') is True
+    assert main._mutation_auth_exempt_path('/karnataka-recovery/cancel/run-1') is True
+    assert main._mutation_auth_exempt_path('/karnataka-recovery/resume/run-1') is True
+    assert main._mutation_auth_exempt_path('/repository/delete') is False
+
+
+def test_karnataka_recovery_start_is_not_blocked_by_auth_middleware(monkeypatch, tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    import main
+
+    monkeypatch.setenv('ADMIN_PASSWORD', 'still-protect-other-routes')
+    app = FastAPI()
+
+    @app.middleware('http')
+    async def guard(request, call_next):
+        return await main.mutation_auth_middleware(request, call_next)
+
+    @app.post('/karnataka-recovery/start')
+    async def recovery_start():
+        return {'ok': True}
+
+    @app.post('/repository/delete')
+    async def protected_delete():
+        return {'ok': True}
+
+    client = TestClient(app)
+    assert client.post('/karnataka-recovery/start').status_code == 200
+    protected = client.post('/repository/delete')
+    assert protected.status_code == 401
+    assert protected.json()['error'] == 'Admin password required'
