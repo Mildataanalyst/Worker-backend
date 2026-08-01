@@ -1,6 +1,7 @@
 import csv
 import difflib
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -388,7 +389,7 @@ def _reset_provider_runtime_state(run_id: str) -> None:
 def _serper_keys() -> list[str]:
     """Return the single funded Serper account configured for this deployment.
 
-    SERPER_API_KEYS is deliberately ignored in v73/v85. This prevents an old or
+    SERPER_API_KEYS is deliberately ignored in the final single-account release. This prevents an old or
     unfunded key from silently receiving a share of requests.
     """
     key = str(os.environ.get("SERPER_API_KEY", "") or "").strip()
@@ -612,9 +613,10 @@ async def all_exception_handler(request, exc):
 
 
 def _admin_secret() -> str:
-    # Global mutation middleware uses a dedicated token only.
-    # ADMIN_PASSWORD remains for explicit admin flows that read a password from the request body.
-    return (os.environ.get("DFP2_ADMIN_TOKEN") or "").strip()
+    # One credential only: reuse the existing ADMIN_PASSWORD.  The frontend
+    # forwards it server-side, so the password is never compiled into the
+    # browser bundle.  DFP2_ADMIN_TOKEN is intentionally ignored.
+    return (os.environ.get("ADMIN_PASSWORD") or "").strip()
 
 def _is_mutating_method(method: str) -> bool:
     return method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
@@ -654,22 +656,23 @@ async def service_role_middleware(request, call_next):
 
 @app.middleware("http")
 async def mutation_auth_middleware(request, call_next):
-    # Optional backend-side guard. When DFP2_ADMIN_TOKEN or ADMIN_PASSWORD is set,
-    # every mutating route must carry the matching token. This is still not a
-    # replacement for real SSO/auth at the network boundary, but it prevents the
-    # backend from being completely open if exposed.
+    # Password-only mutation guard.  There is no second mutation token.
+    # The Next.js server proxy adds X-Admin-Password using the server-only
+    # ADMIN_PASSWORD variable. Bearer is accepted only as a transport alias
+    # for that same password; no second token variable exists.
     if _is_mutating_method(request.method):
         secret = _admin_secret()
-        require = bool(secret) or os.environ.get("DFP2_REQUIRE_MUTATION_AUTH", "").lower() in {"1", "true", "yes"}
-        if require:
-            if not secret:
-                return JSONResponse(status_code=503, content={"ok": False, "stage": "auth_misconfigured", "error": "DFP2_REQUIRE_MUTATION_AUTH is enabled but DFP2_ADMIN_TOKEN is not set"})
-            supplied = (request.headers.get("x-dfp2-admin-token") or "").strip()
+        if secret:
+            supplied = (request.headers.get("x-admin-password") or "").strip()
             auth = request.headers.get("authorization") or ""
             if auth.lower().startswith("bearer "):
                 supplied = supplied or auth.split(" ", 1)[1].strip()
-            if supplied != secret:
-                return JSONResponse(status_code=401, content={"ok": False, "stage": "unauthorized", "error": "Admin authorization required"})
+            if not supplied or not hmac.compare_digest(supplied, secret):
+                return JSONResponse(status_code=401, content={
+                    "ok": False,
+                    "stage": "unauthorized",
+                    "error": "Admin password required",
+                })
     return await call_next(request)
 
 
@@ -704,7 +707,7 @@ def _with_force_cors_headers(response: Response, request) -> Response:
         response.headers["Vary"] = "Origin"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
         requested_headers = request.headers.get("access-control-request-headers")
-        response.headers["Access-Control-Allow-Headers"] = requested_headers or "authorization,content-type,x-dfp2-admin-token"
+        response.headers["Access-Control-Allow-Headers"] = requested_headers or "authorization,content-type,x-admin-password"
         response.headers["Access-Control-Max-Age"] = "600"
     return response
 

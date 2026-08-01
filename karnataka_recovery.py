@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
@@ -25,19 +26,19 @@ from fastapi.responses import FileResponse, JSONResponse
 from ngo_identity import ensure_ngo_id, get_ngo_id
 
 
-MODULE_VERSION = "karnataka_recovery_v2_single_serper_ngo_ids"
+MODULE_VERSION = "karnataka_recovery_v5_final_ownership_guard"
 
 MODE_SPECS: dict[str, dict[str, Any]] = {
     "regression_test": {
-        "label": "Technical regression test",
-        "description": "Small high-recall run for the known website-not-found, mismatch and fetch failures.",
+        "label": "Optional technical audit",
+        "description": "Optional historical 44-NGO audit. Production is protected by a deterministic built-in ownership guard and is not gated on this file.",
         "max_queries_per_row": 4,
         "requires_serper": True,
         "default_concurrency": 4,
     },
     "known_url_identity": {
-        "label": "Verify known URLs",
-        "description": "Zero-query identity verification for a URL already present in the source ledger.",
+        "label": "1. Verify known URLs / saved candidates",
+        "description": "Start here. Every retained URL is fetched and revalidated under current ownership rules without spending a Serper query.",
         "max_queries_per_row": 0,
         "requires_serper": False,
         "default_concurrency": 12,
@@ -50,7 +51,7 @@ MODE_SPECS: dict[str, dict[str, Any]] = {
         "default_concurrency": 12,
     },
     "missing_query_only": {
-        "label": "Run missing query only",
+        "label": "2. Run missing query only",
         "description": "Runs exactly one missing logical search; transient provider retries do not spend another logical query.",
         "max_queries_per_row": 1,
         "requires_serper": True,
@@ -64,7 +65,7 @@ MODE_SPECS: dict[str, dict[str, Any]] = {
         "default_concurrency": 12,
     },
     "new_unlinked": {
-        "label": "New / unlinked Darpan records",
+        "label": "4. New / unlinked Darpan records",
         "description": "Full staged discovery for source records with no defensible historical coverage.",
         "max_queries_per_row": 4,
         "requires_serper": True,
@@ -78,7 +79,7 @@ MODE_SPECS: dict[str, dict[str, Any]] = {
         "default_concurrency": 6,
     },
     "firecrawl_retry": {
-        "label": "Firecrawl fetch retry",
+        "label": "6. Firecrawl fetch retry",
         "description": "No Serper. Direct-fetches first and spends Firecrawl credits only on blocked/SSL/JavaScript failures.",
         "max_queries_per_row": 0,
         "requires_serper": False,
@@ -110,18 +111,21 @@ RESULT_FIELDS = [
     "NGO Name", "State", "District", "Darpan ID", "Registration Reference", "Registered Address", "Pincode",
     "Referral Name", "Public Name", "Project Name", "Parent Organisation", "Email", "Phone", "Sector Tags",
     "Website", "Discovery Status", "Website Status", "Page Type", "Ownership Class", "Confidence",
-    "Identity Evidence", "Identity Conflicts", "Evidence Page URL", "Fetch Status", "Fetch Errors",
+    "Identity Evidence", "Ownership Evidence", "Ownership Gate", "Risk Flags", "Identity Conflicts",
+    "Evidence Page URL", "Fetch Status", "Fetch Errors",
     "Search Provider", "Winning Query", "Query Pass", "Searched", "Logical Queries Used", "Provider Attempts",
     "Successful Searches", "Failed Searches", "Candidate Count", "Candidates Verified", "Carrier Pages Seen",
-    "Firecrawl Credits Used", "Firecrawl Action", "DFP Fit Status", "Retry Required", "Retry Reason", "Note",
-    "Checked At", "Module Version",
+    "Firecrawl Credits Used", "Firecrawl Action", "DFP Fit Status", "Previous Website Status", "Expected Outcome",
+    "Regression Expected Domain", "Regression Forbidden Domains", "Regression Check", "Regression Failure Reason",
+    "Retry Required", "Retry Reason", "Note", "Checked At", "Module Version",
 ]
 
 AUDIT_FIELDS = [
     "NGO ID", "Source Record ID", "NGO Name", "District", "Recovery Mode", "Event Time", "Stage", "Provider",
     "Logical Query Number", "Provider Attempt Number", "Query Pass", "Query", "Candidate Rank", "Candidate URL",
     "Candidate Title", "Candidate Snippet", "Candidate Source", "Candidate Domain", "Page Type", "Candidate Score",
-    "Decision", "Reject Reason", "Fetch Status", "Fetch Error", "Evidence", "Conflict", "Firecrawl Credits Used", "Note",
+    "Decision", "Reject Reason", "Fetch Status", "Fetch Error", "Evidence", "Ownership Evidence", "Ownership Gate",
+    "Risk Flags", "Conflict", "Firecrawl Credits Used", "Note",
 ]
 
 QUERY_PLAN_FIELDS = [
@@ -149,7 +153,7 @@ VERIFIED_STATUSES = {
 }
 
 MANUAL_STATUSES = {"plausible_site_identity_review", "collision_identity_review"}
-RETRY_STATUSES = {"candidate_fetch_pending", "search_partial", "skipped_query_cap", "provider_blocked"}
+RETRY_STATUSES = {"candidate_fetch_pending", "search_partial", "skipped_query_cap", "provider_blocked", "no_candidate_in_uploaded_row"}
 
 LEGAL_SUFFIXES = {
     "trust", "foundation", "society", "samsthe", "samiti", "samithi", "sanstha", "sangha", "mission",
@@ -159,7 +163,9 @@ LEGAL_SUFFIXES = {
 STOPWORDS = {"the", "of", "for", "and", "in", "a", "an", "to", "by", "at", "on"}
 GENERIC_TOKENS = {
     "asha", "seva", "hope", "care", "help", "sadhana", "pragathi", "pragati", "jeevan", "jyothi", "jyoti",
-    "foundation", "trust", "society", "welfare", "development", "education", "charitable", "social",
+    "vision", "divine", "mercy", "india", "indian", "children", "child", "school", "home", "special",
+    "academy", "centre", "center", "community", "rural", "public", "foundation", "trust", "society",
+    "welfare", "development", "education", "educational", "charitable", "social",
 }
 
 DIRECTORY_DOMAINS = {
@@ -168,6 +174,12 @@ DIRECTORY_DOMAINS = {
     "sulekha.com", "indiamart.com", "tracxn.com", "guidestarindia.org", "guidestar.org", "csrbox.org",
     "ngobox.org", "give.do", "globalgiving.org", "crunchbase.com", "rocketreach.co", "signalhire.com",
     "companydetails.in", "thecompanycheck.com", "tofler.in", "indiankanoon.org", "supremetoday.ai",
+    "milaap.org", "helpyourngo.com", "myngos.in", "ivolunteer.in", "divyangsathi.com", "tatanexarc.com",
+    "trip.com", "ixigo.com", "wypages.com", "aurumproptech.in", "tradeindia.com", "studyriserr.com",
+    "play.google.com", "scribd.com", "slideshare.net", "academia.edu", "researchgate.net",
+    "ketto.org", "impactguru.com", "fundrazr.com", "gofundme.com", "giveindia.org", "benevity.com",
+    "wikipedia.org", "wikidata.org", "wikimapia.org", "mapcarta.com", "zoominfo.com", "dnb.com",
+    "glassdoor.com", "ambitionbox.com", "indeed.com", "naukri.com", "jobhai.com", "apna.co",
 }
 SOCIAL_DOMAINS = {
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "youtube.com", "youtu.be",
@@ -178,12 +190,48 @@ NEWS_DOMAINS = {
     "newindianexpress.com", "yourstory.com", "thebetterindia.com", "medium.com", "news18.com", "ndtv.com",
     "indiatoday.in", "scroll.in", "thenewsminute.com", "indiancatholicmatters.org", "ecohq.in",
 }
+REFERENCE_DOMAINS = {
+    "ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov", "wpi.edu", "ieeexplore.ieee.org", "substack.com",
+    "mha.gov.in", "planning.karnataka.gov.in", "kla.kar.nic.in", "fcraonline.nic.in", "unodc.org",
+    "ohchr.org", "fs.usda.gov", "iufro.org", "thenationaltrust.gov.in", "thenationaltrust.in",
+    "archive.org", "issuu.com", "docs.google.com", "drive.google.com", "researchsquare.com", "springer.com",
+    "sciencedirect.com", "jstor.org", "semanticscholar.org", "core.ac.uk", "worldcat.org",
+}
+FOREIGN_CONFLICT_TLDS = {"pk", "bd", "lk", "np"}
+CARRIER_PATH_MARKERS = (
+    "/fundraiser", "/fundraisers", "/ngo-details/", "/company/", "/client", "/travel-guide/",
+    "/attraction/", "/document/", "/documents/", "/article/", "/articles/", "/blog/", "/post/",
+    "/posts/", "/news/", "/discover/", "/institutional-directory", "/registered_organization",
+    "/case-study", "/case-studies", "/success-story", "/success-stories", "/press-release",
+    "/media-coverage", "/year-end-update", "/school-kit-distribution", "/grant-recipient",
+    "/profile/", "/profiles/", "/directory/", "/listing/", "/listings/", "/clients/",
+    "/recipient/", "/recipients/", "/awardee/", "/awardees/", "/grantee/", "/grantees/",
+    "/funding/", "/grant/", "/grants/", "/partner-story", "/partner-stories",
+)
+CARRIER_TITLE_TERMS = (
+    "fundraiser", "company profile", "client we serve", "clients we serve", "travel guide", "attraction",
+    "ngos in", "ngo in karnataka", "ngo details", "registered organisations", "registered organizations",
+    "list of ngos", "research article", "country report", "government of india", "pdf",
+    "case study", "success story", "press release", "year end update", "school kit distribution",
+    "client profile", "our clients", "funded organisation", "funded organization",
+)
 HOSTED_PLATFORMS = {
     "1ngo.in", "site123.me", "wixsite.com", "wordpress.com", "blogspot.com", "weebly.com", "sites.google.com",
     "mystrikingly.com", "webs.com", "godaddysites.com",
 }
 FREE_EMAIL_DOMAINS = {
     "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "rediffmail.com", "icloud.com", "protonmail.com",
+}
+
+COMMON_SECOND_LEVEL_TLDS = {
+    "co.in", "org.in", "net.in", "ac.in", "edu.in", "gov.in", "res.in", "firm.in", "gen.in", "ind.in",
+    "co.uk", "org.uk", "com.au", "org.au", "co.nz", "org.nz",
+}
+
+ARTICLE_JSONLD_TYPES = {"article", "newsarticle", "blogposting", "report", "scholarlyarticle"}
+ORGANISATION_JSONLD_TYPES = {
+    "organization", "organisation", "ngo", "nonprofitorganization", "educationalorganization",
+    "school", "collegeoruniversity", "charity", "governmentorganization",
 }
 
 NAME_KEYS = ("name", "ngo_name", "NGO Name", "Organisation", "Organization", "organisation", "organization")
@@ -209,6 +257,11 @@ SECTOR_KEYS = ("sector_tags", "Sector Tags", "sectors", "Sectors")
 ACTION_KEYS = ("next_action", "Next Action", "queue_action", "Queue Action")
 FAILED_QUERY_KEYS = ("failed_query_passes", "Failed Query Passes")
 MODE_OVERRIDE_KEYS = ("recovery_mode_override", "Recovery Mode Override", "recovery_mode", "Recovery Mode")
+PREVIOUS_STATUS_KEYS = ("previous_website_status", "Previous Website Status", "initial_status_or_reason", "Initial Status or Reason")
+EXPECTED_OUTCOME_KEYS = ("expected_outcome", "Expected Outcome", "regression_expected_outcome", "Regression Expected Outcome")
+EXPECTED_DOMAIN_KEYS = ("regression_expected_domain", "Regression Expected Domain", "expected_domain", "Expected Domain")
+FORBIDDEN_DOMAIN_KEYS = ("regression_forbidden_domains", "Regression Forbidden Domains", "forbidden_domains", "Forbidden Domains")
+DFP_FIT_KEYS = ("dfp_fit_status", "DFP Fit Status", "programme_fit_status", "Program Fit Status", "shortlist_status", "Shortlist Status")
 
 
 class ProviderUnavailable(RuntimeError):
@@ -285,6 +338,94 @@ def acronym(value: Any) -> str:
     return candidate if 3 <= len(candidate) <= 12 else ""
 
 
+def legal_acronym(value: Any) -> str:
+    """Acronym that keeps legal-form words when they are part of the brand.
+
+    This recovers domains such as vdct.in and srmab.org.in without weakening
+    the normal name matcher.  It deliberately ignores one-letter fragments and
+    common stopwords.
+    """
+    words = [w for w in norm(value).split() if w not in STOPWORDS and len(w) > 1]
+    if len(words) < 3:
+        return ""
+    candidate = "".join(w[0] for w in words).upper()
+    return candidate if 3 <= len(candidate) <= 12 else ""
+
+
+def explicit_brand_tokens(row: dict[str, Any] | None) -> list[str]:
+    if not row:
+        return []
+    values = [
+        row.get("referral_name"), row.get("public_name"), row.get("project_name"),
+        row.get("parent_organisation"), row.get("name"),
+    ]
+    out: list[str] = []
+    for value in values:
+        raw = str(value or "")
+        # Parenthesised or explicitly capitalised brands are strong public-name
+        # clues: SACRED, BREADS, SRMAB, etc.  Legal-form words are excluded.
+        for token in re.findall(r"\b[A-Z][A-Z0-9&]{2,11}\b", raw):
+            low = token.lower()
+            if low in LEGAL_SUFFIXES or low in STOPWORDS or low in GENERIC_TOKENS:
+                continue
+            if token not in out:
+                out.append(token)
+        for token in re.findall(r"\(([^()]{3,20})\)", raw):
+            clean = re.sub(r"[^A-Za-z0-9]", "", token).upper()
+            if 3 <= len(clean) <= 12 and clean.lower() not in GENERIC_TOKENS and clean not in out:
+                out.append(clean)
+    return out[:12]
+
+
+def registrable_label(host: str) -> str:
+    labels = [part for part in str(host or "").lower().strip(".").split(".") if part]
+    if len(labels) < 2:
+        return labels[0] if labels else ""
+    suffix2 = ".".join(labels[-2:])
+    if suffix2 in COMMON_SECOND_LEVEL_TLDS and len(labels) >= 3:
+        return labels[-3]
+    return labels[-2]
+
+
+def hosted_slug(host: str) -> str:
+    labels = [part for part in str(host or "").lower().strip(".").split(".") if part]
+    if not labels:
+        return ""
+    if domain_matches(host, HOSTED_PLATFORMS) and len(labels) >= 3:
+        return labels[0]
+    return ""
+
+
+def phrase_token_overlap(left: Any, right: Any) -> float:
+    a = set(tokenise_name(left, drop_legal=False))
+    b = set(tokenise_name(right, drop_legal=False))
+    if not a or not b:
+        return 0.0
+    return len(a & b) / max(1, max(len(a), len(b)))
+
+
+def value_matches_identity(value: Any, row: dict[str, Any] | None, *, exact_for_generic: bool = True) -> bool:
+    if not row:
+        return False
+    value_norm = norm(value)
+    if len(value_norm) < 3:
+        return False
+    for alias in identity_aliases(row):
+        alias_norm = norm(alias)
+        if not alias_norm:
+            continue
+        if alias_norm == value_norm:
+            return True
+        generic = len(distinctive_tokens(alias)) <= 1
+        if generic and exact_for_generic:
+            continue
+        if len(alias_norm) >= 6 and alias_norm in value_norm:
+            return True
+        if phrase_token_overlap(alias, value) >= 0.8:
+            return True
+    return False
+
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(float(str(value).strip()))
@@ -313,19 +454,23 @@ def domain_matches(host: str, domains: set[str]) -> bool:
 
 
 def is_public_hostname(host: str) -> bool:
-    if not host or "." not in host or host.endswith("."):
-        return False
-    if host in {"localhost", "0.0.0.0"} or host.endswith(".local"):
+    """Validate URL hosts without performing DNS during CSV ingestion.
+
+    The earlier implementation synchronously resolved every candidate while a
+    CSV was being parsed. Large 6k-20k uploads could therefore stall before a run
+    was even created. Literal private/loopback addresses and local hostnames are
+    still rejected; normal public DNS resolution is left to the bounded fetch.
+    """
+    host = str(host or "").lower().strip(".")
+    if not host or host in {"localhost", "0.0.0.0"} or host.endswith(".local"):
         return False
     try:
-        ip = socket.gethostbyname(host)
-        parts = [int(x) for x in ip.split(".")]
-        if parts[0] in {10, 127} or (parts[0] == 169 and parts[1] == 254) or (parts[0] == 172 and 16 <= parts[1] <= 31) or (parts[0] == 192 and parts[1] == 168):
-            return False
-    except Exception:
-        # DNS may fail temporarily. The syntactic host is still retained so the
-        # fetch layer can classify the failure without constructing bad variants.
+        parsed_ip = ipaddress.ip_address(host)
+        return bool(parsed_ip.is_global)
+    except ValueError:
         pass
+    if "." not in host or host.endswith("."):
+        return False
     return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,63}", host))
 
 
@@ -372,6 +517,29 @@ def url_variants(value: Any, limit: int = 2) -> list[str]:
     return out
 
 
+def site_root_url(value: Any) -> str:
+    """Return the public origin root used for independent site-owner checks."""
+    url = normalise_url(value)
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme or "https", parsed.netloc, "/", "", "", ""))
+
+
+def requires_site_root_crosscheck(value: Any) -> bool:
+    """Deep pages and query URLs need a separate root-owner confirmation.
+
+    A third-party article can make its article title, H1 and body look exactly like
+    an NGO. The root page identifies who actually controls the domain.
+    """
+    url = normalise_url(value)
+    if not url:
+        return False
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    return path not in {"", "/"} or bool(parsed.query)
+
+
 def extract_urls(value: Any) -> list[str]:
     text = str(value or "")
     raw_urls = re.findall(r"(?:https?://|www\.)[^\s,;|\]\[()<>]+", text, flags=re.I)
@@ -385,18 +553,194 @@ def extract_urls(value: Any) -> list[str]:
     return out
 
 
+def previous_website_status(row: dict[str, Any] | None) -> str:
+    if not row:
+        return ""
+    for key in (
+        "previous_website_status", "Previous Website Status", "initial_status_or_reason",
+        "Initial Status or Reason", "website_status", "Website Status",
+    ):
+        value = norm(row.get(key))
+        if value:
+            return value
+    return ""
+
+
+def is_historical_mismatch(row: dict[str, Any] | None) -> bool:
+    status = previous_website_status(row)
+    return "mismatch" in status or "wrong website" in status or "wrong site" in status
+
+
+def domain_identity_profile(row: dict[str, Any] | None, url: str) -> dict[str, Any]:
+    """Return domain-control evidence separately from page-content relevance.
+
+    A donor/article page can contain the exact NGO name.  It cannot, however,
+    make an unrelated host become NGO-controlled.  This profile therefore uses
+    only the hostname, known aliases and supplied organisational email domain.
+    """
+    if not row:
+        return {"strong": [], "weak": [], "all": [], "score": 0, "root": "", "hosted_slug": ""}
+    host = hostname(url)
+    root = registrable_label(host)
+    slug = hosted_slug(host)
+    host_compact = compact(host)
+    root_compact = compact(root)
+    labels = {compact(part) for part in host.split(".") if compact(part)}
+    strong: list[str] = []
+    weak: list[str] = []
+
+    email = str(row.get("email") or "").strip().lower()
+    if "@" in email:
+        email_host = email.rsplit("@", 1)[-1].lstrip("www.")
+        if email_host and (host == email_host or host.endswith("." + email_host)):
+            strong.append("domain matches supplied organisational email")
+
+    aliases = identity_aliases(row)
+    brands = explicit_brand_tokens(row)
+    legal_forms = {"trust", "foundation", "society", "samsthe", "samiti", "mission", "association", "academy", "school", "home"}
+    for alias in aliases:
+        alias_full = compact(alias)
+        stripped = compact(" ".join(tokenise_name(alias)))
+        alias_tokens_all = tokenise_name(alias, drop_legal=False)
+        alias_tokens_distinctive = distinctive_tokens(alias)
+        alias_generic = len(alias_tokens_distinctive) <= 1
+        alias_legal_forms = [token for token in alias_tokens_all if token in legal_forms]
+
+        # Full or stripped names embedded in the registrable label are strong.
+        for phrase, label in ((alias_full, "full identity"), (stripped, "identity phrase")):
+            if len(phrase) < 6:
+                continue
+            if alias_generic:
+                matched = phrase == root_compact or phrase in labels
+            else:
+                generic_roots = {compact(token) for token in (GENERIC_TOKENS | LEGAL_SUFFIXES | STOPWORDS)}
+                root_is_specific = bool(root_compact and root_compact not in generic_roots)
+                matched = (
+                    phrase == root_compact
+                    or phrase in root_compact
+                    or (root_is_specific and root_compact in phrase and len(root_compact) >= 7)
+                    or phrase in labels
+                )
+            if matched:
+                strong.append(f"domain carries {label}: {phrase}")
+
+        # Official domains frequently use the main word plus a legal form, e.g.
+        # pragathitrust.org.  This remains stronger than a generic-name match on
+        # an unrelated domain such as divinemercydevotion.net.
+        core_tokens = [t for t in alias_tokens_all if t not in LEGAL_SUFFIXES and t not in STOPWORDS]
+        if alias_legal_forms and core_tokens:
+            for core_token in core_tokens:
+                for legal_form in alias_legal_forms:
+                    combo = compact(core_token + legal_form)
+                    if len(combo) >= 7 and combo in root_compact:
+                        strong.append(f"domain carries name plus legal form: {combo}")
+
+        for acro in (acronym(alias), legal_acronym(alias)):
+            ac = compact(acro)
+            if len(ac) >= 3 and (root_compact == ac or ac in labels or (len(ac) >= 4 and root_compact.startswith(ac))):
+                strong.append(f"domain carries organisation acronym: {acro}")
+
+        hits = [token for token in alias_tokens_distinctive if len(token) >= 4 and token in root_compact]
+        if len(alias_tokens_distinctive) >= 2 and len(hits) >= 2:
+            strong.append("domain carries multiple distinctive identity tokens: " + ", ".join(hits[:4]))
+        elif len(alias_tokens_distinctive) == 1 and hits and len(hits[0]) >= 6:
+            weak.append(f"domain carries one distinctive identity token: {hits[0]}")
+
+        # A named hosted-platform subdomain is a real control signal.  Generic
+        # names still require location/contact and page self-identification later.
+        if slug:
+            slug_compact = compact(slug)
+            generic_alias = compact(" ".join(tokenise_name(alias, drop_legal=False)))
+            if len(generic_alias) >= 5 and (slug_compact == generic_alias or generic_alias.startswith(slug_compact) or slug_compact.startswith(generic_alias)):
+                strong.append(f"hosted subdomain carries identity slug: {slug}")
+
+    for brand in brands:
+        brand_compact = compact(brand)
+        if len(brand_compact) >= 4 and (root_compact == brand_compact or root_compact.startswith(brand_compact) or brand_compact in labels):
+            strong.append(f"domain carries public brand/acronym: {brand}")
+        elif len(brand_compact) >= 5 and brand_compact in host_compact:
+            strong.append(f"host carries public brand/acronym: {brand}")
+
+    strong = list(dict.fromkeys(strong))
+    weak = [item for item in dict.fromkeys(weak) if item not in strong]
+    return {
+        "strong": strong,
+        "weak": weak,
+        "all": strong + weak,
+        "score": len(strong) * 3 + len(weak),
+        "root": root,
+        "hosted_slug": slug,
+    }
+
+
+def domain_identity_signals(row: dict[str, Any] | None, url: str) -> list[str]:
+    return list(domain_identity_profile(row, url).get("all") or [])
+
+
+def obvious_carrier_reason(url: str, title: str = "", snippet: str = "", row: dict[str, Any] | None = None) -> str:
+    host = hostname(url)
+    parsed = urlparse(url)
+    path = (parsed.path or "/").lower()
+    blob = norm(" ".join([title, snippet]))
+    domain_profile = domain_identity_profile(row, url)
+    strong_domain = bool(domain_profile.get("strong"))
+    if domain_matches(host, DIRECTORY_DOMAINS):
+        return "known directory, fundraising, marketplace or profile platform"
+    if domain_matches(host, SOCIAL_DOMAINS):
+        return "social-media page"
+    if domain_matches(host, NEWS_DOMAINS):
+        return "known news or profile publisher"
+    if (
+        domain_matches(host, REFERENCE_DOMAINS)
+        or host.endswith(".gov.in")
+        or host.endswith(".nic.in")
+        or ((host.endswith(".edu") or host.endswith(".ac.in")) and not strong_domain)
+    ):
+        return "government, academic or reference source"
+    tld = host.rsplit(".", 1)[-1] if "." in host else ""
+    if tld in FOREIGN_CONFLICT_TLDS:
+        return f"foreign country-code domain .{tld} conflicts with Karnataka identity"
+    if path.endswith(".pdf") or "/pdf/" in path or "/pdf-" in path:
+        return "PDF/reference document"
+    if not strong_domain:
+        if any(marker in path for marker in CARRIER_PATH_MARKERS):
+            return "article, directory, fundraiser, client or profile URL pattern"
+        if re.search(r"/(?:19|20)\d{2}/\d{1,2}/(?:\d{1,2}/)?", path):
+            return "dated article/blog URL pattern"
+        slug_blob = norm(path.replace("-", " ").replace("_", " "))
+        if re.search(r"\b(distribution|fundraiser|recipient|awardee|grantee|profile|interview|visit|updates?)\b", slug_blob) and re.search(r"\b(by|at|for|of)\b", slug_blob):
+            return "article/event/profile URL slug on a non-identity domain"
+        if re.search(r"\b(\d{2}|\d{4}) years? of\b", slug_blob):
+            return "anniversary/article URL slug on a non-identity domain"
+        if any(term in blob for term in CARRIER_TITLE_TERMS):
+            return "search title indicates a directory, article, client list or reference page"
+    return ""
+
+
 def page_type_for_candidate(url: str, title: str = "", snippet: str = "", row: dict[str, Any] | None = None) -> str:
     host = hostname(url)
-    if domain_matches(host, DIRECTORY_DOMAINS):
-        return "directory_or_registry"
-    if domain_matches(host, SOCIAL_DOMAINS):
-        return "social_media"
-    if domain_matches(host, NEWS_DOMAINS):
-        return "article_or_profile"
+    carrier_reason = obvious_carrier_reason(url, title, snippet, row)
+    if carrier_reason:
+        if domain_matches(host, SOCIAL_DOMAINS):
+            return "social_media"
+        if domain_matches(host, DIRECTORY_DOMAINS):
+            return "directory_or_registry"
+        if domain_matches(host, NEWS_DOMAINS):
+            return "article_or_profile"
+        if "foreign country-code" in carrier_reason:
+            return "wrong_entity"
+        if "government" in carrier_reason or "academic" in carrier_reason or "reference" in carrier_reason or "PDF" in carrier_reason:
+            return "government_academic_or_document_reference"
+        return "third_party_mention_candidate"
     if domain_matches(host, HOSTED_PLATFORMS):
         return "controlled_hosted_microsite_candidate"
     blob = norm(" ".join([title, snippet, url]))
-    if re.search(r"\b(donate[sd]? to|supported by|partner(?:ed)? with|grantee|funded by|news|article|story|profile)\b", blob):
+    # These words are useful only when the host does not itself carry the NGO's
+    # identity.  On an NGO-owned domain, a news/story/donate page is still owned.
+    if not domain_identity_profile(row, url).get("strong") and re.search(
+        r"\b(donate[sd]? to|supported by|partner(?:ed)? with|grantee|funded by|client(?:s)?|case study|news|article|story|profile)\b",
+        blob,
+    ):
         return "third_party_mention_candidate"
     if row:
         project = norm(row.get("project_name"))
@@ -414,8 +758,13 @@ def page_type_after_verification(candidate_type: str, url: str, row: dict[str, A
     project = norm(row.get("project_name") or row.get("referral_name"))
     parent = norm(row.get("parent_organisation"))
     legal = norm(row.get("name"))
-    relation_terms = any(term in relation_blob for term in ["project of", "initiative of", "operated by", "run by", "managed by", "unit of", "a programme of", "a program of"])
-    if candidate_type == "parent_or_project_candidate" or (project and project in relation_blob and parent and parent in relation_blob and relation_terms):
+    relation_terms = any(term in relation_blob for term in [
+        "project of", "initiative of", "operated by", "run by", "managed by", "unit of",
+        "a programme of", "a program of", "part of", "under the aegis of",
+    ])
+    if candidate_type == "parent_or_project_candidate" and relation_terms:
+        return "verified_parent_or_project_page"
+    if project and project in relation_blob and parent and parent in relation_blob and relation_terms:
         return "verified_parent_or_project_page"
     if parent and parent in relation_blob and legal and legal in relation_blob and relation_terms:
         return "verified_parent_or_project_page"
@@ -442,6 +791,9 @@ class AuditEvent:
     fetch_status: str = ""
     fetch_error: str = ""
     evidence: str = ""
+    ownership_evidence: str = ""
+    ownership_gate: str = ""
+    risk_flags: str = ""
     conflict: str = ""
     firecrawl_credits_used: int = 0
     note: str = ""
@@ -840,6 +1192,11 @@ def canonicalise_row(raw: dict[str, Any], row_number: int, mode: str, used_ids: 
         "sector_tags": first_value(raw, SECTOR_KEYS),
         "queue_action": first_value(raw, ACTION_KEYS),
         "failed_query_passes": first_value(raw, FAILED_QUERY_KEYS),
+        "previous_website_status": first_value(raw, PREVIOUS_STATUS_KEYS),
+        "expected_outcome": first_value(raw, EXPECTED_OUTCOME_KEYS),
+        "regression_expected_domain": first_value(raw, EXPECTED_DOMAIN_KEYS),
+        "regression_forbidden_domains": first_value(raw, FORBIDDEN_DOMAIN_KEYS),
+        "dfp_fit_status": first_value(raw, DFP_FIT_KEYS),
         "recovery_mode": effective_mode,
     })
     # Preserve a historical ID when supplied; otherwise generate a stable DFP ID
@@ -1028,8 +1385,12 @@ def score_candidate(candidate: dict[str, Any], row: dict[str, Any]) -> tuple[int
     title = candidate.get("title", "")
     snippet = candidate.get("snippet", "")
     page_type = page_type_for_candidate(url, title, snippet, row)
-    if page_type in {"directory_or_registry", "social_media", "article_or_profile", "third_party_mention_candidate"}:
-        return -1000, page_type, "third-party/carrier page cannot be selected as the NGO website"
+    if page_type in {
+        "directory_or_registry", "social_media", "article_or_profile", "third_party_mention_candidate",
+        "government_academic_or_document_reference", "wrong_entity",
+    }:
+        reason = obvious_carrier_reason(url, title, snippet, row) or "third-party/carrier page cannot be selected as the NGO website"
+        return -1000, page_type, reason
     blob = norm(" ".join([title, snippet, hostname(url), url]))
     aliases = identity_aliases(row)
     legal_norm = norm(row.get("name"))
@@ -1048,10 +1409,15 @@ def score_candidate(candidate: dict[str, Any], row: dict[str, Any]) -> tuple[int
         score += int(overlap * 28)
         if overlap >= 0.6:
             reasons.append(f"name-token overlap {overlap:.0%}")
-    host_tokens = set(norm(hostname(url)).split())
-    if any(token in host_tokens or token in compact(hostname(url)) for token in core if len(token) >= 4):
-        score += 18
-        reasons.append("domain/name overlap")
+    domain_profile = domain_identity_profile(row, url)
+    strong_domain = list(domain_profile.get("strong") or [])
+    weak_domain = list(domain_profile.get("weak") or [])
+    if strong_domain:
+        score += 30
+        reasons.extend(strong_domain[:2])
+    elif weak_domain:
+        score += 8
+        reasons.extend(weak_domain[:1])
     district = norm(row.get("district"))
     pin = row.get("pincode", "")
     registration = norm(row.get("registration_reference"))
@@ -1072,169 +1438,737 @@ def score_candidate(candidate: dict[str, Any], row: dict[str, Any]) -> tuple[int
     return score, page_type, "; ".join(reasons) or "weak identity signal"
 
 
+def _jsonld_nodes(value: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        graph = value.get("@graph")
+        if isinstance(graph, list):
+            for item in graph:
+                yield from _jsonld_nodes(item)
+        for key, child in value.items():
+            if key == "@graph":
+                continue
+            if isinstance(child, (dict, list)):
+                yield from _jsonld_nodes(child)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _jsonld_nodes(item)
+
+
+def _jsonld_type_values(node: dict[str, Any]) -> list[str]:
+    raw = node.get("@type")
+    values = raw if isinstance(raw, list) else [raw]
+    return [norm(value).replace(" ", "") for value in values if value]
+
+
+def extract_page_metadata(soup: BeautifulSoup, final_url: str) -> dict[str, Any]:
+    def meta_value(*, name: str = "", prop: str = "") -> str:
+        attrs: dict[str, Any] = {}
+        if name:
+            attrs["name"] = re.compile(rf"^{re.escape(name)}$", re.I)
+        if prop:
+            attrs["property"] = re.compile(rf"^{re.escape(prop)}$", re.I)
+        node = soup.find("meta", attrs=attrs)
+        return re.sub(r"\s+", " ", str(node.get("content") or "")).strip() if node and node.get("content") else ""
+
+    canonical = ""
+    canonical_node = soup.find("link", attrs={"rel": lambda value: value and "canonical" in [str(x).lower() for x in (value if isinstance(value, list) else [value])]})
+    if canonical_node and canonical_node.get("href"):
+        canonical = normalise_url(urljoin(final_url, str(canonical_node.get("href"))))
+
+    h1_text = " | ".join(
+        re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
+        for node in soup.find_all("h1", limit=4)
+        if node.get_text(" ", strip=True)
+    )
+    footer_text = " | ".join(
+        re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
+        for node in soup.find_all("footer", limit=3)
+        if node.get_text(" ", strip=True)
+    )[:6000]
+
+    jsonld_types: list[str] = []
+    jsonld_names: list[str] = []
+    jsonld_urls: list[str] = []
+    jsonld_org_names: list[str] = []
+    for script in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
+        raw = script.string or script.get_text(" ", strip=True)
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        for node in _jsonld_nodes(parsed):
+            types = _jsonld_type_values(node)
+            jsonld_types.extend(types)
+            name = str(node.get("name") or node.get("legalName") or "").strip()
+            if name:
+                jsonld_names.append(name)
+                if any(t in ORGANISATION_JSONLD_TYPES for t in types):
+                    jsonld_org_names.append(name)
+            for key in ("url", "sameAs"):
+                value = node.get(key)
+                values = value if isinstance(value, list) else [value]
+                for item in values:
+                    if isinstance(item, str):
+                        u = normalise_url(item)
+                        if u:
+                            jsonld_urls.append(u)
+
+    og_type = meta_value(prop="og:type")
+    og_site_name = meta_value(prop="og:site_name")
+    article_published = meta_value(prop="article:published_time") or meta_value(name="date") or meta_value(name="pubdate")
+    publisher = meta_value(name="publisher") or meta_value(prop="article:publisher")
+    author = meta_value(name="author") or meta_value(prop="article:author")
+    has_article_node = bool(soup.find("article"))
+    has_time_node = bool(soup.find("time"))
+    normal_types = {norm(value).replace(" ", "") for value in jsonld_types}
+    article_metadata = bool(
+        norm(og_type) == "article"
+        or normal_types.intersection(ARTICLE_JSONLD_TYPES)
+        or article_published
+        or (has_article_node and (author or has_time_node))
+    )
+    return {
+        "canonical_url": canonical,
+        "og_type": og_type,
+        "og_site_name": og_site_name,
+        "publisher": publisher,
+        "author": author,
+        "article_published": article_published,
+        "article_metadata": article_metadata,
+        "h1_text": h1_text,
+        "footer_text": footer_text,
+        "jsonld_types": list(dict.fromkeys(jsonld_types))[:30],
+        "jsonld_names": list(dict.fromkeys(jsonld_names))[:30],
+        "jsonld_org_names": list(dict.fromkeys(jsonld_org_names))[:20],
+        "jsonld_urls": list(dict.fromkeys(jsonld_urls))[:30],
+    }
+
+
+def fetched_carrier_reason(
+    row: dict[str, Any],
+    url: str,
+    metadata: dict[str, Any],
+    title: str,
+    snippet: str,
+    text: str,
+) -> str:
+    base_reason = obvious_carrier_reason(url, " ".join([title, str(metadata.get("og_site_name") or "")]), snippet, row)
+    if base_reason:
+        return base_reason
+    profile = domain_identity_profile(row, url)
+    strong_domain = bool(profile.get("strong"))
+    if metadata.get("article_metadata") and not strong_domain:
+        return "fetched page is article/blog content on a non-identity domain"
+    org_names = list(metadata.get("jsonld_org_names") or [])
+    site_name = str(metadata.get("og_site_name") or "")
+    publisher = str(metadata.get("publisher") or "")
+    canonical_url = str(metadata.get("canonical_url") or "")
+    if canonical_url:
+        canonical_host = hostname(canonical_url)
+        current_host = hostname(url)
+        if canonical_host and current_host and canonical_host != current_host:
+            canonical_profile = domain_identity_profile(row, canonical_url)
+            if obvious_carrier_reason(canonical_url, row=row) or not canonical_profile.get("strong"):
+                return f"canonical URL points to a different, unverified owner domain: {canonical_host}"
+    if org_names and not any(value_matches_identity(name, row) for name in org_names):
+        return "structured-data organisation belongs to another publisher or owner"
+    if site_name and not value_matches_identity(site_name, row) and metadata.get("article_metadata") and not strong_domain:
+        return f"article publisher/site name does not match NGO identity: {site_name[:80]}"
+    if publisher and not value_matches_identity(publisher, row) and metadata.get("article_metadata") and not strong_domain:
+        return f"page publisher does not match NGO identity: {publisher[:80]}"
+    text_blob = norm(" ".join([title, snippet, str(metadata.get("h1_text") or ""), text[:12000]]))
+    if not strong_domain and re.search(
+        r"\b(fundraiser|donate to support|client profile|our client|travel guide|research article|published by|guest post|news report)\b",
+        text_blob,
+    ):
+        return "fetched content identifies a fundraiser, client/profile, travel, research or publisher page"
+    return ""
+
+
 def fetch_direct(url: str, remaining: float) -> dict[str, Any]:
     errors: list[str] = []
+
+    def parse_response(response: Any, variant: str, *, tls_unverified: bool = False) -> dict[str, Any] | None:
+        content_type = str(response.headers.get("Content-Type") or "").lower()
+        if "pdf" in content_type or str(response.url).lower().endswith(".pdf"):
+            errors.append(f"{variant}: pdf_skipped")
+            return None
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, "html.parser")
+            page_title = re.sub(r"\s+", " ", soup.title.get_text(" ", strip=True) if soup.title else "").strip()
+            meta_description = ""
+            meta = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+            if meta and meta.get("content"):
+                meta_description = re.sub(r"\s+", " ", str(meta.get("content"))).strip()
+            final_url = normalise_url(response.url) or variant
+            metadata = extract_page_metadata(soup, final_url)
+            mailtos = [str(a.get("href") or "")[7:] for a in soup.select('a[href^="mailto:"]')][:10]
+            tels = [str(a.get("href") or "")[4:] for a in soup.select('a[href^="tel:"]')][:10]
+            for node in soup(["script", "style", "noscript", "svg"]):
+                node.decompose()
+            text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+            low = text.lower()
+            js_shell = len(text) < 180 or any(marker in low for marker in [
+                "enable javascript", "just a moment", "checking your browser", "captcha", "access denied",
+            ])
+            return {
+                "ok": not js_shell,
+                "text": text,
+                "page_title": page_title,
+                "meta_description": meta_description,
+                "metadata": metadata,
+                "mailto": " | ".join(mailtos),
+                "tel": " | ".join(tels),
+                "url": final_url,
+                "status": response.status_code,
+                "fetch_status": "javascript_or_challenge" if js_shell else ("direct_ok_tls_unverified" if tls_unverified else "direct_ok"),
+                "error": "short/challenge page" if js_shell else ("TLS certificate verification bypassed for public-page read" if tls_unverified else ""),
+                "firecrawl_recommended": js_shell,
+            }
+        if response.status_code in {401, 403, 429, 451, 503}:
+            errors.append(f"{variant}: HTTP {response.status_code}")
+            return {
+                "ok": False, "text": "", "url": variant, "status": response.status_code,
+                "fetch_status": "blocked", "error": errors[-1], "firecrawl_recommended": True,
+            }
+        errors.append(f"{variant}: HTTP {response.status_code}")
+        return None
+
     for variant in url_variants(url, limit=2):
         timeout = max(2.0, min(10.0, remaining - 0.5))
         if timeout <= 1:
             break
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; DFP-Karnataka-Recovery/1.0; +https://feedingindia.org)",
+            "Accept": "text/html,application/xhtml+xml",
+        }
         try:
-            response = requests.get(
-                variant,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; DFP-Karnataka-Recovery/1.0; +https://feedingindia.org)",
-                    "Accept": "text/html,application/xhtml+xml",
-                },
-                timeout=timeout,
-                allow_redirects=True,
-                verify=True,
-            )
-            content_type = str(response.headers.get("Content-Type") or "").lower()
-            if "pdf" in content_type or str(response.url).lower().endswith(".pdf"):
-                errors.append(f"{variant}: pdf_skipped")
-                continue
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, "html.parser")
-                for node in soup(["script", "style", "noscript", "svg"]):
-                    node.decompose()
-                text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-                low = text.lower()
-                js_shell = len(text) < 180 or any(marker in low for marker in ["enable javascript", "just a moment", "checking your browser", "captcha", "access denied"])
-                return {
-                    "ok": not js_shell,
-                    "text": text,
-                    "url": normalise_url(response.url) or variant,
-                    "status": response.status_code,
-                    "fetch_status": "javascript_or_challenge" if js_shell else "direct_ok",
-                    "error": "short/challenge page" if js_shell else "",
-                    "firecrawl_recommended": js_shell,
-                }
-            if response.status_code in {401, 403, 429, 451, 503}:
-                errors.append(f"{variant}: HTTP {response.status_code}")
-                return {"ok": False, "text": "", "url": variant, "status": response.status_code, "fetch_status": "blocked", "error": errors[-1], "firecrawl_recommended": True}
-            errors.append(f"{variant}: HTTP {response.status_code}")
+            response = requests.get(variant, headers=headers, timeout=timeout, allow_redirects=True, verify=True)
+            parsed = parse_response(response, variant)
+            if parsed is not None:
+                return parsed
             if response.status_code in {404, 410}:
                 continue
         except requests.exceptions.SSLError as exc:
             errors.append(f"{variant}: SSL {str(exc)[:120]}")
-            return {"ok": False, "text": "", "url": variant, "status": "ssl_error", "fetch_status": "ssl_error", "error": errors[-1], "firecrawl_recommended": True}
+            # This is a public, read-only identity check.  A certificate problem
+            # should not force paid Firecrawl usage or make a live NGO site look
+            # absent.  Retry the same URL once without certificate validation and
+            # retain an explicit fetch-status marker in the audit.
+            retry_timeout = max(2.0, min(8.0, remaining - 1.0))
+            if retry_timeout > 1:
+                try:
+                    requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
+                    response = requests.get(variant, headers=headers, timeout=retry_timeout, allow_redirects=True, verify=False)
+                    parsed = parse_response(response, variant, tls_unverified=True)
+                    if parsed is not None:
+                        return parsed
+                except requests.RequestException as retry_exc:
+                    errors.append(f"{variant}: tls_bypass {type(retry_exc).__name__} {str(retry_exc)[:120]}")
+            continue
         except requests.RequestException as exc:
             errors.append(f"{variant}: {type(exc).__name__} {str(exc)[:120]}")
             continue
-    return {"ok": False, "text": "", "url": normalise_url(url), "status": "failed", "fetch_status": "direct_failed", "error": " | ".join(errors[-4:]), "firecrawl_recommended": False}
+    return {
+        "ok": False, "text": "", "url": normalise_url(url), "status": "failed",
+        "fetch_status": "direct_failed", "error": " | ".join(errors[-6:]), "firecrawl_recommended": False,
+    }
 
 
-def identity_verification(row: dict[str, Any], url: str, text: str, candidate_type: str) -> dict[str, Any]:
-    normal_text = norm(text[:100000])
-    compact_text = compact(text[:100000])
+def identity_verification(
+    row: dict[str, Any],
+    url: str,
+    text: str,
+    candidate_type: str,
+    candidate_title: str = "",
+    candidate_snippet: str = "",
+    candidate_source: str = "",
+    fetch_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Conservatively verify both entity identity and page ownership.
+
+    The key invariant is that exact NGO-name text proves relevance only.  It can
+    never by itself prove that the page is owned or controlled by the NGO.
+    """
+    fetch_meta = fetch_meta or {}
+    metadata = fetch_meta.get("metadata") if isinstance(fetch_meta.get("metadata"), dict) else fetch_meta
+    page_title = str(fetch_meta.get("page_title") or "")
+    meta_description = str(fetch_meta.get("meta_description") or "")
+    mailto_text = str(fetch_meta.get("mailto") or "")
+    tel_text = str(fetch_meta.get("tel") or "")
+    merged_title = " | ".join(x for x in [candidate_title, page_title, str(metadata.get("og_site_name") or "")] if x)
+    merged_snippet = " | ".join(x for x in [candidate_snippet, meta_description] if x)
+    metadata_text = " | ".join(
+        str(value or "") for value in [
+            metadata.get("h1_text"), metadata.get("footer_text"), metadata.get("og_site_name"),
+            metadata.get("publisher"), " | ".join(metadata.get("jsonld_org_names") or []),
+            " | ".join(metadata.get("jsonld_names") or []), mailto_text, tel_text,
+        ]
+    )
+    combined_text = " ".join([merged_title, merged_snippet, metadata_text, text])
+    normal_text = norm(combined_text[:140000])
+    compact_text = compact(combined_text[:140000])
     aliases = identity_aliases(row)
     legal = norm(row.get("name"))
     core = distinctive_tokens(row.get("name")) or tokenise_name(row.get("name"))
-    evidence: list[str] = []
+    identity_evidence: list[str] = []
+    ownership_evidence: list[str] = []
     conflicts: list[str] = []
+    risk_flags: list[str] = []
     hard = 0
     strong = 0
     supporting = 0
 
+    carrier_reason = fetched_carrier_reason(row, url, metadata, merged_title, merged_snippet, text)
+    if carrier_reason:
+        return {
+            "verified": False,
+            "status": "rejected_third_party_or_unowned",
+            "page_type": page_type_for_candidate(url, merged_title, merged_snippet, row),
+            "ownership": "third_party_or_wrong_entity",
+            "confidence": "high",
+            "evidence": "",
+            "ownership_evidence": "",
+            "ownership_gate": "hard_carrier_veto",
+            "risk_flags": carrier_reason,
+            "conflicts": carrier_reason,
+            "evidence_score": 0,
+        }
+
     registration = compact(row.get("registration_reference"))
     if registration and len(registration) >= 5 and registration in compact_text:
         hard += 1
-        evidence.append("registration reference")
+        identity_evidence.append("registration reference")
     phone = digits(row.get("phone"))
-    if len(phone) >= 8 and phone[-8:] in digits(text):
+    if len(phone) >= 8 and phone[-8:] in digits(combined_text):
         hard += 1
-        evidence.append("phone")
+        identity_evidence.append("phone")
     email = str(row.get("email") or "").strip().lower()
-    if "@" in email and email in text.lower():
+    if "@" in email and email in combined_text.lower():
         hard += 1
-        evidence.append("email")
-    pin = row.get("pincode", "")
-    if pin and pin in text:
+        identity_evidence.append("email")
+    pin = str(row.get("pincode") or "")
+    pin_match = bool(pin and pin in combined_text)
+    if pin_match:
         strong += 1
-        evidence.append("pincode")
+        identity_evidence.append("pincode")
     district = norm(row.get("district"))
-    if district and district in normal_text:
+    district_match = bool(district and district in normal_text)
+    if district_match:
         supporting += 1
-        evidence.append("district")
+        identity_evidence.append("district")
     address_tokens = [t for t in norm(row.get("registered_address")).split() if len(t) >= 5 and t not in STOPWORDS]
-    address_hits = [t for t in address_tokens[:12] if t in normal_text]
-    if len(address_hits) >= 2:
+    address_hits = [t for t in address_tokens[:16] if t in normal_text]
+    address_match = len(address_hits) >= 2
+    if address_match:
         strong += 1
-        evidence.append("address tokens: " + ", ".join(address_hits[:4]))
-    if legal and legal in normal_text:
+        identity_evidence.append("address tokens: " + ", ".join(address_hits[:4]))
+    legal_exact = bool(legal and legal in normal_text)
+    if legal_exact:
         strong += 2
-        evidence.append("exact legal name")
-    alias_hit = ""
+        identity_evidence.append("exact legal name")
+    alias_hits: list[str] = []
     for alias in aliases[1:]:
-        if len(norm(alias)) >= 4 and norm(alias) in normal_text:
-            alias_hit = alias
-            strong += 1
-            evidence.append("alias/project/parent: " + alias)
-            break
+        alias_norm = norm(alias)
+        if len(alias_norm) >= 4 and alias_norm in normal_text:
+            alias_hits.append(alias)
+    if alias_hits:
+        strong += 1
+        identity_evidence.append("alias/project/parent: " + alias_hits[0])
     overlap = sum(1 for token in core if token in normal_text) / max(1, len(core)) if core else 0.0
     if overlap >= 0.75:
         strong += 1
-        evidence.append(f"name-token overlap {overlap:.0%}")
+        identity_evidence.append(f"name-token overlap {overlap:.0%}")
     elif overlap >= 0.5:
         supporting += 1
-        evidence.append(f"partial name-token overlap {overlap:.0%}")
-    host_blob = compact(hostname(url))
-    if any(token in host_blob for token in core if len(token) >= 4):
-        supporting += 1
-        evidence.append("domain/name overlap")
+        identity_evidence.append(f"partial name-token overlap {overlap:.0%}")
 
-    # Explicit contradictory state or a different organisation name is recorded,
-    # but stale addresses are never an automatic rejection.
+    domain_profile = domain_identity_profile(row, url)
+    strong_domain = list(domain_profile.get("strong") or [])
+    weak_domain = list(domain_profile.get("weak") or [])
+    ownership_evidence.extend(strong_domain)
+    ownership_evidence.extend(weak_domain)
+
+    jsonld_org_matches = [name for name in (metadata.get("jsonld_org_names") or []) if value_matches_identity(name, row)]
+    if jsonld_org_matches:
+        ownership_evidence.append("organisation structured data matches: " + jsonld_org_matches[0])
+    site_name = str(metadata.get("og_site_name") or "")
+    site_name_match = bool(site_name and value_matches_identity(site_name, row))
+    if site_name_match:
+        ownership_evidence.append("site name matches NGO identity: " + site_name[:100])
+    h1_text = str(metadata.get("h1_text") or "")
+    h1_match = bool(h1_text and value_matches_identity(h1_text, row, exact_for_generic=False))
+    if h1_match:
+        ownership_evidence.append("page heading identifies the NGO")
+    footer_text = norm(metadata.get("footer_text"))
+    footer_match = False
+    if footer_text:
+        for alias in aliases:
+            a = norm(alias)
+            if len(a) >= 5 and a in footer_text and any(marker in footer_text for marker in ["copyright", "all rights reserved", "contact", "registered"]):
+                footer_match = True
+                ownership_evidence.append("footer/copyright identifies the NGO")
+                break
+
+    self_phrase_match = False
+    for alias in aliases:
+        a = norm(alias)
+        if len(a) < 5:
+            continue
+        patterns = [
+            f"welcome to {a}", f"about {a}", f"contact {a}", f"{a} is a ", f"{a} is an ",
+            f"{a} was established", f"{a} works", f"{a} provides", f"{a} aims", f"{a} mission",
+        ]
+        if any(pattern in normal_text for pattern in patterns):
+            self_phrase_match = True
+            ownership_evidence.append("page self-identifies as: " + alias)
+            break
+    page_self_marker = bool(jsonld_org_matches or site_name_match or h1_match or footer_match or self_phrase_match)
+
+    final_host = hostname(url)
+    contact_domain_match = False
+    for found_email in re.findall(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})", mailto_text + " " + combined_text[:30000]):
+        email_host = found_email.lower().lstrip("www.")
+        if final_host == email_host or final_host.endswith("." + email_host) or email_host.endswith("." + final_host):
+            contact_domain_match = True
+            ownership_evidence.append("page contact email uses candidate domain")
+            break
+
+    relation_terms = [
+        "project of", "initiative of", "operated by", "run by", "managed by", "unit of", "programme of",
+        "program of", "part of", "under the aegis of", "social development wing", "institution of",
+    ]
+    explicit_relation = any(term in normal_text for term in relation_terms)
+    parent_identity = norm(row.get("parent_organisation"))
+    project_identities = list(dict.fromkeys(
+        value for value in [
+            norm(row.get("project_name")), norm(row.get("public_name")), norm(row.get("referral_name")), legal,
+        ] if len(value) >= 4 and value != parent_identity
+    ))
+    # Parent/project verification requires an explicitly supplied parent identity.
+    # Duplicate legal/referral aliases must never manufacture the two signals.
+    relation_identity_match = bool(
+        explicit_relation
+        and parent_identity
+        and parent_identity in normal_text
+        and any(value in normal_text for value in project_identities)
+    )
+    if relation_identity_match:
+        ownership_evidence.append("explicit project/parent/operator relationship")
+
+    previous_status = previous_website_status(row)
+    uploaded_candidate = candidate_source == "uploaded_candidate"
+    trusted_historical = uploaded_candidate and any(
+        term in previous_status for term in ["accepted", "shortlisted", "verified owned", "verified_owned", "verified site"]
+    ) and not is_historical_mismatch(row)
+    if trusted_historical:
+        risk_flags.append("historically_accepted_url_rechecked_not_trusted_as_ownership")
+
+    entity_form_present = any(term in normal_text for term in [
+        " charitable trust", " foundation", " society", " samsthe", " samiti", " ngo", " non profit",
+        " nonprofit", " not for profit", " registered trust", " organisation", " organization",
+    ])
+    if entity_form_present and (legal_exact or alias_hits):
+        supporting += 1
+        identity_evidence.append("organisation/legal-form context")
+
     state = norm(row.get("state"))
     if state and state not in normal_text and district and district not in normal_text and hard == 0 and strong == 0:
         conflicts.append("no supplied location signal")
 
-    verified_page_type = page_type_after_verification(candidate_type, url, row, text)
-    hosted = verified_page_type == "controlled_hosted_microsite"
-    parent_project = verified_page_type == "verified_parent_or_project_page"
     generic_name = len(distinctive_tokens(row.get("name"))) <= 1
+    if generic_name:
+        risk_flags.append("generic_or_low_distinctiveness_name")
+    if weak_domain and not strong_domain:
+        risk_flags.append("weak_domain_identity_only")
+    if metadata.get("article_metadata"):
+        risk_flags.append("article_metadata_present")
+    if is_historical_mismatch(row):
+        risk_flags.append("historically_mismatched_url_rechecked_not_trusted")
+
+    identity_points = hard * 5 + strong * 2 + supporting
+    location_support = hard > 0 or pin_match or address_match or district_match
+    hosted = domain_matches(final_host, HOSTED_PLATFORMS)
+    hosted_named_slug = any("hosted subdomain carries identity slug" in item for item in strong_domain)
+    legal_form_domain = any("name plus legal form" in item for item in strong_domain)
+    public_brand_domain = any("public brand/acronym" in item for item in strong_domain)
+    domain_control = bool(strong_domain)
+    self_control = page_self_marker
+    relationship_control = relation_identity_match
+    # Registration, phone, email text, address and pincode prove entity identity,
+    # not ownership. Only a contact email using the candidate domain is a hard
+    # control signal here; supplied organisational email-domain matching is
+    # already represented in strong_domain.
+    hard_control = contact_domain_match
 
     verified = False
-    confidence = "low"
     status = "plausible_site_identity_review"
-    ownership = "unresolved"
-    if hard >= 1 and (strong >= 1 or supporting >= 1):
-        verified = True
-        confidence = "high"
-    elif strong >= 3:
-        verified = True
-        confidence = "high"
-    elif strong >= 2 and supporting >= 1 and not generic_name:
-        verified = True
-        confidence = "medium"
-    elif strong >= 2 and (pin or address_hits or alias_hit):
-        verified = True
-        confidence = "medium"
+    page_type = "owned_organisation_site"
+    ownership = "identity_review_required"
+    confidence = "low"
+    ownership_gate = "manual_ownership_insufficient"
 
-    if verified:
-        if hosted:
+    relationship_owner_control = bool(
+        domain_control or hard_control or jsonld_org_matches or site_name_match or footer_match
+    )
+    if relationship_control and relationship_owner_control and identity_points >= 5:
+        verified = True
+        status = "verified_parent_or_project_page"
+        page_type = "verified_parent_or_project_page"
+        ownership = "verified_parent_project_relationship"
+        confidence = "high" if hard or domain_control else "medium"
+        ownership_gate = "explicit_parent_project_relation"
+    elif hosted:
+        if hosted_named_slug and (legal_exact or alias_hits or overlap >= 0.75) and self_control and (location_support or hard > 0 or not generic_name):
+            verified = True
             status = "verified_controlled_microsite"
+            page_type = "controlled_hosted_microsite"
             ownership = "controlled_hosted_presence"
-        elif parent_project:
-            status = "verified_parent_or_project_page"
-            ownership = "verified_parent_project_relationship"
-        else:
-            status = "verified_owned_site"
-            ownership = "owned_organisation_site"
+            confidence = "high" if hard or pin_match or address_match else "medium"
+            ownership_gate = "hosted_slug_plus_self_identity"
+        elif hard_control and (legal_exact or alias_hits) and self_control and identity_points >= 5:
+            verified = True
+            status = "verified_controlled_microsite"
+            page_type = "controlled_hosted_microsite"
+            ownership = "controlled_hosted_presence"
+            confidence = "high"
+            ownership_gate = "hosted_contact_plus_self_identity"
     else:
-        confidence = "medium" if (hard + strong + supporting) >= 2 else "low"
-        ownership = "identity_review_required"
+        # Normal owned-domain verification.  A strong domain-control signal and
+        # a page-level self-identification marker are both required.  For generic
+        # names, the domain must carry the legal form or the page must also match
+        # a supplied location/contact identifier.
+        if domain_control and self_control and identity_points >= 5:
+            if (
+                not generic_name
+                or legal_form_domain
+                or location_support
+                or hard_control
+                or (public_brand_domain and legal_exact and (jsonld_org_matches or site_name_match or footer_match))
+            ):
+                verified = True
+                status = "verified_owned_site"
+                page_type = "owned_organisation_site"
+                ownership = "owned_organisation_site"
+                confidence = "high" if hard or len(strong_domain) >= 2 else "medium"
+                ownership_gate = "domain_control_plus_page_self_identity"
+        if not verified and hard_control and legal_exact and self_control and identity_points >= 7:
+            verified = True
+            status = "verified_owned_site"
+            page_type = "owned_organisation_site"
+            ownership = "owned_organisation_site"
+            confidence = "high"
+            ownership_gate = "hard_contact_identity_plus_page_self_identity"
+
+    if not verified:
+        any_ownership_signal = bool(domain_control or weak_domain or self_control or hard_control or relationship_owner_control)
+        enough_identity_for_review = identity_points >= 4 and (legal_exact or alias_hits or overlap >= 0.75)
+        if not any_ownership_signal or not enough_identity_for_review:
+            ownership_gate = "rejected_no_independent_ownership_proof" if enough_identity_for_review else "rejected_identity_and_ownership_insufficient"
+            return {
+                "verified": False,
+                "status": "rejected_third_party_or_unowned",
+                "page_type": "third_party_mention_after_fetch" if enough_identity_for_review else "wrong_or_unproven_entity",
+                "ownership": "mentions_entity_but_ownership_unproven",
+                "confidence": "high",
+                "evidence": "; ".join(identity_evidence),
+                "ownership_evidence": "; ".join(ownership_evidence),
+                "ownership_gate": ownership_gate,
+                "risk_flags": "; ".join(risk_flags),
+                "conflicts": "; ".join(conflicts + (["no independent ownership/control proof"] if enough_identity_for_review else ["identity evidence below review threshold"])),
+                "evidence_score": identity_points,
+            }
+        confidence = "medium" if identity_points >= 7 and (domain_control or hard_control) else "low"
 
     return {
         "verified": verified,
         "status": status,
-        "page_type": verified_page_type,
+        "page_type": page_type,
         "ownership": ownership,
         "confidence": confidence,
-        "evidence": "; ".join(evidence),
+        "evidence": "; ".join(identity_evidence),
+        "ownership_evidence": "; ".join(dict.fromkeys(ownership_evidence)),
+        "ownership_gate": ownership_gate,
+        "risk_flags": "; ".join(dict.fromkeys(risk_flags)),
         "conflicts": "; ".join(conflicts),
-        "evidence_score": hard * 5 + strong * 2 + supporting,
+        "evidence_score": identity_points + len(ownership_evidence) * 2,
     }
+
+
+ALLOWED_VERIFIED_OWNERSHIP_CLASSES = {
+    "owned_organisation_site",
+    "controlled_hosted_presence",
+    "verified_parent_project_relationship",
+}
+ALLOWED_VERIFIED_PAGE_TYPES = {
+    "owned_organisation_site",
+    "controlled_hosted_microsite",
+    "verified_parent_or_project_page",
+}
+ALLOWED_OWNERSHIP_GATES = {
+    "domain_control_plus_page_self_identity",
+    "hard_contact_identity_plus_page_self_identity",
+    "hosted_slug_plus_self_identity",
+    "hosted_contact_plus_self_identity",
+    "explicit_parent_project_relation",
+}
+
+
+def verification_safety_failure(row: dict[str, Any], url: str, verification: dict[str, Any]) -> str:
+    """Second, independent fail-closed guard for any purported verified site.
+
+    This guard is deliberately redundant with :func:`identity_verification`.
+    It prevents a future scoring/refactor regression from exporting a directory,
+    article, donor, vendor or merely mentioning page to Avika as an owned site.
+    """
+    status = str(verification.get("status") or "")
+    if status not in VERIFIED_STATUSES and not verification.get("verified"):
+        return ""
+    page_type = str(verification.get("page_type") or "")
+    ownership = str(verification.get("ownership") or "")
+    gate = str(verification.get("ownership_gate") or "")
+    ownership_evidence = str(verification.get("ownership_evidence") or "").strip()
+    if obvious_carrier_reason(url, row=row):
+        return "final safety gate detected a hard carrier URL"
+    host = hostname(url)
+    if (
+        domain_matches(host, DIRECTORY_DOMAINS)
+        or domain_matches(host, SOCIAL_DOMAINS)
+        or domain_matches(host, NEWS_DOMAINS)
+        or domain_matches(host, REFERENCE_DOMAINS)
+        or host.endswith(".gov.in")
+        or host.endswith(".nic.in")
+        or (host.endswith(".ac.in") and not domain_identity_profile(row, url).get("strong"))
+    ):
+        return "final safety gate detected a third-party/reference host"
+    if page_type not in ALLOWED_VERIFIED_PAGE_TYPES:
+        return f"invalid verified page type: {page_type or 'blank'}"
+    if ownership not in ALLOWED_VERIFIED_OWNERSHIP_CLASSES:
+        return f"invalid verified ownership class: {ownership or 'blank'}"
+    if gate not in ALLOWED_OWNERSHIP_GATES:
+        return f"invalid or missing ownership gate: {gate or 'blank'}"
+    if not ownership_evidence:
+        return "verified result has no independent ownership evidence"
+    if gate == "explicit_parent_project_relation" and page_type != "verified_parent_or_project_page":
+        return "parent/project relationship gate was not classified as a parent/project page"
+    if gate.startswith("hosted_") and page_type != "controlled_hosted_microsite":
+        return "hosted ownership gate was not classified as a controlled microsite"
+    return ""
+
+def result_export_safety_failure(row: dict[str, Any], result: dict[str, Any]) -> str:
+    """Fail closed immediately before a result can reach an export.
+
+    Candidate verification already applies the ownership guard.  This final
+    result-level check is intentionally redundant: it protects downloads and
+    Avika inputs if a future refactor, resume path or manual result construction
+    accidentally marks a third-party page as verified.
+    """
+    status = str(result.get("Discovery Status") or result.get("Website Status") or "")
+    if status not in VERIFIED_STATUSES:
+        return ""
+    url = str(result.get("Website") or "")
+    if not normalise_url(url):
+        return "verified result has no valid website URL"
+    verification = {
+        "verified": True,
+        "status": status,
+        "page_type": result.get("Page Type", ""),
+        "ownership": result.get("Ownership Class", ""),
+        "ownership_evidence": result.get("Ownership Evidence", ""),
+        "ownership_gate": result.get("Ownership Gate", ""),
+    }
+    failure = verification_safety_failure(row, url, verification)
+    if failure:
+        return failure
+    if requires_site_root_crosscheck(url):
+        evidence = norm(result.get("Ownership Evidence"))
+        flags = norm(result.get("Risk Flags"))
+        if "site root independently identifies" not in evidence and "site root crosschecked" not in flags:
+            return "deep or query URL lacks an independent site-root ownership confirmation"
+    return ""
+
+
+def _domain_list(value: Any) -> list[str]:
+    domains: list[str] = []
+    for part in re.split(r"[|,;\s]+", str(value or "")):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if "://" in part:
+            part = hostname(normalise_url(part))
+        part = part.lstrip("www.").strip("/")
+        if part and "." in part and part not in domains:
+            domains.append(part)
+    return domains
+
+
+def _host_matches_any(host: str, domains: list[str]) -> bool:
+    return any(host == domain or host.endswith("." + domain) for domain in domains)
+
+
+def evaluate_regression_result(row: dict[str, Any], result: dict[str, Any]) -> tuple[str, str]:
+    expected_raw = str(row.get("expected_outcome") or "").strip()
+    expected = norm(expected_raw)
+    if not expected:
+        return "not_applicable", ""
+    status = str(result.get("Discovery Status") or "")
+    selected_host = hostname(str(result.get("Website") or ""))
+    expected_domains = _domain_list(row.get("regression_expected_domain"))
+    forbidden_domains = _domain_list(row.get("regression_forbidden_domains"))
+    ownership_evidence = norm(result.get("Ownership Evidence"))
+    ownership_class = str(result.get("Ownership Class") or "")
+    page_type = str(result.get("Page Type") or "")
+    dfp_status = norm(result.get("DFP Fit Status"))
+
+    if selected_host and _host_matches_any(selected_host, forbidden_domains):
+        return "fail", f"selected forbidden historical/third-party domain: {selected_host}"
+    if status in VERIFIED_STATUSES:
+        if page_type in {"directory_or_registry", "article_or_profile", "social_media", "third_party_mention_after_fetch", "wrong_entity", "government_academic_or_document_reference"}:
+            return "fail", f"verified a non-owned page type: {page_type}"
+        if not ownership_evidence:
+            return "fail", "verified without a separate ownership signal"
+        if ownership_class not in {"owned_organisation_site", "controlled_hosted_presence", "verified_parent_project_relationship"}:
+            return "fail", f"verified with invalid ownership class: {ownership_class}"
+
+    if expected_domains and status in VERIFIED_STATUSES and not _host_matches_any(selected_host, expected_domains):
+        return "fail", f"selected {selected_host or 'no domain'}; expected one of: {', '.join(expected_domains)}"
+
+    if expected.startswith("retain verified site") or expected.startswith("retain_verified_site"):
+        return ("pass", "") if status in VERIFIED_STATUSES else ("fail", f"expected a retained verified site, got {status}")
+    if "manual page ownership check" in expected or "manual_page_ownership_check" in expected:
+        return ("pass", "") if status in VERIFIED_STATUSES | MANUAL_STATUSES else ("fail", f"expected verified/manual ownership outcome, got {status}")
+    if "no owned site after enhanced recovery" in expected or "no_owned_site_after_enhanced_recovery" in expected:
+        if status == "no_owned_site_after_enhanced_recovery":
+            return "pass", ""
+        if status in MANUAL_STATUSES:
+            return "pass", "plausible candidate was correctly withheld for human review"
+        return "fail", f"no-site control was automatically classified as {status}"
+    if "plausible site manual identity review" in expected or "plausible_site_manual_identity_review" in expected:
+        return ("pass", "") if status in MANUAL_STATUSES else ("fail", f"expected manual identity review, got {status}")
+    if "verified controlled microsite" in expected or "verified_controlled_microsite" in expected:
+        return ("pass", "") if status == "verified_controlled_microsite" else ("fail", f"expected controlled microsite, got {status}")
+    if "verified parent project page" in expected or "verified_parent_project_page" in expected:
+        return ("pass", "") if status == "verified_parent_or_project_page" else ("fail", f"expected parent/project page, got {status}")
+    if "verified owned site" in expected or "verified_owned_site" in expected:
+        return ("pass", "") if status == "verified_owned_site" else ("fail", f"expected owned site, got {status}")
+    if expected.startswith("reject ") or expected.startswith("reject_"):
+        if status in VERIFIED_STATUSES | MANUAL_STATUSES | {"no_owned_site_after_enhanced_recovery"}:
+            return "pass", ""
+        return "fail", f"mismatch recovery did not reach a defensible terminal outcome: {status}"
+    if "fetch and verify" in expected or "fetch_and_verify" in expected or "normalise www non www then verify" in expected or "normalise_www_non_www_then_verify" in expected:
+        return ("pass", "") if status in VERIFIED_STATUSES else ("fail", f"known live site was not verified: {status}")
+    if "retain substantive" in expected or "retain_substantive" in expected:
+        if dfp_status == "substantive not fit" or dfp_status == "substantive_not_fit":
+            return "pass", ""
+        return "fail", f"substantive programme-fit rejection was not preserved separately: {result.get('DFP Fit Status')}"
+    if "discover even without" in expected or "discover_even_without" in expected:
+        if status in VERIFIED_STATUSES | MANUAL_STATUSES | {"no_owned_site_after_enhanced_recovery"}:
+            return "pass", ""
+        return "fail", f"not-in-Darpan referral did not complete discovery: {status}"
+    return "pass", ""
 
 
 def blank_result(row: dict[str, Any], mode: str) -> dict[str, Any]:
@@ -1266,6 +2200,9 @@ def blank_result(row: dict[str, Any], mode: str) -> dict[str, Any]:
         "Ownership Class": "",
         "Confidence": "low",
         "Identity Evidence": "",
+        "Ownership Evidence": "",
+        "Ownership Gate": "",
+        "Risk Flags": "",
         "Identity Conflicts": "",
         "Evidence Page URL": "",
         "Fetch Status": "",
@@ -1283,7 +2220,16 @@ def blank_result(row: dict[str, Any], mode: str) -> dict[str, Any]:
         "Carrier Pages Seen": 0,
         "Firecrawl Credits Used": 0,
         "Firecrawl Action": "",
-        "DFP Fit Status": "not_yet_assessed",
+        "DFP Fit Status": (
+            "substantive_not_fit" if "substantive" in norm(row.get("previous_website_status"))
+            else (row.get("dfp_fit_status") or "not_yet_assessed")
+        ),
+        "Previous Website Status": row.get("previous_website_status", ""),
+        "Expected Outcome": row.get("expected_outcome", ""),
+        "Regression Expected Domain": row.get("regression_expected_domain", ""),
+        "Regression Forbidden Domains": row.get("regression_forbidden_domains", ""),
+        "Regression Check": "",
+        "Regression Failure Reason": "",
         "Retry Required": "no",
         "Retry Reason": "",
         "Note": "",
@@ -1319,9 +2265,147 @@ def audit_dict(row: dict[str, Any], mode: str, event: AuditEvent) -> dict[str, A
         "Fetch Status": event.fetch_status,
         "Fetch Error": event.fetch_error,
         "Evidence": event.evidence,
+        "Ownership Evidence": event.ownership_evidence,
+        "Ownership Gate": event.ownership_gate,
+        "Risk Flags": event.risk_flags,
         "Conflict": event.conflict,
         "Firecrawl Credits Used": event.firecrawl_credits_used,
         "Note": event.note,
+    }
+
+
+
+
+def run_ownership_self_test() -> dict[str, Any]:
+    """Network-free startup invariant for the false-positive classes observed
+    in the 44-NGO technical run, plus positive controls for official, hosted and
+    parent/project pages.  A failed guard blocks the worker from starting a run.
+    """
+    failures: list[str] = []
+    carrier_urls = [
+        ("Guardians of Dreams", "https://milaap.org/fundraisers/godreamskochi1"),
+        ("Asha Kirana Seva Trust", "https://www.helpyourngo.com/ngo/1570/children/asha-kirana-seva-trust"),
+        ("Vimochana Development Society", "https://www.myngos.in/ngo-details/vimochana-development-society-in-karnataka"),
+        ("Shivashakthi Foundation", "https://www.tatanexarc.com/company/shree-shivashakthi-innovative-utn5150shr80xqx/"),
+        ("Reach Rural Development Society", "https://www.ixigo.com/buses/hyderabad-yadgir-sts"),
+        ("The Hope House", "https://pmc.ncbi.nlm.nih.gov/articles/PMC10615235/"),
+        ("Auxilium Navajeevana Society", "https://orellsoft.com/client"),
+        ("Deenabandhu", "https://rinatham.com/2018/03/13/deenabandhu-chamarajanagar-karnataka/"),
+        ("Gonikoppal Higher Primary School", "https://abhyudayakkss.org/school-kit-distribution-at-ghps-kajuru-aigur-village/"),
+        ("Garden City Jeevitha Anathashrama", "https://us.trip.com/travel-guide/attraction/bengaluru-urban/garden-city-jeevitha-anathashrama-141739151/"),
+        ("Mithra Grameena Vikasa Samsthe", "https://wp.wpi.edu/capetown/projects/p2012/mgv/"),
+    ]
+    for name, url in carrier_urls:
+        row = {"name": name, "referral_name": name, "district": "Karnataka", "state": "Karnataka"}
+        ptype = page_type_for_candidate(url, row=row)
+        if ptype not in {
+            "directory_or_registry", "article_or_profile", "third_party_mention_candidate",
+            "government_academic_or_document_reference", "wrong_entity",
+        }:
+            failures.append(f"carrier URL not blocked: {url} -> {ptype}")
+
+    synthetic_third_party = [
+        (
+            {"name": "Shifting Orbits Foundation", "referral_name": "Shifting Orbits Foundation", "state": "Karnataka"},
+            "https://www.northsouth.org/", "NorthSouth",
+            "NorthSouth supported a changemaker working with Shifting Orbits Foundation.",
+        ),
+        (
+            {"name": "DIVINE MERCY CHARITABLE TRUST", "referral_name": "Divine Mercy Charitable Trust", "state": "Karnataka"},
+            "https://www.divinemercydevotion.net/", "Divine Mercy Devotion",
+            "Divine Mercy prayers and novena. Divine Mercy Charitable Trust is mentioned in one story.",
+        ),
+        (
+            {"name": "VISION INDIA FOUNDATION", "referral_name": "Vision India Trust", "state": "Karnataka"},
+            "https://www.giftofvision.org/25-years-of-sankara-eye-foundation-usa", "Sankara Eye Foundation",
+            "An anniversary article mentioning Vision India Foundation.",
+        ),
+    ]
+    for row, url, owner, body in synthetic_third_party:
+        verification = identity_verification(
+            row,
+            url,
+            body,
+            "owned_site_candidate",
+            fetch_meta={
+                "page_title": owner,
+                "meta_description": body,
+                "metadata": {
+                    "og_site_name": owner,
+                    "publisher": owner,
+                    "h1_text": owner,
+                    "footer_text": f"© {owner}",
+                    "jsonld_org_names": [owner],
+                    "jsonld_names": [owner],
+                    "article_metadata": "article" in body.lower() or "anniversary" in body.lower(),
+                },
+            },
+        )
+        if verification.get("verified") or verification.get("status") in VERIFIED_STATUSES:
+            failures.append(f"third-party page verified: {url} -> {verification.get('status')}")
+
+    positive_controls = [
+        (
+            {"name": "PRAGATHI CHARITABLE TRUST", "referral_name": "Pragathi Charitable Trust", "district": "Bengaluru Urban", "state": "Karnataka"},
+            "https://pragathitrust.org/",
+            "PRAGATHI CHARITABLE TRUST is a registered charitable trust in Bengaluru Urban.",
+            "owned_site_candidate",
+            "Pragathi Charitable Trust",
+            "verified_owned_site",
+        ),
+        (
+            {"name": "SADHANA", "referral_name": "Sadhana Raichur", "public_name": "Sadhana Raichur", "district": "Raichur", "state": "Karnataka"},
+            "https://sadhana.1ngo.in/",
+            "Sadhana Raichur is a registered NGO working in Raichur.",
+            "controlled_hosted_microsite_candidate",
+            "Sadhana Raichur",
+            "verified_controlled_microsite",
+        ),
+        (
+            {"name": "Arsha Gokulam", "referral_name": "Arsha Gokulam", "project_name": "Arsha Gokulam", "parent_organisation": "Arsha Seva Kendram", "state": "Karnataka"},
+            "https://www.arshasevakendram.org/seva/arsha-gokulam/",
+            "Arsha Gokulam is a project of Arsha Seva Kendram.",
+            "parent_or_project_candidate",
+            "Arsha Seva Kendram",
+            "verified_parent_or_project_page",
+        ),
+        (
+            {"name": "VIKAS DISABLED CHARITABLE TRUST", "referral_name": "Vikasa Special School", "state": "Karnataka"},
+            "https://www.vdct.in/",
+            "VIKAS DISABLED CHARITABLE TRUST operates Vikasa Special School.",
+            "owned_site_candidate",
+            "VIKAS Disabled Charitable Trust",
+            "verified_owned_site",
+        ),
+    ]
+    for row, url, body, candidate_type, owner, expected in positive_controls:
+        verification = identity_verification(
+            row,
+            url,
+            body,
+            candidate_type,
+            fetch_meta={
+                "page_title": owner,
+                "meta_description": body,
+                "metadata": {
+                    "og_site_name": owner,
+                    "h1_text": owner,
+                    "footer_text": f"Copyright © {owner}. All rights reserved.",
+                    "jsonld_org_names": [owner],
+                    "jsonld_names": [owner],
+                    "article_metadata": False,
+                },
+            },
+        )
+        failure = verification_safety_failure(row, url, verification)
+        if verification.get("status") != expected or failure:
+            failures.append(f"positive control failed: {url} expected {expected}, got {verification.get('status')} ({failure})")
+
+    return {
+        "passed": not failures,
+        "failures": failures,
+        "cases": len(carrier_urls) + len(synthetic_third_party) + len(positive_controls),
+        "module_version": MODULE_VERSION,
     }
 
 
@@ -1342,6 +2426,7 @@ class KarnatakaRecoveryService:
         self.lock = threading.RLock()
         self.serper_preflight_cache: dict[str, dict[str, Any]] = {}
         self.firecrawl_preflight_cache: dict[str, dict[str, Any]] = {}
+        self.ownership_self_test = run_ownership_self_test()
         self._register_routes()
 
     def _run_dir(self, run_id: str) -> Path:
@@ -1409,9 +2494,36 @@ class KarnatakaRecoveryService:
         return {str(row.get("Source Record ID") or "") for row in self._load_results(rd) if str(row.get("Source Record ID") or "")}
 
     def _checkpoint(self, rd: Path, row: dict[str, Any], mode: str, result: dict[str, Any], events: list[AuditEvent]) -> None:
+        export_failure = result_export_safety_failure(row, result)
+        if export_failure:
+            original_status = str(result.get("Discovery Status") or result.get("Website Status") or "")
+            result.update({
+                "Discovery Status": "plausible_site_identity_review",
+                "Website Status": "plausible_site_identity_review",
+                "Page Type": "third_party_mention_after_fetch",
+                "Ownership Class": "final_export_guard_rejected",
+                "Confidence": "low",
+                "Ownership Gate": "final_export_fail_closed",
+                "Risk Flags": "; ".join(x for x in [str(result.get("Risk Flags") or ""), export_failure] if x),
+                "Identity Conflicts": "; ".join(x for x in [str(result.get("Identity Conflicts") or ""), export_failure] if x),
+                "Retry Required": "yes",
+                "Retry Reason": "final_export_ownership_guard",
+                "Note": (str(result.get("Note") or "") + f" Final export guard downgraded {original_status or 'verified'}: {export_failure}").strip(),
+            })
+            events.append(AuditEvent(
+                stage="final_export_ownership_guard", provider=str(result.get("Search Provider") or ""),
+                query_pass=str(result.get("Query Pass") or ""), query=str(result.get("Winning Query") or ""),
+                candidate_url=str(result.get("Website") or ""), page_type="third_party_mention_after_fetch",
+                decision="downgraded_before_export", reject_reason=export_failure,
+                risk_flags=export_failure, conflict=export_failure,
+            ))
+        if mode == "regression_test":
+            check, reason = evaluate_regression_result(row, result)
+            result["Regression Check"] = check
+            result["Regression Failure Reason"] = reason
         self._append_csv(rd / RESULT_FILES["results"], RESULT_FIELDS, [result])
         self._append_csv(rd / RESULT_FILES["audit"], AUDIT_FIELDS, [audit_dict(row, mode, event) for event in events])
-        if result.get("Website") and result.get("Discovery Status") in VERIFIED_STATUSES:
+        if result.get("Website") and result.get("Discovery Status") in VERIFIED_STATUSES and not result_export_safety_failure(row, result):
             self._append_csv(
                 rd / RESULT_FILES["avika_input"],
                 ["ngo_id", "name", "district", "state", "darpan_id", "website", "website_recovery_status", "source_record_id"],
@@ -1450,6 +2562,172 @@ class KarnatakaRecoveryService:
             if cap and int(shared.get("logical_queries") or 0) >= cap:
                 raise QueryCapReached("run logical query cap reached")
             shared["logical_queries"] = int(shared.get("logical_queries") or 0) + 1
+
+    def _crosscheck_site_root(
+        self,
+        ctx: RowContext,
+        candidate_url: str,
+        verification: dict[str, Any],
+        use_firecrawl: bool,
+        firecrawl_pool: FirecrawlPool | None,
+        query_info: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        """Confirm that a deep page lives on a site controlled by the NGO/parent.
+
+        The candidate page can mention the NGO exactly. The root page must also
+        independently identify the NGO, its supplied public brand, or its supplied
+        parent organisation before a deep URL may be exported as verified.
+        """
+        final_url = normalise_url(candidate_url)
+        if not final_url or not requires_site_root_crosscheck(final_url):
+            return {**verification, "site_root_crosschecked": True, "site_root_url": site_root_url(final_url)}
+        root_url = site_root_url(final_url)
+        if not root_url or root_url == final_url:
+            return {**verification, "site_root_crosschecked": True, "site_root_url": root_url}
+
+        ctx.check_deadline()
+        root_fetched = fetch_direct(root_url, ctx.remaining())
+        firecrawl_action = ""
+        firecrawl_credits = 0
+        if (
+            not root_fetched.get("ok")
+            and use_firecrawl
+            and firecrawl_pool
+            and root_fetched.get("firecrawl_recommended")
+            and ctx.remaining() > 8
+        ):
+            firecrawl_action = "root_scrape_after_" + str(root_fetched.get("fetch_status") or "direct_failure")
+            try:
+                fc = firecrawl_pool.scrape(root_url, timeout_sec=max(10, min(40, int(ctx.remaining() - 2))))
+            except ProviderUnavailable as exc:
+                if ctx.mode == "firecrawl_retry":
+                    raise
+                firecrawl_action = f"root_not_run_{exc.reason}"
+                fc = {"ok": False, "credits": 0, "error": str(exc)}
+            firecrawl_credits = safe_int(fc.get("credits"), 0)
+            ctx.firecrawl_credits_used += firecrawl_credits
+            if fc.get("ok"):
+                root_fetched = {
+                    "ok": True, "text": fc.get("text", ""),
+                    "url": normalise_url(fc.get("url")) or root_url,
+                    "status": 200, "fetch_status": "firecrawl_root_ok", "error": "",
+                    "firecrawl_recommended": False,
+                }
+
+        root_event = AuditEvent(
+            stage="site_root_ownership_check",
+            provider=(query_info or {}).get("provider", "zero_query"),
+            logical_query_number=safe_int((query_info or {}).get("logical_query_number")),
+            query_pass=(query_info or {}).get("pass", ""),
+            query=(query_info or {}).get("query", ""),
+            candidate_url=root_url,
+            candidate_source="site_root_crosscheck",
+            page_type=page_type_for_candidate(root_url, row=ctx.row),
+            fetch_status=root_fetched.get("fetch_status", ""),
+            fetch_error=root_fetched.get("error", ""),
+            firecrawl_credits_used=firecrawl_credits,
+            note=firecrawl_action,
+        )
+
+        if not root_fetched.get("ok"):
+            root_event.decision = "root_owner_unavailable_manual"
+            root_event.reject_reason = "Deep-page ownership could not be confirmed from the site root."
+            ctx.audit.append(root_event)
+            return {
+                **verification,
+                "verified": False,
+                "status": "plausible_site_identity_review",
+                "ownership": "identity_review_required",
+                "confidence": "low",
+                "ownership_gate": "site_root_ownership_unavailable",
+                "risk_flags": "; ".join(x for x in [str(verification.get("risk_flags") or ""), "site_root_unavailable"] if x),
+                "conflicts": "; ".join(x for x in [str(verification.get("conflicts") or ""), "site root ownership not confirmed"] if x),
+                "site_root_crosschecked": False,
+                "site_root_url": root_url,
+            }
+
+        root_text = " ".join([
+            str(root_fetched.get("page_title") or ""),
+            str(root_fetched.get("meta_description") or ""),
+            str(root_fetched.get("mailto") or ""),
+            str(root_fetched.get("tel") or ""),
+            str(root_fetched.get("text") or ""),
+        ])
+        root_type = page_type_for_candidate(
+            root_fetched.get("url") or root_url,
+            str(root_fetched.get("page_title") or ""),
+            str(root_fetched.get("meta_description") or ""),
+            ctx.row,
+        )
+        root_verification = identity_verification(
+            ctx.row,
+            root_fetched.get("url") or root_url,
+            root_text,
+            root_type,
+            candidate_title=str(root_fetched.get("page_title") or ""),
+            candidate_snippet=str(root_fetched.get("meta_description") or ""),
+            candidate_source="site_root_crosscheck",
+            fetch_meta=root_fetched,
+        )
+        root_event.page_type = root_verification.get("page_type", root_type)
+        root_event.evidence = root_verification.get("evidence", "")
+        root_event.ownership_evidence = root_verification.get("ownership_evidence", "")
+        root_event.ownership_gate = root_verification.get("ownership_gate", "")
+        root_event.risk_flags = root_verification.get("risk_flags", "")
+        root_event.conflict = root_verification.get("conflicts", "")
+
+        if root_verification.get("status") in VERIFIED_STATUSES and not verification_safety_failure(
+            ctx.row, root_fetched.get("url") or root_url, root_verification
+        ):
+            root_event.decision = "root_owner_confirmed"
+            ctx.audit.append(root_event)
+            combined_ownership = "; ".join(dict.fromkeys(
+                x for x in [
+                    str(verification.get("ownership_evidence") or ""),
+                    "site root independently identifies the NGO/parent",
+                    str(root_verification.get("ownership_evidence") or ""),
+                ] if x
+            ))
+            return {
+                **verification,
+                "ownership_evidence": combined_ownership,
+                "risk_flags": "; ".join(x for x in [str(verification.get("risk_flags") or ""), "site_root_crosschecked"] if x),
+                "site_root_crosschecked": True,
+                "site_root_url": root_fetched.get("url") or root_url,
+            }
+
+        if root_verification.get("status") in MANUAL_STATUSES:
+            root_event.decision = "root_owner_ambiguous_manual"
+            ctx.audit.append(root_event)
+            return {
+                **verification,
+                "verified": False,
+                "status": "plausible_site_identity_review",
+                "ownership": "identity_review_required",
+                "confidence": "low",
+                "ownership_gate": "site_root_ownership_ambiguous",
+                "risk_flags": "; ".join(x for x in [str(verification.get("risk_flags") or ""), "site_root_ambiguous"] if x),
+                "conflicts": "; ".join(x for x in [str(verification.get("conflicts") or ""), "site root did not independently verify ownership"] if x),
+                "site_root_crosschecked": False,
+                "site_root_url": root_fetched.get("url") or root_url,
+            }
+
+        root_event.decision = "root_owner_conflict_rejected"
+        root_event.reject_reason = "The site root identifies another owner or does not independently establish NGO/parent control."
+        ctx.audit.append(root_event)
+        return {
+            **verification,
+            "verified": False,
+            "status": "rejected_third_party_or_unowned",
+            "page_type": "third_party_mention_after_fetch",
+            "ownership": "mentions_entity_but_ownership_unproven",
+            "confidence": "high",
+            "ownership_gate": "site_root_owner_conflict",
+            "risk_flags": "; ".join(x for x in [str(verification.get("risk_flags") or ""), "site_root_owner_conflict"] if x),
+            "conflicts": "; ".join(x for x in [str(verification.get("conflicts") or ""), "site root owner conflicts with NGO identity"] if x),
+            "site_root_crosschecked": False,
+            "site_root_url": root_fetched.get("url") or root_url,
+        }
 
     def _verify_one_candidate(
         self,
@@ -1497,21 +2775,59 @@ class KarnatakaRecoveryService:
             return {
                 "url": fetched.get("url") or url, "fetch_ok": False, "fetch_status": fetched.get("fetch_status", "direct_failed"),
                 "fetch_error": fetched.get("error", ""), "status": "candidate_fetch_pending", "page_type": candidate_type,
-                "ownership": "unverified_due_to_fetch", "confidence": "low", "evidence": "", "conflicts": "",
+                "ownership": "unverified_due_to_fetch", "confidence": "low", "evidence": "", "ownership_evidence": "",
+                "ownership_gate": "fetch_required_before_ownership_decision", "risk_flags": "", "conflicts": "",
                 "firecrawl_action": firecrawl_action, "firecrawl_credits": firecrawl_credits,
             }
-        verification = identity_verification(ctx.row, fetched.get("url") or url, fetched.get("text", ""), candidate_type)
+        verification_text = " ".join([
+            str(fetched.get("page_title") or ""), str(fetched.get("meta_description") or ""),
+            str(fetched.get("mailto") or ""), str(fetched.get("tel") or ""), str(fetched.get("text") or ""),
+        ])
+        verification = identity_verification(
+            ctx.row, fetched.get("url") or url, verification_text, candidate_type,
+            candidate_title=" | ".join(x for x in [str(candidate.get("title") or ""), str(fetched.get("page_title") or "")] if x),
+            candidate_snippet=" | ".join(x for x in [str(candidate.get("snippet") or ""), str(fetched.get("meta_description") or "")] if x),
+            candidate_source=str(candidate.get("source") or ""),
+            fetch_meta=fetched,
+        )
+        if verification.get("verified"):
+            verification = self._crosscheck_site_root(
+                ctx, fetched.get("url") or url, verification, use_firecrawl, firecrawl_pool, query_info
+            )
+        safety_failure = verification_safety_failure(ctx.row, fetched.get("url") or url, verification)
+        if safety_failure:
+            verification = {
+                **verification,
+                "verified": False,
+                "status": "rejected_third_party_or_unowned",
+                "page_type": "third_party_mention_after_fetch",
+                "ownership": "safety_guard_rejected",
+                "confidence": "high",
+                "ownership_gate": "final_fail_closed_safety_gate",
+                "risk_flags": "; ".join(x for x in [str(verification.get("risk_flags") or ""), safety_failure] if x),
+                "conflicts": "; ".join(x for x in [str(verification.get("conflicts") or ""), safety_failure] if x),
+            }
         ctx.best_verification = {**verification, "url": fetched.get("url") or url, "fetch_status": fetched.get("fetch_status", "direct_ok"), "fetch_error": fetched.get("error", "")}
-        event_base.decision = "accepted" if verification.get("verified") else "manual_identity_review"
+        if verification.get("verified"):
+            event_base.decision = "accepted"
+        elif verification.get("status") == "rejected_third_party_or_unowned":
+            event_base.decision = "rejected_after_fetch_ownership_unproven"
+        else:
+            event_base.decision = "manual_identity_review"
         event_base.page_type = verification.get("page_type", candidate_type)
         event_base.evidence = verification.get("evidence", "")
+        event_base.ownership_evidence = verification.get("ownership_evidence", "")
+        event_base.ownership_gate = verification.get("ownership_gate", "")
+        event_base.risk_flags = verification.get("risk_flags", "")
         event_base.conflict = verification.get("conflicts", "")
         ctx.audit.append(event_base)
         return {
             "url": fetched.get("url") or url, "fetch_ok": True, "fetch_status": fetched.get("fetch_status", "direct_ok"),
             "fetch_error": fetched.get("error", ""), "status": verification.get("status"), "page_type": verification.get("page_type"),
             "ownership": verification.get("ownership"), "confidence": verification.get("confidence"), "evidence": verification.get("evidence"),
-            "conflicts": verification.get("conflicts"), "evidence_score": verification.get("evidence_score", 0),
+            "ownership_evidence": verification.get("ownership_evidence", ""), "ownership_gate": verification.get("ownership_gate", ""),
+            "risk_flags": verification.get("risk_flags", ""), "conflicts": verification.get("conflicts"),
+            "evidence_score": verification.get("evidence_score", 0),
             "firecrawl_action": firecrawl_action, "firecrawl_credits": firecrawl_credits,
         }
 
@@ -1533,6 +2849,9 @@ class KarnatakaRecoveryService:
             "Ownership Class": verification.get("ownership", ""),
             "Confidence": verification.get("confidence", "low"),
             "Identity Evidence": verification.get("evidence", ""),
+            "Ownership Evidence": verification.get("ownership_evidence", ""),
+            "Ownership Gate": verification.get("ownership_gate", ""),
+            "Risk Flags": verification.get("risk_flags", ""),
             "Identity Conflicts": verification.get("conflicts", ""),
             "Evidence Page URL": verification.get("url", ""),
             "Fetch Status": verification.get("fetch_status", ""),
@@ -1570,13 +2889,20 @@ class KarnatakaRecoveryService:
         spec = MODE_SPECS[mode]
         ctx = RowContext(row=row, mode=mode, deadline_at=time.monotonic() + max(20, row_deadline_sec), max_queries=int(spec["max_queries_per_row"]))
         direct_candidates: list[dict[str, Any]] = []
+        all_uploaded_urls: set[str] = set()
+        carrier_types = {
+            "directory_or_registry", "social_media", "article_or_profile", "third_party_mention_candidate",
+            "government_academic_or_document_reference", "wrong_entity",
+        }
         for index, url in enumerate(candidate_urls(row), start=1):
+            all_uploaded_urls.add(url)
             candidate_type = page_type_for_candidate(url, row=row)
-            if candidate_type in {"directory_or_registry", "social_media", "article_or_profile", "third_party_mention_candidate"}:
+            if candidate_type in carrier_types:
                 ctx.carrier_pages_seen += 1
                 ctx.audit.append(AuditEvent(
                     stage="zero_query_candidate", provider="zero_query", candidate_rank=index, candidate_url=url,
-                    page_type=candidate_type, decision="carrier_only_continue", reject_reason="third-party page is never official ownership evidence",
+                    page_type=candidate_type, decision="carrier_only_continue",
+                    reject_reason=obvious_carrier_reason(url, row=row) or "third-party page is never official ownership evidence",
                 ))
                 continue
             direct_candidates.append({"url": url, "title": "", "snippet": "", "source": "uploaded_candidate", "rank": index, "page_type": candidate_type, "score": 100})
@@ -1593,6 +2919,8 @@ class KarnatakaRecoveryService:
             elif verification.get("status") in MANUAL_STATUSES:
                 if not best_manual or safe_int(verification.get("evidence_score")) > safe_int(best_manual[0].get("evidence_score")):
                     best_manual = (verification, candidate, None)
+            elif verification.get("status") == "rejected_third_party_or_unowned":
+                ctx.carrier_pages_seen += 1
 
         if ctx.max_queries <= 0:
             if best_manual:
@@ -1616,7 +2944,7 @@ class KarnatakaRecoveryService:
             raise ProviderUnavailable("serper", "not_configured_for_search_mode")
 
         plans = build_query_plan(row, mode)
-        seen_urls = {candidate.get("url") for candidate in direct_candidates}
+        seen_urls = set(all_uploaded_urls)
         carrier_hints: list[str] = []
         for query_index, plan in enumerate(plans, start=1):
             ctx.check_deadline()
@@ -1683,9 +3011,11 @@ class KarnatakaRecoveryService:
                 if verification.get("status") == "candidate_fetch_pending":
                     if not best_unreachable or safe_int(candidate.get("score")) > safe_int(best_unreachable[1].get("score")):
                         best_unreachable = (verification, candidate, qinfo)
-                else:
+                elif verification.get("status") in MANUAL_STATUSES:
                     if not best_manual or safe_int(verification.get("evidence_score")) > safe_int(best_manual[0].get("evidence_score")):
                         best_manual = (verification, candidate, qinfo)
+                elif verification.get("status") == "rejected_third_party_or_unowned":
+                    ctx.carrier_pages_seen += 1
 
             # One targeted carrier recovery query is allowed only if it fits the
             # mode's existing query ceiling. It replaces, rather than adds to,
@@ -1743,10 +3073,35 @@ class KarnatakaRecoveryService:
             "parent_organisation": row.get("Parent Organisation", ""), "email": row.get("Email", ""), "phone": row.get("Phone", ""),
             "recheck_candidate_url": row.get("Website", ""), "previous_discovery_status": row.get("Discovery Status", ""),
             "retry_reason": row.get("Retry Reason", ""),
-            "recovery_mode_override": "firecrawl_retry" if row.get("Discovery Status") == "candidate_fetch_pending" else "missing_query_only" if row.get("Discovery Status") == "search_partial" else row.get("Recovery Mode", ""),
+            "recovery_mode_override": (
+                "firecrawl_retry" if row.get("Discovery Status") == "candidate_fetch_pending"
+                else "missing_query_only" if row.get("Discovery Status") == "search_partial"
+                else "enhanced_search" if row.get("Discovery Status") == "no_candidate_in_uploaded_row"
+                else row.get("Recovery Mode", "")
+            ),
         } for row in retry]
         self._rewrite_csv(rd / RESULT_FILES["retry"], retry_fields, retry_rows)
-        return {"manual_review": len(manual), "no_site": len(no_site), "retry": len(retry)}
+        avika_fields = ["ngo_id", "name", "district", "state", "darpan_id", "website", "website_recovery_status", "source_record_id"]
+        safe_verified = []
+        for result in results:
+            source_row = {
+                "name": result.get("NGO Name", ""), "district": result.get("District", ""), "state": result.get("State", ""),
+                "darpan_id": result.get("Darpan ID", ""), "registration_reference": result.get("Registration Reference", ""),
+                "registered_address": result.get("Registered Address", ""), "pincode": result.get("Pincode", ""),
+                "referral_name": result.get("Referral Name", ""), "public_name": result.get("Public Name", ""),
+                "project_name": result.get("Project Name", ""), "parent_organisation": result.get("Parent Organisation", ""),
+                "email": result.get("Email", ""), "phone": result.get("Phone", ""),
+            }
+            if result.get("Website") and result.get("Discovery Status") in VERIFIED_STATUSES and not result_export_safety_failure(source_row, result):
+                safe_verified.append({
+                    "ngo_id": result.get("NGO ID", ""), "name": result.get("NGO Name", ""),
+                    "district": result.get("District", ""), "state": result.get("State", ""),
+                    "darpan_id": result.get("Darpan ID", ""), "website": result.get("Website", ""),
+                    "website_recovery_status": result.get("Discovery Status", ""),
+                    "source_record_id": result.get("Source Record ID", ""),
+                })
+        self._rewrite_csv(rd / RESULT_FILES["avika_input"], avika_fields, safe_verified)
+        return {"manual_review": len(manual), "no_site": len(no_site), "retry": len(retry), "safe_verified": len(safe_verified)}
 
     def _summarise(self, rd: Path, settings: dict[str, Any], shared: dict[str, Any], serper_pool: SerperPool | None, firecrawl_pool: FirecrawlPool | None, started_at: float) -> dict[str, Any]:
         results = self._load_results(rd)
@@ -1755,6 +3110,14 @@ class KarnatakaRecoveryService:
             status = str(row.get("Discovery Status") or "unknown")
             by_status[status] = by_status.get(status, 0) + 1
         derived = self._write_derived_exports(rd)
+        regression_counts: dict[str, int] = {}
+        for row in results:
+            check = str(row.get("Regression Check") or "not_applicable")
+            regression_counts[check] = regression_counts.get(check, 0) + 1
+        regression_failures = [
+            {"ngo_id": row.get("NGO ID", ""), "name": row.get("NGO Name", ""), "reason": row.get("Regression Failure Reason", "")}
+            for row in results if row.get("Regression Check") == "fail"
+        ]
         summary = {
             "module_version": MODULE_VERSION,
             "run_id": rd.name,
@@ -1780,6 +3143,11 @@ class KarnatakaRecoveryService:
             "serper_credit_budget": settings.get("serper_credit_budget", 0),
             "serper_concurrency": settings.get("serper_concurrency", settings.get("serper_per_key_concurrency", 0)),
             "firecrawl_key_stats": firecrawl_pool.stats() if firecrawl_pool else [],
+            "regression_status_counts": regression_counts,
+            "regression_passed": bool(settings.get("mode") != "regression_test" or not regression_failures),
+            "production_run_allowed": bool(settings.get("mode") != "regression_test" or not regression_failures),
+            "regression_failures": regression_failures[:100],
+            "ownership_self_test": self.ownership_self_test,
             "generated_at": utc_now(),
         }
         self._write_json(rd / RESULT_FILES["summary"], summary)
@@ -1904,6 +3272,9 @@ class KarnatakaRecoveryService:
                                 "Page Type": verification.get("page_type") or candidate.get("page_type", ""),
                                 "Ownership Class": verification.get("ownership", "unverified_due_to_deadline"),
                                 "Identity Evidence": verification.get("evidence", ""),
+                                "Ownership Evidence": verification.get("ownership_evidence", ""),
+                                "Ownership Gate": verification.get("ownership_gate", "deadline_before_final_ownership_decision"),
+                                "Risk Flags": verification.get("risk_flags", ""),
                                 "Identity Conflicts": verification.get("conflicts", ""),
                                 "Fetch Status": verification.get("fetch_status", "row_deadline"),
                                 "Fetch Errors": verification.get("fetch_error", ""),
@@ -1994,7 +3365,12 @@ class KarnatakaRecoveryService:
 
         @router.get("/modes")
         def modes() -> JSONResponse:
-            return self._json(True, module_version=MODULE_VERSION, modes=MODE_SPECS)
+            return self._json(True, module_version=MODULE_VERSION, modes=MODE_SPECS, ownership_self_test=self.ownership_self_test)
+
+        @router.get("/ownership-self-test")
+        def ownership_self_test() -> JSONResponse:
+            passed = bool(self.ownership_self_test.get("passed"))
+            return self._json(passed, 200 if passed else 503, **self.ownership_self_test)
 
         @router.get("/capacity")
         def capacity(
@@ -2036,6 +3412,7 @@ class KarnatakaRecoveryService:
                 firecrawl_configured=bool(firecrawl_keys),
                 healthy_firecrawl_keys=healthy_firecrawl,
                 firecrawl_key_stats=firecrawl_stats,
+                ownership_self_test=self.ownership_self_test,
             )
 
         @router.post("/start")
@@ -2055,6 +3432,8 @@ class KarnatakaRecoveryService:
             row_deadline_seconds: int = 90,
         ) -> JSONResponse:
             mode = str(mode or "").strip().lower()
+            if not self.ownership_self_test.get("passed"):
+                return self._json(False, 503, error="The built-in ownership guard failed; this worker refuses to start a run.", ownership_self_test=self.ownership_self_test)
             if mode not in MODE_SPECS:
                 return self._json(False, 400, error=f"Unknown mode. Choose one of: {', '.join(MODE_SPECS)}")
             with self.lock:

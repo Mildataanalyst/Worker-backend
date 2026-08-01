@@ -42,6 +42,36 @@ def base_row(**changes):
     return row
 
 
+def owned_fetch(url, name, text="", *, site_name=None, h1=None, footer=None, org_names=None):
+    site_name = site_name or name
+    h1 = h1 or name
+    footer = footer or f"Copyright {name}. All rights reserved."
+    org_names = org_names or [name]
+    body = text or f"Welcome to {name}. {name} is a registered organisation."
+    return {
+        "ok": True,
+        "text": body,
+        "page_title": name,
+        "meta_description": body,
+        "mailto": "",
+        "tel": "",
+        "metadata": {
+            "h1_text": h1,
+            "footer_text": footer,
+            "og_site_name": site_name,
+            "jsonld_org_names": org_names,
+            "jsonld_names": org_names,
+            "jsonld_types": ["organization"],
+            "article_metadata": False,
+        },
+        "url": url,
+        "status": 200,
+        "fetch_status": "direct_ok",
+        "error": "",
+        "firecrawl_recommended": False,
+    }
+
+
 def test_input_preserves_same_name_same_district_source_rows(tmp_path):
     path = tmp_path / "input.csv"
     path.write_text(
@@ -58,11 +88,11 @@ def test_input_preserves_same_name_same_district_source_rows(tmp_path):
 
 def test_zero_query_mode_never_needs_serper(monkeypatch, tmp_path):
     service = kr.KarnatakaRecoveryService(tmp_path, 1_000_000)
-    row = base_row(website="https://example.org", recovery_mode="known_url_identity")
-    monkeypatch.setattr(kr, "fetch_direct", lambda url, remaining: {
-        "ok": True, "text": "Example Children Foundation Bengaluru Urban 560068 REG-123",
-        "url": "https://example.org/", "status": 200, "fetch_status": "direct_ok", "error": "", "firecrawl_recommended": False,
-    })
+    row = base_row(website="https://examplechildren.org", recovery_mode="known_url_identity")
+    monkeypatch.setattr(kr, "fetch_direct", lambda url, remaining: owned_fetch(
+        "https://examplechildren.org/", "Example Children Foundation",
+        "Welcome to Example Children Foundation. Bengaluru Urban 560068 REG-123.",
+    ))
     result, _ = service._process_row(
         row, "known_url_identity", None, None,
         {"lock": __import__("threading").RLock(), "logical_queries": 0, "query_cap": 0},
@@ -76,11 +106,11 @@ def test_zero_query_mode_never_needs_serper(monkeypatch, tmp_path):
 def test_missing_query_only_runs_exactly_one_logical_query(monkeypatch, tmp_path):
     service = kr.KarnatakaRecoveryService(tmp_path, 1_000_000)
     row = base_row(recovery_mode="missing_query_only", failed_query_passes="public_brand_geo", public_name="Example Learning Home")
-    payload = {"organic": [{"position": 1, "title": "Example Learning Home", "link": "https://example.org", "snippet": "Example Children Foundation Bengaluru Urban 560068"}]}
-    monkeypatch.setattr(kr, "fetch_direct", lambda url, remaining: {
-        "ok": True, "text": "Example Children Foundation Example Learning Home Bengaluru Urban 560068 REG-123",
-        "url": "https://example.org/", "status": 200, "fetch_status": "direct_ok", "error": "", "firecrawl_recommended": False,
-    })
+    payload = {"organic": [{"position": 1, "title": "Example Learning Home", "link": "https://examplechildren.org", "snippet": "Example Children Foundation Bengaluru Urban 560068"}]}
+    monkeypatch.setattr(kr, "fetch_direct", lambda url, remaining: owned_fetch(
+        "https://examplechildren.org/", "Example Children Foundation",
+        "Welcome to Example Children Foundation. Example Learning Home Bengaluru Urban 560068 REG-123.",
+    ))
     shared = {"lock": __import__("threading").RLock(), "logical_queries": 0, "query_cap": 10}
     result, _ = service._process_row(row, "missing_query_only", FakeSerperPool(payload), None, shared, False, 60)
     assert result["Discovery Status"] == "verified_owned_site"
@@ -93,17 +123,16 @@ def test_directory_is_carrier_and_pipeline_continues_to_owned_site(monkeypatch, 
     row = base_row(name="Deenabandhu", district="Chamarajanagar", pincode="571313", registration_reference="REG-DEENA")
     payload = {"organic": [
         {"position": 1, "title": "Deenabandhu NGO directory", "link": "https://www.oneindia.com/ngos-in-chamarajanagar", "snippet": "Deenabandhu Chamarajanagar"},
-        {"position": 2, "title": "Deenabandhu official", "link": "https://deenabandhu.example.org", "snippet": "Deenabandhu Chamarajanagar 571313"},
+        {"position": 2, "title": "Deenabandhu official", "link": "https://deenabandhu.org", "snippet": "Deenabandhu Chamarajanagar 571313"},
     ]}
-    monkeypatch.setattr(kr, "fetch_direct", lambda url, remaining: {
-        "ok": True, "text": "Deenabandhu Chamarajanagar 571313 REG-DEENA children home",
-        "url": url, "status": 200, "fetch_status": "direct_ok", "error": "", "firecrawl_recommended": False,
-    })
+    monkeypatch.setattr(kr, "fetch_direct", lambda url, remaining: owned_fetch(
+        url, "Deenabandhu", "Welcome to Deenabandhu. Chamarajanagar 571313 REG-DEENA children home.",
+    ))
     result, audit = service._process_row(
         row, "enhanced_search", FakeSerperPool(payload), None,
         {"lock": __import__("threading").RLock(), "logical_queries": 0, "query_cap": 10}, False, 60,
     )
-    assert result["Website"].startswith("https://deenabandhu.example.org")
+    assert result["Website"].startswith("https://deenabandhu.org")
     assert result["Discovery Status"] == "verified_owned_site"
     assert any(event.decision == "carrier_only_continue" and event.page_type == "directory_or_registry" for event in audit)
 
@@ -111,10 +140,10 @@ def test_directory_is_carrier_and_pipeline_continues_to_owned_site(monkeypatch, 
 def test_verified_hosted_page_gets_controlled_microsite_status(monkeypatch, tmp_path):
     service = kr.KarnatakaRecoveryService(tmp_path, 1_000_000)
     row = base_row(name="Sadhana", district="Raichur", pincode="584128", phone="9876543210", website="https://sadhana.1ngo.in/", recovery_mode="known_url_identity")
-    monkeypatch.setattr(kr, "fetch_direct", lambda url, remaining: {
-        "ok": True, "text": "Sadhana Raichur 584128 phone 9876543210",
-        "url": url, "status": 200, "fetch_status": "direct_ok", "error": "", "firecrawl_recommended": False,
-    })
+    monkeypatch.setattr(kr, "fetch_direct", lambda url, remaining: owned_fetch(
+        url, "Sadhana", "Welcome to Sadhana. Sadhana Raichur 584128 phone 9876543210.",
+        site_name="Sadhana Raichur", h1="Sadhana Raichur", org_names=["Sadhana"],
+    ))
     result, _ = service._process_row(row, "known_url_identity", None, None, {"lock": __import__("threading").RLock(), "logical_queries": 0, "query_cap": 0}, False, 60)
     assert result["Discovery Status"] == "verified_controlled_microsite"
     assert result["Ownership Class"] == "controlled_hosted_presence"

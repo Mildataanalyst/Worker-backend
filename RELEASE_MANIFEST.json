@@ -1,21 +1,29 @@
 {
   "service": "DFP 2.0 search worker",
-  "version": "v73",
+  "version": "v76",
   "release_date": "2026-08-01",
   "railway_ready": true,
+  "module_version": "karnataka_recovery_v5_final_ownership_guard",
   "features": [
+    "fail-closed NGO website ownership verification",
+    "hard carrier, directory, fundraiser, vendor, article, travel, social and reference rejection",
+    "independent site-root ownership crosscheck for every deep or query URL",
+    "current-rule revalidation of every retained or historical URL regardless of its old label",
+    "known official fetch failure preservation instead of directory replacement",
+    "explicit parent/project and controlled hosted-microsite verification",
+    "three-layer safety enforcement: candidate verifier, final result guard and deterministic Avika-export rebuild",
     "one SERPER_API_KEY only",
-    "Karnataka Recovery",
-    "zero-query recovery",
-    "permanent NGO IDs",
-    "resumable concurrency",
-    "optional selective Firecrawl"
+    "permanent NGO IDs and immutable source-record IDs",
+    "resumable checkpoints and optional selective Firecrawl"
   ],
   "tests": {
-    "pytest": "68 passed",
-    "python_compile": "passed"
+    "pytest": "95 passed",
+    "python_compile": "passed",
+    "built_in_ownership_guard": "18 deterministic cases passed"
   },
   "notes": [
-    "Set SERPER_CONCURRENCY=4 initially. SERPER_API_KEYS is ignored."
+    "Production starts directly with RUN_01; the external 44-NGO test is not a gate.",
+    "Use SERPER_CONCURRENCY=4 initially. SERPER_API_KEYS is ignored.",
+    "No separate mutation token is used; ADMIN_PASSWORD is the only credential."
   ]
 }
