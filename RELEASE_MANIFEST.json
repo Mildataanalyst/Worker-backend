@@ -1,6 +1,6 @@
 {
   "service": "DFP 2.0 core backend",
-  "version": "v93",
+  "version": "v94",
   "release_date": "2026-08-02",
   "railway_ready": true,
   "features": [
@@ -19,7 +19,7 @@
     "Search Worker v84",
     "Frontend v163"
   ],
-  "release": "DFP2 Core Backend v93",
+  "release": "operator-routing-diagnostics",
   "notes": [
     "Routine Avika and Shortlisting Pool actions rely on explicit selection, confirmation, duplicate checks and undo history instead of an admin-password prompt.",
     "Unrelated administrative and final-output mutations remain password-protected."

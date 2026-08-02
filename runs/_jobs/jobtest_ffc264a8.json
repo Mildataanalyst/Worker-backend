@@ -1,0 +1,16 @@
+{
+  "run_id": "jobtest_ffc264a8",
+  "job_type": "unit_test",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "run_dir": "/mnt/data/build_v94/runs/jobtest_ffc264a8",
+  "owner_pid": 3065,
+  "cancel_requested": true,
+  "created_at": "2026-08-02T02:07:06Z",
+  "total": 10,
+  "processed": 4,
+  "updated_at": "2026-08-02T02:07:06Z",
+  "cancel_requested_at": "2026-08-02T02:07:06Z",
+  "interrupted_at": "2026-08-02T02:07:06Z",
+  "live_state": "not_running"
+}

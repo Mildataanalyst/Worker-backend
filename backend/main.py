@@ -654,21 +654,19 @@ async def service_role_middleware(request, call_next):
     return await call_next(request)
 
 def _public_operator_mutation_path(path: str) -> bool:
-    """Internal review actions that should never show a password prompt.
-
-    Avika selection and the Shortlisting Pool are routine operator workflows.
-    They remain protected by explicit row selection, confirmation, duplicate
-    checks and the undo log rather than by a second password field.
-    """
+    """Internal operator actions that must not display a password prompt."""
     clean = (path or "/").rstrip("/") or "/"
     if clean == "/admin/ngo-ids/backfill":
         return True
+    if clean in {"/repository/delete", "/repository/runs/delete", "/repository/runs/delete-many"}:
+        return False
+    if clean == "/repository" or clean.startswith("/repository/"):
+        # The core service normally rejects these through service-role routing,
+        # but it must return a clear wrong-service response rather than a 401.
+        return True
     parts = [part for part in clean.split("/") if part]
     if len(parts) >= 3 and parts[0] == "workspace":
-        # /workspace/{region}/lead-pool/... and /workspace/{region}/send-to-ranking
-        if parts[2] == "lead-pool":
-            return True
-        if parts[2] == "send-to-ranking":
+        if parts[2] in {"lead-pool", "send-to-ranking"}:
             return True
     return False
 
@@ -1273,6 +1271,12 @@ def health():
         "active_runs": _active_run_ids(),
         "jobs_dir": str(JOBS_DIR),
         "recent_jobs": len(_job_records(limit=500)),
+        "service_role": _service_role(),
+        "module_version": "backend_v94_operator_routing_diagnostics",
+        "capabilities": {
+            "core_workspace": True,
+            "repository": _service_role() in {"full", "all", "search"},
+        },
     }
 
 

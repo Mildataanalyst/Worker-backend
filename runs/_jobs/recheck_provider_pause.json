@@ -1,10 +1,19 @@
 {
   "run_id": "recheck_provider_pause",
-  "job_type": "unknown",
+  "job_type": "no_website_recheck",
   "created_at": "2026-08-01T17:42:20Z",
-  "run_dir": "/mnt/data/release_v92_v83_v163/backend/runs/recheck_provider_pause",
+  "run_dir": "/tmp/pytest-of-root/pytest-6/test_provider_pause_status_is_0/recheck_provider_pause",
   "status": "paused",
   "stage": "provider_credit_exhausted",
   "error": "anthropic (...abc123) HTTP 402: credits_exhausted. credit balance too low",
-  "updated_at": "2026-08-01T17:42:20Z"
+  "updated_at": "2026-08-02T02:07:28Z",
+  "run_status": "paused",
+  "processed": 1,
+  "total": 10,
+  "current_item": "Paused safely: Haiku / Anthropic capacity needs attention. Completed NGOs remain checkpointed.",
+  "queries_used": 2,
+  "strategy": "fast",
+  "module": "no_website_recheck",
+  "remaining": 9,
+  "progress_pct": 10.0
 }
