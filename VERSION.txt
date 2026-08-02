@@ -1,1 +1,1 @@
-DFP2 Worker v83 — 15,000-row recovery + automatic checkpoint resume + strict identity
+DFP2 Core Backend v93 — password-free Avika and Shortlisting Pool

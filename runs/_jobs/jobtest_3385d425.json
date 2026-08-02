@@ -1,0 +1,13 @@
+{
+  "run_id": "jobtest_3385d425",
+  "job_type": "unit_test",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "run_dir": "/mnt/data/release_v92_v83_v163/backend/runs/jobtest_3385d425",
+  "owner_pid": 2385,
+  "cancel_requested": false,
+  "created_at": "2026-08-01T17:42:17Z",
+  "updated_at": "2026-08-01T17:42:17Z",
+  "interrupted_at": "2026-08-01T17:42:17Z",
+  "live_state": "not_running"
+}

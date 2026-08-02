@@ -1,0 +1,13 @@
+{
+  "run_id": "jobtest_b5ff24b7",
+  "job_type": "unit_test",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "run_dir": "/mnt/data/release_v92_v83_v163/backend/backend/runs/jobtest_b5ff24b7",
+  "owner_pid": 2143,
+  "cancel_requested": false,
+  "created_at": "2026-08-01T17:37:47Z",
+  "updated_at": "2026-08-01T17:37:47Z",
+  "interrupted_at": "2026-08-01T17:37:47Z",
+  "live_state": "not_running"
+}

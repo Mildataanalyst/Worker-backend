@@ -1,34 +1,27 @@
 {
-  "service": "DFP 2.0 search worker",
-  "version": "v83",
-  "release_date": "2026-08-01",
+  "service": "DFP 2.0 core backend",
+  "version": "v93",
+  "release_date": "2026-08-02",
   "railway_ready": true,
-  "module_version": "karnataka_recovery_v6_0_large_batch_auto_resume",
   "features": [
-    "all Worker v82 strict source-identity, missing-query handoff and prefetch carrier protections retained",
-    "100 MB streamed upload safety cap; old 8 MB limit removed",
-    "up to 20000 Karnataka Recovery rows per run, supporting a 15000-row enhanced batch",
-    "up to 20000 compact Avika rows per run",
-    "durable automatic checkpoint resume after Railway restarts or worker interruption",
-    "automatic backoff and retry for transient provider-capacity pauses and unexpected errors",
-    "explicit user pause and cancellation remain manual and are never auto-resumed",
-    "single funded SERPER_API_KEY and checkpoint-per-source-record behaviour retained"
+    "Avika-to-Shortlisting-Pool imports and Lead Pool curation are password-free",
+    "Approve and send selected Shortlisting Pool NGOs to PMs is password-free",
+    "all Core Backend v91 permanent NGO ID, Avika provenance, Shortlisting Pool and PM-dispatch features retained",
+    "100 MB streamed CSV safety cap for large Avika and Lead Pool imports; old 8 MB limit removed",
+    "compatible with Worker v83 automatic checkpoint resume and Frontend v163 large-batch UI"
   ],
   "tests": {
-    "pytest": "124 passed",
-    "large_batch_15000": "passed",
-    "automatic_resume": "passed",
-    "strict_identity": "passed",
+    "pytest": "112 passed",
+    "password_free_operator_workflow_paths": "passed",
     "python_compile": "passed"
   },
   "compatible_with": [
-    "Core Backend v92",
+    "Search Worker v84",
     "Frontend v163"
   ],
-  "release": "DFP2 Worker v83",
+  "release": "DFP2 Core Backend v93",
   "notes": [
-    "Auto-resume is enabled by default and persists in each run settings file.",
-    "The supervisor restarts only the newest eligible incomplete run and never duplicates completed source records.",
-    "Uploads are streamed to disk before parsing to reduce memory pressure on 15000-row jobs."
+    "Routine Avika and Shortlisting Pool actions rely on explicit selection, confirmation, duplicate checks and undo history instead of an admin-password prompt.",
+    "Unrelated administrative and final-output mutations remain password-protected."
   ]
 }
