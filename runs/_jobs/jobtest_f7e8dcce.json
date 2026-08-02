@@ -1,0 +1,16 @@
+{
+  "run_id": "jobtest_f7e8dcce",
+  "job_type": "unit_test",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "run_dir": "/mnt/data/fix_avika_pw/worker/runs/jobtest_f7e8dcce",
+  "owner_pid": 1788,
+  "cancel_requested": true,
+  "created_at": "2026-08-02T01:57:02Z",
+  "total": 10,
+  "processed": 4,
+  "updated_at": "2026-08-02T01:57:02Z",
+  "cancel_requested_at": "2026-08-02T01:57:02Z",
+  "interrupted_at": "2026-08-02T01:57:02Z",
+  "live_state": "not_running"
+}

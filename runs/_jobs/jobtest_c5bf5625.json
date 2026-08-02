@@ -1,0 +1,13 @@
+{
+  "run_id": "jobtest_c5bf5625",
+  "job_type": "unit_test",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "run_dir": "/mnt/data/fix_avika_pw/worker/runs/jobtest_c5bf5625",
+  "owner_pid": 1788,
+  "cancel_requested": false,
+  "created_at": "2026-08-02T01:57:02Z",
+  "updated_at": "2026-08-02T01:57:02Z",
+  "interrupted_at": "2026-08-02T01:57:02Z",
+  "live_state": "not_running"
+}

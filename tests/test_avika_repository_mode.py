@@ -69,3 +69,13 @@ def test_avika_mode_rejects_rows_above_dedicated_limit(monkeypatch, tmp_path):
     assert response.status_code == 400
     assert payload["stage"] == "too_many_rows_avika"
     assert payload["limit"] == 1000
+
+
+def test_avika_and_operator_run_routes_are_password_free():
+    assert main._mutation_auth_exempt_path('/repository/start') is True
+    assert main._mutation_auth_exempt_path('/repository/resume/run_123') is True
+    assert main._mutation_auth_exempt_path('/repository/cancel/run_123') is True
+    assert main._mutation_auth_exempt_path('/repository/recheck/start') is True
+    assert main._mutation_auth_exempt_path('/karnataka-recovery/start') is True
+    # Destructive archive deletion remains protected.
+    assert main._mutation_auth_exempt_path('/repository/runs/delete') is False

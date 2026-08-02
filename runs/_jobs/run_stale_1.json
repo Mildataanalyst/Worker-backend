@@ -1,0 +1,11 @@
+{
+  "run_id": "run_stale_1",
+  "job_type": "unknown",
+  "created_at": "2026-08-02T02:26:53Z",
+  "run_dir": "/tmp/pytest-of-root/pytest-7/test_stale_repository_lock_is_0/runs/run_stale_1",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "live_state": "not_running",
+  "interruption_reason": "stale_repository_lock",
+  "updated_at": "2026-08-02T02:26:53Z"
+}

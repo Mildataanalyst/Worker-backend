@@ -1,0 +1,13 @@
+{
+  "run_id": "jobtest_20af8664",
+  "job_type": "unit_test",
+  "status": "interrupted",
+  "stage": "interrupted_restart",
+  "run_dir": "/mnt/data/build_v85/runs/jobtest_20af8664",
+  "owner_pid": 2917,
+  "cancel_requested": false,
+  "created_at": "2026-08-02T02:06:25Z",
+  "updated_at": "2026-08-02T02:06:25Z",
+  "interrupted_at": "2026-08-02T02:06:25Z",
+  "live_state": "not_running"
+}

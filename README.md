@@ -1,14 +1,17 @@
-# DFP 2.0 Core Backend v91 — Avika and Shortlisting Integration
+# DFP 2.0 Search Worker v80 — Compact Avika Filter
 
-Complete Railway-ready FastAPI repository. It preserves historical work and adds the data flow required by Frontend v162.
+Complete Railway-ready FastAPI worker repository.
 
-## Added
+## Avika mode
 
-- Avika metadata and source-batch provenance in Lead Pool imports.
-- Automatic reviewer summary and shortlisting comment generation.
-- Bulk curation states: pending, approved, follow-up and hold.
-- Explicit selected-lead dispatch to PMs without a separate password prompt.
-- Existing-assignment and existing-rating dedupe.
-- Permanent NGO IDs throughout Lead Pool and PM tasks.
+Start through `POST /repository/start?mode=avika&run_type=avika_filter`.
 
-Retain the existing Railway volume mounted at `/data`.
+- Uses **zero Serper queries**.
+- Fetches only the websites supplied in the CSV.
+- Deterministically removes obvious exclusions.
+- Sends remaining ambiguous/plausible NGOs to compact Claude Haiku classification.
+- Returns YES / MAYBE / NO, confidence, reason code and a 20–35 word description.
+- Does not run story, partner or media enrichment.
+- Preserves permanent NGO ID, source-record ID and source-batch fields.
+
+Default dedicated Avika limit: 10,000 rows per run.

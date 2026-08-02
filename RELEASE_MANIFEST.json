@@ -1,27 +1,37 @@
 {
-  "service": "DFP 2.0 core backend",
-  "version": "v94",
+  "service": "DFP 2.0 search worker",
+  "version": "v85",
   "release_date": "2026-08-02",
   "railway_ready": true,
+  "module_version": "karnataka_recovery_v6_1_password_free_avika",
   "features": [
-    "Avika-to-Shortlisting-Pool imports and Lead Pool curation are password-free",
-    "Approve and send selected Shortlisting Pool NGOs to PMs is password-free",
-    "all Core Backend v91 permanent NGO ID, Avika provenance, Shortlisting Pool and PM-dispatch features retained",
-    "100 MB streamed CSV safety cap for large Avika and Lead Pool imports; old 8 MB limit removed",
-    "compatible with Worker v83 automatic checkpoint resume and Frontend v163 large-batch UI"
+    "Avika Fit Review start route is password-free; no ADMIN_PASSWORD header or frontend password variable is required",
+    "repository discovery/recheck/presence run start, resume, pause and cancel controls are password-free operator actions",
+    "all Worker v82 strict source-identity, missing-query handoff and prefetch carrier protections retained",
+    "100 MB streamed upload safety cap; old 8 MB limit removed",
+    "up to 20000 Karnataka Recovery rows per run, supporting a 15000-row enhanced batch",
+    "up to 20000 compact Avika rows per run",
+    "durable automatic checkpoint resume after Railway restarts or worker interruption",
+    "automatic backoff and retry for transient provider-capacity pauses and unexpected errors",
+    "explicit user pause and cancellation remain manual and are never auto-resumed",
+    "single funded SERPER_API_KEY and checkpoint-per-source-record behaviour retained"
   ],
   "tests": {
-    "pytest": "112 passed",
-    "password_free_operator_workflow_paths": "passed",
+    "pytest": "125 passed",
+    "password_free_avika_route": "passed",
+    "large_batch_15000": "passed",
+    "automatic_resume": "passed",
+    "strict_identity": "passed",
     "python_compile": "passed"
   },
   "compatible_with": [
-    "Search Worker v84",
+    "Core Backend v93",
     "Frontend v163"
   ],
-  "release": "operator-routing-diagnostics",
+  "release": "password-free-operator-routes",
   "notes": [
-    "Routine Avika and Shortlisting Pool actions rely on explicit selection, confirmation, duplicate checks and undo history instead of an admin-password prompt.",
-    "Unrelated administrative and final-output mutations remain password-protected."
+    "The global mutation middleware no longer intercepts POST /repository/start, which is the Avika Fit Review launch endpoint.",
+    "Destructive archive deletion and unrelated admin routes remain password-protected.",
+    "No frontend change is required to remove the Avika password banner after this worker is deployed."
   ]
 }

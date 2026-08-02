@@ -203,6 +203,7 @@ PRESENCE_OUTPUTS = {
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
 processes: dict[str, subprocess.Popen] = {}
 REPO_LOCK_FILE = RUNS_DIR / '.repository_active.lock'
+REPO_LOCK_STALE_SECONDS = max(30, int(os.environ.get('REPO_LOCK_STALE_SECONDS', '90')))
 GLOBAL_SCAN_HISTORY = RUNS_DIR / 'global_scan_history.csv'
 DASHBOARD_DATA_FILE = RUNS_DIR / 'dashboard_data.json'
 story_threads: dict[str, threading.Thread] = {}
@@ -656,16 +657,25 @@ async def service_role_middleware(request, call_next):
     return await call_next(request)
 
 def _mutation_auth_exempt_path(path: str) -> bool:
-    """Routes intentionally available without an admin password.
+    """Password-free internal operator workflows.
 
-    Karnataka Recovery is an operator workflow, not a destructive admin
-    mutation. Requiring a password here caused every CSV upload, pause, cancel
-    and resume request to fail with HTTP 401 whenever the frontend proxy did not
-    carry a server-side password. Keep the legacy password guard for unrelated
-    consequential endpoints, but never gate the recovery module.
+    Repository discovery, Avika Fit Review, Karnataka Recovery, job controls,
+    exports and status checks are routine internal operations.  They must never
+    be intercepted by the global admin-password middleware.  Destructive admin
+    endpoints outside these namespaces remain protected.
     """
     clean = (path or "/").rstrip("/") or "/"
-    return clean == "/karnataka-recovery" or clean.startswith("/karnataka-recovery/")
+    if clean in {"/repository/delete", "/repository/runs/delete", "/repository/runs/delete-many"}:
+        return False
+    if clean == "/repository" or clean.startswith("/repository/"):
+        return True
+    if clean == "/karnataka-recovery" or clean.startswith("/karnataka-recovery/"):
+        return True
+    if clean == "/jobs" or clean.startswith("/jobs/"):
+        return True
+    if clean == "/enrichment" or clean.startswith("/enrichment/"):
+        return True
+    return False
 
 
 @app.middleware("http")
@@ -1198,6 +1208,39 @@ def _release_repo_lock(run_id: str | None = None):
         pass
 
 
+def _repo_lock_age_seconds() -> float:
+    try:
+        return max(0.0, time.time() - REPO_LOCK_FILE.stat().st_mtime)
+    except Exception:
+        return 0.0
+
+
+def _interrupt_orphaned_repository_run(run_id: str, reason: str = "worker_restart") -> None:
+    if not run_id:
+        return
+    rd = _run_dir(run_id)
+    try:
+        if rd.exists() and not _status_is_terminal(rd) and not _repo_outputs_ready(rd):
+            _write_repo_status(
+                rd,
+                ok=False,
+                run_id=run_id,
+                run_status="interrupted",
+                stage="interrupted_restart",
+                active=False,
+                resumable=bool((rd / "ngo_list.csv").exists()),
+                interruption_reason=reason,
+                current_item="Previous worker process is no longer running. The stale lock was cleared; partial outputs remain available and the old run can be resumed from its checkpoint.",
+            )
+            _job_update(run_id, status="interrupted", stage="interrupted_restart", live_state="not_running", interruption_reason=reason)
+    except Exception as exc:
+        try:
+            print(f"failed to mark orphaned repository run {run_id}: {exc}", file=sys.stderr)
+        except Exception:
+            pass
+    _release_repo_lock(run_id)
+
+
 def _repo_lock_is_active() -> tuple[bool, str]:
     locked = _read_repo_lock()
     if not locked:
@@ -1209,7 +1252,32 @@ def _repo_lock_is_active() -> tuple[bool, str]:
     if _status_is_terminal(rd) or _repo_outputs_ready(rd):
         _release_repo_lock(locked)
         return False, ""
+    # A repository subprocess exists only inside this worker process. After a
+    # Railway/container restart, `processes` is empty while the persistent lock
+    # file survives on /data. The old implementation treated that orphaned
+    # lock as active forever, causing every new Avika run to return HTTP 409.
+    # Keep a short grace period to avoid racing the tiny start-up window between
+    # acquiring the lock and registering the subprocess, then fail open safely.
+    if not proc and _repo_lock_age_seconds() >= REPO_LOCK_STALE_SECONDS:
+        _interrupt_orphaned_repository_run(locked, reason="stale_repository_lock")
+        return False, ""
     return True, locked
+
+
+def _reconcile_repository_lock_startup() -> None:
+    locked = _read_repo_lock()
+    if not locked:
+        return
+    rd = _run_dir(locked)
+    proc = processes.get(locked)
+    if proc and proc.poll() is None:
+        return
+    if _status_is_terminal(rd) or _repo_outputs_ready(rd):
+        _release_repo_lock(locked)
+        return
+    # On startup there cannot be a live child process from the old container.
+    # Clear the orphan immediately instead of waiting for the normal grace age.
+    _interrupt_orphaned_repository_run(locked, reason="worker_startup_reconcile")
 
 
 def _acquire_repo_lock(run_id: str) -> tuple[bool, str]:
@@ -1276,8 +1344,20 @@ def health():
         "runs_dir": str(RUNS_DIR),
         "engine_file_exists": ENGINE_FILE.exists(),
         "active_runs": _active_run_ids(),
+        "repository_lock": {
+            "run_id": _read_repo_lock(),
+            "age_seconds": round(_repo_lock_age_seconds(), 1) if _read_repo_lock() else 0.0,
+            "stale_after_seconds": REPO_LOCK_STALE_SECONDS,
+        },
         "jobs_dir": str(JOBS_DIR),
         "recent_jobs": len(_job_records(limit=500)),
+        "service_role": _service_role(),
+        "module_version": "worker_v86_self_healing_repository_lock",
+        "capabilities": {
+            "repository": True,
+            "avika_filter": True,
+            "karnataka_recovery": True,
+        },
     }
 
 
@@ -1376,7 +1456,7 @@ async def start_repository(file: UploadFile = File(...), mode: str = "rapid", ru
 
     active = _active_run_ids()
     if active:
-        return _json(False, status_code=409, stage="another_run_active", error="Another repository run is already active", active_runs=active)
+        return _json(False, status_code=409, stage="another_run_active", error=f"Another Avika/discovery run is already active: {active[0]}. Open Runs to inspect it, or wait for it to finish.", active_runs=active)
 
     run_id = f"run_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     rd = _run_dir(run_id)
@@ -1463,7 +1543,7 @@ async def start_repository(file: UploadFile = File(...), mode: str = "rapid", ru
     lock_ok, locked_run = _acquire_repo_lock(run_id)
     if not lock_ok:
         _write_repo_status(rd, ok=False, run_id=run_id, run_status="blocked", stage="another_run_active", error="Another repository run is already active", active_run=locked_run)
-        return _json(False, status_code=409, run_id=run_id, stage="another_run_active", error="Another repository run is already active", active_run=locked_run)
+        return _json(False, status_code=409, run_id=run_id, stage="another_run_active", error=f"Another Avika/discovery run is already active: {locked_run}. Open Runs to inspect it, or wait for it to finish.", active_run=locked_run)
 
     input_csv = rd / "ngo_list.csv"
     _limit_csv_rows(uploaded, input_csv, rows_to_run)
@@ -4862,6 +4942,29 @@ def recheck_resume(run_id: str, strategy_override: str = ""):
 def recheck_cancel(run_id: str):
     # Backward-compatible alias. The UI now calls this "End and save outputs".
     return recheck_stop(run_id)
+
+
+@app.on_event("startup")
+def _reconcile_repository_lock_on_startup():
+    # Always reconcile this lock, even when the heavier legacy startup scan is
+    # disabled. The lock is persisted on /data while child processes are not.
+    try:
+        _reconcile_repository_lock_startup()
+    except Exception as e:
+        print(f"repository lock startup reconciliation failed: {e}", file=sys.stderr)
+
+
+@app.post("/repository/recover-stale-lock")
+def repository_recover_stale_lock():
+    """Clear an orphaned repository lock without deleting any run data."""
+    locked = _read_repo_lock()
+    if not locked:
+        return _json(True, stage="no_lock", cleared=False)
+    proc = processes.get(locked)
+    if proc and proc.poll() is None:
+        return _json(False, status_code=409, stage="real_run_active", error=f"Run {locked} is genuinely active and was not interrupted.", active_run=locked)
+    _interrupt_orphaned_repository_run(locked, reason="operator_stale_lock_recovery")
+    return _json(True, stage="stale_lock_cleared", cleared=True, run_id=locked)
 
 
 @app.on_event("startup")
